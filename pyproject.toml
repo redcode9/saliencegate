@@ -54,7 +54,7 @@ dev = [
   "pytest-asyncio>=1.0,<2",
   "pytest-cov>=6.2,<7",
   "pytest-socket>=0.7,<1",
-  "ruff>=0.12,<1",
+  "ruff>=0.15.22,<1",
 ]
 
 [tool.hatch.build.targets.wheel]
