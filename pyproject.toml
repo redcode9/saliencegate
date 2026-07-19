@@ -52,7 +52,7 @@ dev = [
   "pip-audit>=2.9,<3",
   "pytest>=9.0.3,<10",
   "pytest-asyncio>=1.0,<2",
-  "pytest-cov>=6.2,<7",
+  "pytest-cov>=7.1.0,<8",
   "pytest-socket>=0.7,<1",
   "ruff>=0.12,<1",
 ]
