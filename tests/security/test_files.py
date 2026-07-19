@@ -492,6 +492,174 @@ def test_missing_parent_fails_without_creating_any_directory(tmp_path: Path) -> 
     assert not target.parent.exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="private directories require POSIX")
+def test_private_directory_authorization_creates_and_revalidates_the_exact_leaf(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "state" / "saliencegate" / "capture-spool"
+
+    authorization = files_module._authorize_private_directory(target, create=True)
+
+    for directory in (target.parent.parent, target.parent, target):
+        metadata = directory.lstat()
+        assert stat.S_ISDIR(metadata.st_mode)
+        assert stat.S_IMODE(metadata.st_mode) == 0o700
+        assert metadata.st_uid == os.getuid()
+    assert "capture-spool" not in repr(authorization)
+    authorization.revalidate()
+
+    displaced = tmp_path / "state-displaced"
+    target.parent.parent.rename(displaced)
+    replacement_state = _private_directory(tmp_path / "state")
+    replacement_product = _private_directory(replacement_state / "saliencegate")
+    _private_directory(replacement_product / "capture-spool")
+
+    with pytest.raises(SecureFileError):
+        authorization.revalidate()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="mkdirat requires POSIX")
+def test_private_directory_creation_never_follows_an_ancestor_replaced_during_mkdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = _private_directory(tmp_path / "state-root")
+    replacement = _private_directory(tmp_path / "replacement-root")
+    displaced = tmp_path / "state-root-displaced"
+    target = state_root / "saliencegate" / "capture-spool"
+    real_mkdir = os.mkdir
+    injected = False
+
+    def replace_before_first_create(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal injected
+        if os.fsdecode(path) == "saliencegate" and dir_fd is not None and not injected:
+            injected = True
+            state_root.rename(displaced)
+            replacement.rename(state_root)
+        real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "mkdir", replace_before_first_create)
+    monkeypatch.setattr(
+        os,
+        "supports_dir_fd",
+        os.supports_dir_fd | {replace_before_first_create},
+    )
+
+    with pytest.raises(SecureFileError):
+        files_module._authorize_private_directory(target, create=True)
+
+    assert injected
+    assert not (state_root / "saliencegate").exists()
+    assert (displaced / "saliencegate").is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor lifecycle requires POSIX")
+def test_private_directory_authorization_fails_if_its_final_descriptor_close_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _private_directory(tmp_path / "private")
+    real_snapshot = files_module._open_private_directory_snapshot
+    real_close = os.close
+    final_descriptor: int | None = None
+    close_attempted = False
+
+    def capture_final_descriptor(path: Path):
+        nonlocal final_descriptor
+        descriptor, identity = real_snapshot(path)
+        final_descriptor = descriptor
+        return descriptor, identity
+
+    def close_then_fail(descriptor: int) -> None:
+        nonlocal close_attempted
+        if descriptor == final_descriptor:
+            close_attempted = True
+            real_close(descriptor)
+            raise OSError(errno.EIO, "synthetic final close failure")
+        real_close(descriptor)
+
+    monkeypatch.setattr(
+        files_module,
+        "_open_private_directory_snapshot",
+        capture_final_descriptor,
+    )
+    monkeypatch.setattr(os, "close", close_then_fail)
+
+    with pytest.raises(SecureFileError) as captured:
+        files_module._authorize_private_directory(target, create=False)
+
+    assert close_attempted
+    assert final_descriptor is not None
+    with pytest.raises(OSError):
+        os.fstat(final_descriptor)
+    _assert_sanitized(captured.value, "synthetic final close failure")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor lifecycle requires POSIX")
+def test_private_directory_child_authorization_attempts_both_final_closes_and_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    child = _private_directory(parent / "child")
+    authorization = files_module._authorize_private_directory(parent, create=False)
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_fd = os.open(parent, flags)
+    parent_identity = (parent.stat().st_dev, parent.stat().st_ino)
+    child_identity = (child.stat().st_dev, child.stat().st_ino)
+    real_close = os.close
+    close_attempts: list[tuple[str, int]] = []
+
+    def use_pinned_parent(_authorization: object) -> int:
+        return parent_fd
+
+    def skip_path_revalidation(_authorization: object) -> None:
+        return None
+
+    def close_then_fail(descriptor: int) -> None:
+        metadata = os.fstat(descriptor)
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity == child_identity:
+            close_attempts.append(("child", descriptor))
+            real_close(descriptor)
+            raise OSError(errno.EIO, "synthetic child close failure")
+        if identity == parent_identity:
+            close_attempts.append(("parent", descriptor))
+            real_close(descriptor)
+            raise OSError(errno.EIO, "synthetic parent close failure")
+        real_close(descriptor)
+
+    monkeypatch.setattr(
+        files_module,
+        "_open_authorized_private_directory",
+        use_pinned_parent,
+    )
+    monkeypatch.setattr(
+        files_module._PrivateDirectoryAuthorization,
+        "revalidate",
+        skip_path_revalidation,
+    )
+    monkeypatch.setattr(os, "close", close_then_fail)
+
+    with pytest.raises(SecureFileError) as captured:
+        files_module._authorize_private_directory_child(
+            authorization,
+            child.name,
+            create=False,
+        )
+
+    assert [kind for kind, _descriptor in close_attempts] == ["child", "parent"]
+    for _kind, descriptor in close_attempts:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    _assert_sanitized(captured.value, "synthetic child close failure")
+
+
 @pytest.mark.parametrize("component", (".", ".."))
 def test_dot_path_components_are_rejected_before_normalization(
     tmp_path: Path,
@@ -1410,6 +1578,426 @@ def test_stable_read_authorization_rejects_content_or_name_replacement(
     _private_file(target, b"original")
     with pytest.raises(SecureFileError):
         read.authorization.revalidate()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="authorized deletion requires POSIX")
+@pytest.mark.parametrize("mode", (0o600, 0o644))
+def test_authorized_private_deletion_removes_only_the_exact_stable_read_and_syncs_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: int,
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    target = _private_file(parent / "entry", b"authenticated")
+    target.chmod(mode)
+    stable = read_stable_file(
+        target,
+        maximum_bytes=32,
+        policy=StableReadPolicy.PRIVATE_OWNER,
+    )
+    synced_directories: list[tuple[int, int]] = []
+    real_fsync = os.fsync
+
+    def observe_fsync(descriptor: int) -> None:
+        metadata = os.fstat(descriptor)
+        assert stat.S_ISDIR(metadata.st_mode)
+        synced_directories.append((metadata.st_dev, metadata.st_ino))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", observe_fsync)
+
+    files_module.delete_authorized_private_file(stable.authorization)
+
+    assert not target.exists()
+    parent_metadata = parent.stat()
+    assert synced_directories
+    assert (parent_metadata.st_dev, parent_metadata.st_ino) in set(synced_directories)
+    with pytest.raises(SecureFileError):
+        files_module.delete_authorized_private_file(stable.authorization)
+
+
+def test_authorized_private_deletion_rejects_legacy_and_non_authorization_inputs(
+    tmp_path: Path,
+) -> None:
+    target = _private_file(tmp_path / "legacy", b"preserved")
+    legacy = read_stable_file(
+        target,
+        maximum_bytes=16,
+        policy=StableReadPolicy.LEGACY_COMPATIBILITY,
+    )
+
+    for invalid in (legacy.authorization, object(), legacy):
+        with pytest.raises(SecureFileError) as captured:
+            files_module.delete_authorized_private_file(cast(StableFileAuthorization, invalid))
+        assert str(captured.value) == "secure file authorization failed"
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
+
+    assert target.read_bytes() == b"preserved"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="authorized deletion requires POSIX")
+@pytest.mark.parametrize("mutation", ("content", "replacement", "hardlink", "symlink"))
+def test_authorized_private_deletion_preserves_every_changed_or_aliased_name(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    target = _private_file(parent / "entry", b"original")
+    stable = read_stable_file(
+        target,
+        maximum_bytes=16,
+        policy=StableReadPolicy.PRIVATE_OWNER,
+    )
+    expected_target = b"original"
+    if mutation == "content":
+        target.write_bytes(b"changed!")
+        expected_target = b"changed!"
+    elif mutation == "replacement":
+        target.rename(parent / "original-displaced")
+        _private_file(target, b"replacement")
+        expected_target = b"replacement"
+    elif mutation == "hardlink":
+        (parent / "alias").hardlink_to(target)
+    else:
+        target.rename(parent / "original-displaced")
+        victim = _private_file(parent / "victim", b"victim")
+        target.symlink_to(victim)
+
+    with pytest.raises(SecureFileError):
+        files_module.delete_authorized_private_file(stable.authorization)
+
+    if mutation == "symlink":
+        assert target.is_symlink()
+        assert target.read_bytes() == b"victim"
+    else:
+        assert target.read_bytes() == expected_target
+
+
+@pytest.mark.skipif(os.name != "posix", reason="authorized deletion requires POSIX")
+def test_authorized_private_deletion_rejects_parent_replacement_without_touching_either_tree(
+    tmp_path: Path,
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    target = _private_file(parent / "entry", b"original")
+    stable = read_stable_file(
+        target,
+        maximum_bytes=16,
+        policy=StableReadPolicy.PRIVATE_OWNER,
+    )
+    displaced = tmp_path / "private-displaced"
+    parent.rename(displaced)
+    replacement_parent = _private_directory(tmp_path / "private")
+    replacement = _private_file(replacement_parent / "entry", b"replacement")
+
+    with pytest.raises(SecureFileError):
+        files_module.delete_authorized_private_file(stable.authorization)
+
+    assert (displaced / "entry").read_bytes() == b"original"
+    assert replacement.read_bytes() == b"replacement"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="authorized deletion requires POSIX")
+def test_authorized_private_deletion_detects_a_replacement_between_observable_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    target = _private_file(parent / "entry", b"original")
+    stable = read_stable_file(
+        target,
+        maximum_bytes=16,
+        policy=StableReadPolicy.PRIVATE_OWNER,
+    )
+    real_validate = files_module._validate_private_read_target_at
+    calls = 0
+
+    def replace_after_first_check(
+        directory_fd: int,
+        name: str,
+        expected: object,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        real_validate(directory_fd, name, expected)
+        if calls == 1:
+            target.rename(parent / "original-displaced")
+            _private_file(target, b"unexpected-replacement")
+
+    monkeypatch.setattr(
+        files_module,
+        "_validate_private_read_target_at",
+        replace_after_first_check,
+    )
+
+    with pytest.raises(SecureFileError):
+        files_module.delete_authorized_private_file(stable.authorization)
+
+    assert calls == 2
+    assert (parent / "original-displaced").read_bytes() == b"original"
+    assert target.read_bytes() == b"unexpected-replacement"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="authorized deletion requires POSIX")
+def test_authorized_private_deletion_stages_and_restores_a_final_boundary_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    target = _private_file(parent / "entry", b"original")
+    stable = read_stable_file(
+        target,
+        maximum_bytes=16,
+        policy=StableReadPolicy.PRIVATE_OWNER,
+    )
+    real_stage = files_module._stage_authorized_private_name
+
+    def replace_at_stage_boundary(directory_fd: int, name: str, stage_fd: int) -> None:
+        target.rename(parent / "original-displaced")
+        _private_file(target, b"unexpected-replacement")
+        real_stage(directory_fd, name, stage_fd)
+
+    monkeypatch.setattr(
+        files_module,
+        "_stage_authorized_private_name",
+        replace_at_stage_boundary,
+    )
+
+    with pytest.raises(SecureFileError):
+        files_module.delete_authorized_private_file(stable.authorization)
+
+    assert (parent / "original-displaced").read_bytes() == b"original"
+    assert target.read_bytes() == b"unexpected-replacement"
+    assert tuple(parent.glob(".saliencegate-delete-*")) == ()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="authorized deletion requires POSIX")
+def test_authorized_private_deletion_restores_after_poststage_directory_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    target = _private_file(parent / "entry", b"original")
+    stable = read_stable_file(
+        target,
+        maximum_bytes=16,
+        policy=StableReadPolicy.PRIVATE_OWNER,
+    )
+    original = target.stat()
+    real_stage = files_module._stage_authorized_private_name
+    real_probe = files_module._probe_directory_fsync
+    staged = False
+    injected = False
+
+    def observe_stage(directory_fd: int, name: str, stage_fd: int) -> None:
+        nonlocal staged
+        real_stage(directory_fd, name, stage_fd)
+        staged = True
+
+    def fail_first_poststage_sync(descriptor: int) -> None:
+        nonlocal injected
+        if staged and not injected:
+            injected = True
+            raise OSError(errno.EIO, "synthetic directory sync failure")
+        real_probe(descriptor)
+
+    monkeypatch.setattr(files_module, "_stage_authorized_private_name", observe_stage)
+    monkeypatch.setattr(files_module, "_probe_directory_fsync", fail_first_poststage_sync)
+
+    with pytest.raises(SecureFileError) as captured:
+        files_module.delete_authorized_private_file(stable.authorization)
+
+    restored = target.stat()
+    assert injected
+    assert target.read_bytes() == b"original"
+    assert (restored.st_dev, restored.st_ino) == (original.st_dev, original.st_ino)
+    assert stat.S_IMODE(restored.st_mode) == 0o600
+    assert restored.st_nlink == 1
+    assert tuple(parent.glob(".saliencegate-delete-*")) == ()
+    _assert_sanitized(captured.value, "synthetic directory sync failure")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="authorized deletion requires POSIX")
+def test_authorized_private_deletion_never_clobbers_an_occupied_restore_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    target = _private_file(parent / "entry", b"original")
+    stable = read_stable_file(
+        target,
+        maximum_bytes=16,
+        policy=StableReadPolicy.PRIVATE_OWNER,
+    )
+    real_stage = files_module._stage_authorized_private_name
+    real_validate_staged = files_module._validate_staged_private_read_target_at
+    occupied = False
+
+    def stage_replacement(directory_fd: int, name: str, stage_fd: int) -> None:
+        target.rename(parent / "original-displaced")
+        _private_file(target, b"staged-candidate")
+        real_stage(directory_fd, name, stage_fd)
+
+    def occupy_original(
+        directory_fd: int,
+        name: str,
+        expected: object,
+    ) -> None:
+        nonlocal occupied
+        if not occupied:
+            _private_file(target, b"new-occupant")
+            occupied = True
+        real_validate_staged(directory_fd, name, expected)
+
+    monkeypatch.setattr(
+        files_module,
+        "_stage_authorized_private_name",
+        stage_replacement,
+    )
+    monkeypatch.setattr(
+        files_module,
+        "_validate_staged_private_read_target_at",
+        occupy_original,
+    )
+
+    with pytest.raises(SecureFileError) as captured:
+        files_module.delete_authorized_private_file(stable.authorization)
+
+    stages = tuple(parent.glob(".saliencegate-delete-*"))
+    assert occupied
+    assert (parent / "original-displaced").read_bytes() == b"original"
+    assert target.read_bytes() == b"new-occupant"
+    assert len(stages) == 1
+    assert (stages[0] / "entry").read_bytes() == b"staged-candidate"
+    _assert_sanitized(captured.value, "staged-candidate")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="authorized deletion requires POSIX")
+@pytest.mark.parametrize("unlink_then_raise", (False, True))
+def test_authorized_private_deletion_classifies_staged_unlink_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unlink_then_raise: bool,
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    target = _private_file(parent / "entry", b"original")
+    stable = read_stable_file(
+        target,
+        maximum_bytes=16,
+        policy=StableReadPolicy.PRIVATE_OWNER,
+    )
+    original = target.stat()
+    real_unlink = os.unlink
+    injected = False
+
+    def fail_first_staged_unlink(
+        name: str | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal injected
+        if name == "entry" and not injected:
+            injected = True
+            if unlink_then_raise:
+                real_unlink(name, dir_fd=dir_fd)
+            raise OSError(errno.EIO, "synthetic staged unlink failure")
+        real_unlink(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", fail_first_staged_unlink)
+    monkeypatch.setattr(
+        os,
+        "supports_dir_fd",
+        os.supports_dir_fd | {fail_first_staged_unlink},
+    )
+
+    with pytest.raises(SecureFileError) as captured:
+        files_module.delete_authorized_private_file(stable.authorization)
+
+    assert injected
+    if unlink_then_raise:
+        assert not target.exists()
+    else:
+        restored = target.stat()
+        assert target.read_bytes() == b"original"
+        assert (restored.st_dev, restored.st_ino) == (original.st_dev, original.st_ino)
+        assert restored.st_nlink == 1
+    assert tuple(parent.glob(".saliencegate-delete-*")) == ()
+    _assert_sanitized(captured.value, "synthetic staged unlink failure")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="authorized deletion requires POSIX")
+def test_authorized_private_deletion_requires_rename_dir_fd_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    target = _private_file(parent / "entry", b"original")
+    stable = read_stable_file(
+        target,
+        maximum_bytes=16,
+        policy=StableReadPolicy.PRIVATE_OWNER,
+    )
+    original = target.stat()
+    monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd - {os.rename})
+
+    with pytest.raises(SecureFileUnsupportedError) as captured:
+        files_module.delete_authorized_private_file(stable.authorization)
+
+    unchanged = target.stat()
+    assert target.read_bytes() == b"original"
+    assert (unchanged.st_dev, unchanged.st_ino) == (original.st_dev, original.st_ino)
+    assert tuple(parent.glob(".saliencegate-delete-*")) == ()
+    assert str(captured.value) == "secure file operation unsupported"
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="authorized deletion requires POSIX")
+def test_authorized_private_deletion_restores_before_propagating_keyboard_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    target = _private_file(parent / "entry", b"original")
+    stable = read_stable_file(
+        target,
+        maximum_bytes=16,
+        policy=StableReadPolicy.PRIVATE_OWNER,
+    )
+    original = target.stat()
+    real_stage = files_module._stage_authorized_private_name
+    real_probe = files_module._probe_directory_fsync
+    staged = False
+    injected = False
+
+    def observe_stage(directory_fd: int, name: str, stage_fd: int) -> None:
+        nonlocal staged
+        real_stage(directory_fd, name, stage_fd)
+        staged = True
+
+    def interrupt_first_poststage_sync(descriptor: int) -> None:
+        nonlocal injected
+        if staged and not injected:
+            injected = True
+            raise KeyboardInterrupt
+        real_probe(descriptor)
+
+    monkeypatch.setattr(files_module, "_stage_authorized_private_name", observe_stage)
+    monkeypatch.setattr(
+        files_module,
+        "_probe_directory_fsync",
+        interrupt_first_poststage_sync,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        files_module.delete_authorized_private_file(stable.authorization)
+
+    restored = target.stat()
+    assert injected
+    assert target.read_bytes() == b"original"
+    assert (restored.st_dev, restored.st_ino) == (original.st_dev, original.st_ino)
+    assert restored.st_nlink == 1
+    assert tuple(parent.glob(".saliencegate-delete-*")) == ()
 
 
 def test_private_location_snapshots_an_absent_slot_without_creating_it(

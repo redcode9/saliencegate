@@ -195,16 +195,26 @@ CAPTURE_RUNTIME_FILES = {
     "saliencegate/capture/__init__.py",
     "saliencegate/capture/adapters.py",
     "saliencegate/capture/capabilities.py",
+    "saliencegate/capture/health.py",
     "saliencegate/capture/identities.py",
+    "saliencegate/capture/locations.py",
+    "saliencegate/capture/migrations/__init__.py",
+    "saliencegate/capture/publication.py",
     "saliencegate/capture/schema.py",
+    "saliencegate/capture/spool.py",
+    "saliencegate/capture/store.py",
     "saliencegate/integrations/__init__.py",
 }
 CAPTURE_RESOURCE_FILES = {
+    "saliencegate/capture/migrations/0001_capture_store.sql",
     "saliencegate/integrations/fixtures/claude-code-hooks-v1.json",
     "saliencegate/integrations/fixtures/codex-hooks-v1.json",
     "saliencegate/integrations/fixtures/opencode-plugin-v1.json",
     "saliencegate/integrations/fixtures/pi-extension-v1.json",
     "saliencegate/integrations/profiles.json",
+}
+CAPTURE_SECURITY_RUNTIME_FILES = {
+    "saliencegate/security/windows.py",
 }
 ROOT_SDIST_FILES = {
     ".gitignore",
@@ -460,6 +470,13 @@ def test_source_distribution_declares_the_complete_shadow_example_membership() -
     } == {path.name for path in (ROOT / "examples/atif-shadow").iterdir()}
 
 
+def test_wheel_declares_the_installed_capture_migration_resources() -> None:
+    metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    artifacts = metadata["tool"]["hatch"]["build"]["targets"]["wheel"]["artifacts"]
+
+    assert "src/saliencegate/capture/migrations/*.sql" in artifacts
+
+
 @pytest.mark.parametrize(
     "names",
     (
@@ -548,6 +565,7 @@ def test_built_wheel_has_exact_runtime_membership_and_payloads(
         "saliencegate/repository/migrations/0002_unique_invocation_event.sql",
         *CAPTURE_RESOURCE_FILES,
         *CAPTURE_RUNTIME_FILES,
+        *CAPTURE_SECURITY_RUNTIME_FILES,
         *SHADOW_RUNTIME_FILES,
         *SHADOW_RESOURCE_FILES,
     } <= files.keys()
@@ -613,6 +631,7 @@ def test_built_sdist_has_exact_reviewable_membership_and_payloads(
         "tests/fixtures/shadow/atif/terminus-timeout-sanitized.trajectory.json",
         *(f"src/{path}" for path in CAPTURE_RESOURCE_FILES),
         *(f"src/{path}" for path in CAPTURE_RUNTIME_FILES),
+        *(f"src/{path}" for path in CAPTURE_SECURITY_RUNTIME_FILES),
         *(f"src/{path}" for path in SHADOW_RUNTIME_FILES),
         *(f"src/{path}" for path in SHADOW_RESOURCE_FILES),
     } <= files.keys()

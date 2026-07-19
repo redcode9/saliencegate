@@ -492,6 +492,8 @@ def test_ci_exercises_the_installed_sdist_from_locked_build_dependencies() -> No
     import_smoke = PACKAGE_IMPORT_SMOKE.read_text(encoding="utf-8")
     assert "import saliencegate.capture" in import_smoke
     assert "import saliencegate.shadow" in import_smoke
+    assert "discover_capture_migrations" in import_smoke
+    assert "capture migration resources are incomplete" in import_smoke
     assert "load_capture_capability_registry" in import_smoke
     assert "find_spec(optional_module)" in import_smoke
     assert "optional_module in sys.modules" in import_smoke

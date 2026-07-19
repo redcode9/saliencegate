@@ -8,10 +8,21 @@ import saliencegate.capture
 import saliencegate.models
 import saliencegate.shadow
 from saliencegate.capture import CaptureProfile, load_capture_capability_registry
+from saliencegate.capture.migrations import discover_capture_migrations
 
 registry = load_capture_capability_registry()
 if tuple(profile.profile_id for profile in registry.profiles) != tuple(CaptureProfile):
     raise RuntimeError("capture capability registry is incomplete")
+
+migrations = discover_capture_migrations()
+if tuple((migration.version, migration.name, migration.checksum) for migration in migrations) != (
+    (
+        1,
+        "capture_store",
+        "b829f4b21bc4859ab352a1ed8513672686622edda2f5bc248a7dc195b4677a77",
+    ),
+):
+    raise RuntimeError("capture migration resources are incomplete")
 
 for optional_module in ("anthropic", "harbor", "httpx", "openai", "openai_harmony"):
     if importlib.util.find_spec(optional_module) is not None:

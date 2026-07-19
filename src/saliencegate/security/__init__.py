@@ -16,6 +16,7 @@ from saliencegate.security.files import (
     StableReadPolicy,
     authorize_atomic_file_publication,
     authorize_private_sqlite_path,
+    claim_private_sqlite_location,
     inspect_private_file_location,
     read_stable_file,
 )
@@ -68,6 +69,7 @@ __all__ = [
     "SyntheticDigestDisabledError",
     "authorize_atomic_file_publication",
     "authorize_private_sqlite_path",
+    "claim_private_sqlite_location",
     "default_installation_key_path",
     "generate_installation_key",
     "inspect_private_file_location",

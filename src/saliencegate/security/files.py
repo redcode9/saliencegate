@@ -115,6 +115,33 @@ class _StableIdentity:
         return self == type(self).from_stat(value)
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _PrivateDirectoryAuthorization:
+    """An exact owner-private directory reached without following symlinks."""
+
+    path: str
+    _identity: _StableIdentity
+
+    def revalidate(self) -> None:
+        descriptor: int | None = None
+        failed = False
+        try:
+            descriptor = _open_authorized_private_directory(self)
+        except Exception:
+            failed = True
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except Exception:
+                    failed = True
+        if failed:
+            raise SecureFileError()
+
+    def __repr__(self) -> str:
+        return "_PrivateDirectoryAuthorization(<redacted>)"
+
+
 @dataclass(frozen=True, slots=True)
 class _CompleteIdentity:
     stable: _StableIdentity
@@ -163,12 +190,33 @@ class StableFileAuthorization:
 
         self._checked_revalidate(strict_transient=False)
 
+    @property
+    def target_exists(self) -> bool:
+        """Whether the inspected private-location slot contained an exact target."""
+
+        if self._kind is not _AuthorizationKind.PRIVATE_LOCATION:
+            raise SecureFileError()
+        return self._target_complete_identity is not None
+
     def _revalidate_before_sqlite_statements(self) -> None:
         """Pin every journal identity before SQLite is allowed to execute SQL."""
 
         if self._kind is not _AuthorizationKind.SQLITE:
             raise SecureFileError()
         self._checked_revalidate(strict_transient=True)
+
+    def _revalidate_mutable_sqlite(self) -> None:
+        """Revalidate a live multi-process SQLite boundary as contents change."""
+
+        failed = False
+        try:
+            if self._kind is not _AuthorizationKind.SQLITE:
+                _fail()
+            _revalidate_mutable_sqlite(self)
+        except Exception:
+            failed = True
+        if failed:
+            raise SecureFileError()
 
     def _checked_revalidate(self, *, strict_transient: bool) -> None:
         failed = False
@@ -323,6 +371,39 @@ class AtomicFilePublication:
 
 def _fail() -> Never:
     raise _UnsafeFilePathError
+
+
+def _preferred_failure(
+    primary: BaseException | None,
+    secondary: BaseException | None,
+) -> BaseException | None:
+    """Preserve the primary failure without swallowing cleanup cancellation."""
+
+    if primary is None:
+        return secondary
+    if not isinstance(primary, Exception):
+        return primary
+    if secondary is not None and not isinstance(secondary, Exception):
+        return secondary
+    return primary
+
+
+def _close_independent_descriptors(
+    *descriptors: int | None,
+) -> BaseException | None:
+    """Attempt every distinct close and return the preferred failure, if any."""
+
+    failure: BaseException | None = None
+    attempted: set[int] = set()
+    for descriptor in descriptors:
+        if descriptor is None or descriptor in attempted:
+            continue
+        attempted.add(descriptor)
+        try:
+            os.close(descriptor)
+        except BaseException as error:
+            failure = _preferred_failure(failure, error)
+    return failure
 
 
 def _current_user_id() -> int:
@@ -567,6 +648,81 @@ def _read_private_file(path: Path, maximum_bytes: int) -> StableFileRead:
     return StableFileRead(data=data, authorization=authorization)
 
 
+def _require_authorized_private_directory_descriptor(
+    directory: _PrivateDirectoryAuthorization,
+    directory_fd: int,
+) -> None:
+    if type(directory_fd) is not int or directory_fd < 0:
+        _fail()
+    opened = os.fstat(directory_fd)
+    if not _safe_private_directory(opened) or not directory._identity.matches(opened):
+        _fail()
+    _require_safe_acl(directory_fd)
+
+
+def _read_private_file_at_descriptor(
+    directory: _PrivateDirectoryAuthorization,
+    directory_fd: int,
+    name: str,
+    maximum_bytes: int,
+) -> StableFileRead:
+    """Read one child relative to an already pinned authorized directory."""
+
+    copied_name = _copy_private_child_name(name)
+    path = Path(directory.path) / copied_name
+    _require_authorized_private_directory_descriptor(directory, directory_fd)
+    named_before = _named_stat(copied_name, directory_fd)
+    descriptor = os.open(copied_name, _read_open_flags(), dir_fd=directory_fd)
+    try:
+        data, identity = _read_opened_stable_file(
+            descriptor,
+            named_before,
+            lambda: _named_stat(copied_name, directory_fd),
+            maximum_bytes=maximum_bytes,
+            policy=StableReadPolicy.PRIVATE_OWNER,
+            check_acl=True,
+        )
+    finally:
+        os.close(descriptor)
+    _require_authorized_private_directory_descriptor(directory, directory_fd)
+    final_named = _named_stat(copied_name, directory_fd)
+    _require_stable_read_metadata(
+        identity,
+        (final_named,),
+        policy=StableReadPolicy.PRIVATE_OWNER,
+    )
+    return StableFileRead(
+        data=data,
+        authorization=StableFileAuthorization(
+            path=os.fspath(path),
+            _parent_identity=directory._identity,
+            _target_identity=identity.stable,
+            _target_complete_identity=identity,
+            _kind=_AuthorizationKind.STABLE_READ,
+            _read_policy=StableReadPolicy.PRIVATE_OWNER,
+        ),
+    )
+
+
+def _read_private_file_at(
+    directory: _PrivateDirectoryAuthorization,
+    name: str,
+    maximum_bytes: int,
+) -> StableFileRead:
+    descriptor = _open_authorized_private_directory(directory)
+    try:
+        result = _read_private_file_at_descriptor(
+            directory,
+            descriptor,
+            name,
+            maximum_bytes,
+        )
+        directory.revalidate()
+        return result
+    finally:
+        os.close(descriptor)
+
+
 def _darwin_acl_is_unsafe(descriptor: int, *, deny_only_allowed: bool) -> bool:
     """Fail-closed detection of unsafe macOS extended ACL entries.
 
@@ -640,6 +796,79 @@ def _named_stat(name: str, directory_fd: int) -> os.stat_result:
     return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
 
 
+def _safe_private_directory(value: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(value.st_mode)
+        and value.st_uid == _current_user_id()
+        and stat.S_IMODE(value.st_mode) == 0o700
+    )
+
+
+def _require_private_directory_platform() -> None:
+    _require_secure_platform()
+    if os.mkdir not in os.supports_dir_fd:
+        _fail()
+
+
+def _open_or_create_private_directory_chain(path: Path) -> tuple[int, _StableIdentity]:
+    """Create a missing suffix with mkdirat while every ancestor remains pinned."""
+
+    if not path.is_absolute() or path.anchor != os.sep or path == Path(os.sep):
+        _fail()
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(os.sep, flags)
+    try:
+        root = os.fstat(descriptor)
+        if not _safe_ancestor(root):
+            _fail()
+        _require_safe_acl(descriptor, deny_only_allowed=True)
+        components = path.parts[1:]
+        for index, component in enumerate(components):
+            if component in ("", ".", ".."):
+                _fail()
+            created = False
+            try:
+                next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                    created = True
+                except FileExistsError:
+                    pass
+                next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            try:
+                if created:
+                    os.fchmod(next_descriptor, 0o700)
+                opened = os.fstat(next_descriptor)
+                named = _named_stat(component, descriptor)
+                identity = _StableIdentity.from_stat(opened)
+                is_leaf = index == len(components) - 1
+                if not identity.matches(named):
+                    _fail()
+                if created or is_leaf:
+                    if not _safe_private_directory(opened) or not _safe_private_directory(named):
+                        _fail()
+                    _require_safe_acl(next_descriptor)
+                else:
+                    if not _safe_ancestor(opened) or not _safe_ancestor(named):
+                        _fail()
+                    _require_safe_acl(next_descriptor, deny_only_allowed=True)
+            except BaseException:
+                os.close(next_descriptor)
+                raise
+            previous_descriptor = descriptor
+            descriptor = next_descriptor
+            os.close(previous_descriptor)
+        opened = os.fstat(descriptor)
+        if not _safe_private_directory(opened):
+            _fail()
+        _require_safe_acl(descriptor)
+        return descriptor, _StableIdentity.from_stat(opened)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _open_directory_chain(path: Path) -> tuple[int, _StableIdentity]:
     """Open an absolute directory without following any component symlink."""
 
@@ -673,6 +902,170 @@ def _open_directory_chain(path: Path) -> tuple[int, _StableIdentity]:
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _open_private_directory_snapshot(path: Path) -> tuple[int, _StableIdentity]:
+    """Open one exact 0700 leaf and confirm a second fresh walk names it."""
+
+    descriptor, identity = _open_directory_chain(path)
+    try:
+        opened = os.fstat(descriptor)
+        if not _safe_private_directory(opened) or not identity.matches(opened):
+            _fail()
+        named_descriptor, named_identity = _open_directory_chain(path)
+        try:
+            named = os.fstat(named_descriptor)
+            if (
+                not _safe_private_directory(named)
+                or not identity.matches(named)
+                or named_identity != identity
+            ):
+                _fail()
+        finally:
+            os.close(named_descriptor)
+        return descriptor, identity
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _authorize_private_directory(
+    path: str | os.PathLike[str],
+    *,
+    create: bool,
+) -> _PrivateDirectoryAuthorization:
+    """Authorize an exact private directory, optionally creating a missing suffix."""
+
+    authorization: _PrivateDirectoryAuthorization | None = None
+    descriptor: int | None = None
+    operation_failure: BaseException | None = None
+    try:
+        if type(create) is not bool:
+            _fail()
+        _require_private_directory_platform()
+        copied_path = _copy_path(path)
+        if create:
+            descriptor, created_identity = _open_or_create_private_directory_chain(copied_path)
+            close_failure = _close_independent_descriptors(descriptor)
+            descriptor = None
+            if close_failure is not None:
+                raise close_failure
+            descriptor, identity = _open_private_directory_snapshot(copied_path)
+            if identity != created_identity:
+                _fail()
+        else:
+            descriptor, identity = _open_private_directory_snapshot(copied_path)
+        authorization = _PrivateDirectoryAuthorization(
+            path=os.fspath(copied_path),
+            _identity=identity,
+        )
+    except BaseException as error:
+        operation_failure = error
+    finally:
+        close_failure = _close_independent_descriptors(descriptor)
+        operation_failure = _preferred_failure(operation_failure, close_failure)
+    if operation_failure is not None and not isinstance(operation_failure, Exception):
+        raise operation_failure
+    if operation_failure is not None or authorization is None:
+        raise SecureFileError()
+    return authorization
+
+
+def _open_authorized_private_directory(
+    authorization: _PrivateDirectoryAuthorization,
+) -> int:
+    """Return a descriptor for the exact directory captured by an authorization."""
+
+    if (
+        type(authorization) is not _PrivateDirectoryAuthorization
+        or type(authorization.path) is not str
+        or type(authorization._identity) is not _StableIdentity
+    ):
+        _fail()
+    copied_path = _copy_path(authorization.path)
+    if os.fspath(copied_path) != authorization.path:
+        _fail()
+    descriptor, identity = _open_private_directory_snapshot(copied_path)
+    if identity != authorization._identity:
+        os.close(descriptor)
+        _fail()
+    return descriptor
+
+
+def _authorize_private_directory_child(
+    parent: _PrivateDirectoryAuthorization,
+    name: str,
+    *,
+    create: bool,
+) -> _PrivateDirectoryAuthorization:
+    """Authorize one direct child relative to an already authorized parent."""
+
+    authorization: _PrivateDirectoryAuthorization | None = None
+    parent_fd: int | None = None
+    child_fd: int | None = None
+    operation_failure: BaseException | None = None
+    try:
+        if type(create) is not bool:
+            _fail()
+        _require_private_directory_platform()
+        copied_name = _copy_private_child_name(name)
+        parent_fd = _open_authorized_private_directory(parent)
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+        created = False
+        try:
+            child_fd = os.open(copied_name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            if not create:
+                raise
+            try:
+                os.mkdir(copied_name, 0o700, dir_fd=parent_fd)
+                created = True
+            except FileExistsError:
+                pass
+            child_fd = os.open(copied_name, flags, dir_fd=parent_fd)
+        if created:
+            os.fchmod(child_fd, 0o700)
+        opened = os.fstat(child_fd)
+        named = _named_stat(copied_name, parent_fd)
+        identity = _StableIdentity.from_stat(opened)
+        if (
+            not _safe_private_directory(opened)
+            or not _safe_private_directory(named)
+            or not identity.matches(named)
+        ):
+            _fail()
+        _require_safe_acl(child_fd)
+        _require_authorized_private_directory_descriptor(parent, parent_fd)
+        authorization = _PrivateDirectoryAuthorization(
+            path=os.fspath(Path(parent.path) / copied_name),
+            _identity=identity,
+        )
+    except BaseException as error:
+        operation_failure = error
+    finally:
+        close_failure = _close_independent_descriptors(child_fd, parent_fd)
+        operation_failure = _preferred_failure(operation_failure, close_failure)
+    if operation_failure is not None and not isinstance(operation_failure, Exception):
+        raise operation_failure
+    if operation_failure is not None or authorization is None:
+        raise SecureFileError()
+    parent.revalidate()
+    authorization.revalidate()
+    return authorization
+
+
+def _copy_private_child_name(name: str) -> str:
+    if (
+        type(name) is not str
+        or not name
+        or name in (".", "..")
+        or os.sep in name
+        or (os.altsep is not None and os.altsep in name)
+        or "\0" in name
+    ):
+        _fail()
+    os.fsencode(name)
+    return name
 
 
 def _open_parent(path: Path) -> tuple[int, _StableIdentity]:
@@ -736,6 +1129,41 @@ def _validate_existing_target(
         ):
             _fail()
         return identity.stable
+    finally:
+        os.close(descriptor)
+
+
+def _validate_existing_mutable_target(
+    directory_fd: int,
+    name: str,
+    *,
+    expected: _StableIdentity | None = None,
+) -> _StableIdentity:
+    """Pin security identity while allowing SQLite-managed bytes to change."""
+
+    named_before = _named_stat(name, directory_fd)
+    if not _safe_target(named_before):
+        _fail()
+    descriptor = _open_existing_target(name, directory_fd)
+    try:
+        opened_before = os.fstat(descriptor)
+        if not _safe_target(opened_before):
+            _fail()
+        _require_safe_acl(descriptor)
+        identity = _StableIdentity.from_stat(opened_before)
+        opened_after = os.fstat(descriptor)
+        _require_safe_acl(descriptor)
+        named_after = _named_stat(name, directory_fd)
+        if (
+            not _safe_target(opened_after)
+            or not _safe_target(named_after)
+            or _StableIdentity.from_stat(named_before) != identity
+            or _StableIdentity.from_stat(opened_after) != identity
+            or _StableIdentity.from_stat(named_after) != identity
+            or (expected is not None and identity != expected)
+        ):
+            _fail()
+        return identity
     finally:
         os.close(descriptor)
 
@@ -1206,6 +1634,61 @@ def _revalidate_sqlite(
         os.close(directory_fd)
 
 
+def _validate_mutable_sqlite_sidecars(
+    directory_fd: int,
+    database_name: str,
+    sidecars: tuple[_SQLiteSidecarAuthorization, ...],
+) -> None:
+    if tuple(sidecar.suffix for sidecar in sidecars) != _SQLITE_SIDECAR_SUFFIXES:
+        _fail()
+    for sidecar in sidecars:
+        try:
+            _validate_existing_mutable_target(
+                directory_fd,
+                f"{database_name}{sidecar.suffix}",
+                expected=None if sidecar.transient else sidecar.identity,
+            )
+        except FileNotFoundError:
+            if sidecar.transient:
+                continue
+            raise
+
+
+def _revalidate_mutable_sqlite(authorization: StableFileAuthorization) -> None:
+    path = Path(authorization.path)
+    expected_parent = authorization._parent_identity
+    expected_target = authorization._target_identity
+    if expected_parent is None or expected_target is None:
+        _fail()
+    directory_fd, parent_identity = _open_parent(path)
+    try:
+        if parent_identity != expected_parent:
+            _fail()
+        _validate_existing_mutable_target(
+            directory_fd,
+            path.name,
+            expected=expected_target,
+        )
+        _validate_mutable_sqlite_sidecars(
+            directory_fd,
+            path.name,
+            authorization._sqlite_sidecars,
+        )
+        _verify_parent(path, directory_fd, expected_parent)
+        _validate_existing_mutable_target(
+            directory_fd,
+            path.name,
+            expected=expected_target,
+        )
+        _validate_mutable_sqlite_sidecars(
+            directory_fd,
+            path.name,
+            authorization._sqlite_sidecars,
+        )
+    finally:
+        os.close(directory_fd)
+
+
 def _validate_read_authorization(authorization: StableFileAuthorization) -> None:
     expected = authorization._target_complete_identity
     policy = authorization._read_policy
@@ -1264,6 +1747,373 @@ def _validate_read_authorization(authorization: StableFileAuthorization) -> None
         os.close(directory_fd)
 
 
+def _validate_private_read_target_at(
+    directory_fd: int,
+    name: str,
+    expected: _CompleteIdentity,
+) -> None:
+    """Revalidate one PRIVATE_OWNER read against an already pinned parent."""
+
+    if type(expected) is not _CompleteIdentity:
+        _fail()
+    named_before = _named_stat(name, directory_fd)
+    descriptor = os.open(name, _read_open_flags(), dir_fd=directory_fd)
+    try:
+        opened_before = os.fstat(descriptor)
+        _require_safe_acl(descriptor)
+        opened_after = os.fstat(descriptor)
+        _require_safe_acl(descriptor)
+        named_after = _named_stat(name, directory_fd)
+        _require_stable_read_metadata(
+            expected,
+            (named_before, opened_before, opened_after, named_after),
+            policy=StableReadPolicy.PRIVATE_OWNER,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _staged_private_read_metadata_matches(
+    expected: _CompleteIdentity,
+    value: os.stat_result,
+) -> bool:
+    """Match a renamed target while allowing the rename-induced ctime change."""
+
+    return (
+        _safe_read_target(value, StableReadPolicy.PRIVATE_OWNER)
+        and expected.stable.matches(value)
+        and value.st_nlink == expected.link_count
+        and value.st_size == expected.size
+        and value.st_mtime_ns == expected.modified_ns
+    )
+
+
+def _validate_staged_private_read_target_at(
+    directory_fd: int,
+    name: str,
+    expected: _CompleteIdentity,
+) -> None:
+    if type(expected) is not _CompleteIdentity:
+        _fail()
+    named_before = _named_stat(name, directory_fd)
+    descriptor = os.open(name, _read_open_flags(), dir_fd=directory_fd)
+    try:
+        opened_before = os.fstat(descriptor)
+        _require_safe_acl(descriptor)
+        opened_after = os.fstat(descriptor)
+        _require_safe_acl(descriptor)
+        named_after = _named_stat(name, directory_fd)
+        if any(
+            not _staged_private_read_metadata_matches(expected, value)
+            for value in (named_before, opened_before, opened_after, named_after)
+        ):
+            _fail()
+    finally:
+        os.close(descriptor)
+
+
+def _require_private_delete_platform() -> None:
+    try:
+        _require_secure_platform()
+    except Exception:
+        raise _UnsupportedFileOperationError from None
+    if (
+        not hasattr(os, "fsync")
+        or not hasattr(os, "link")
+        or not hasattr(os, "mkdir")
+        or not hasattr(os, "rename")
+        or not hasattr(os, "rmdir")
+        or os.link not in os.supports_dir_fd
+        or os.link not in os.supports_follow_symlinks
+        or os.mkdir not in os.supports_dir_fd
+        or os.rename not in os.supports_dir_fd
+        or os.rmdir not in os.supports_dir_fd
+    ):
+        raise _UnsupportedFileOperationError
+
+
+def _private_delete_stage_matches(
+    metadata: os.stat_result | None,
+    expected: _StableIdentity,
+) -> bool:
+    return (
+        metadata is not None
+        and stat.S_ISDIR(metadata.st_mode)
+        and stat.S_IMODE(metadata.st_mode) == 0o700
+        and metadata.st_uid == _current_user_id()
+        and expected.matches(metadata)
+    )
+
+
+def _create_private_delete_stage(
+    directory_fd: int,
+    *,
+    forbidden_name: str,
+) -> tuple[str, int, _StableIdentity]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    for _attempt in range(32):
+        name = f".saliencegate-delete-{secrets.token_hex(16)}"
+        if name == forbidden_name:
+            continue
+        try:
+            os.mkdir(name, 0o700, dir_fd=directory_fd)
+        except FileExistsError:
+            continue
+        stage_fd: int | None = None
+        identity: _StableIdentity | None = None
+        try:
+            stage_fd = os.open(name, flags, dir_fd=directory_fd)
+            os.fchmod(stage_fd, 0o700)
+            opened = os.fstat(stage_fd)
+            _require_safe_acl(stage_fd)
+            identity = _StableIdentity.from_stat(opened)
+            named = _named_stat(name, directory_fd)
+            if not _private_delete_stage_matches(opened, identity) or not identity.matches(named):
+                _fail()
+            return name, stage_fd, identity
+        except BaseException:
+            if stage_fd is not None:
+                with suppress(OSError):
+                    os.close(stage_fd)
+            if identity is not None and _private_delete_stage_matches(
+                _optional_named_stat(name, directory_fd),
+                identity,
+            ):
+                with suppress(OSError):
+                    os.rmdir(name, dir_fd=directory_fd)
+            raise
+    _fail()
+
+
+def _stage_authorized_private_name(
+    directory_fd: int,
+    name: str,
+    stage_fd: int,
+) -> None:
+    """Atomically move the current name into a freshly created private stage."""
+
+    _require_absent_target(stage_fd, "entry")
+    os.rename(
+        name,
+        "entry",
+        src_dir_fd=directory_fd,
+        dst_dir_fd=stage_fd,
+    )
+
+
+def _same_named_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return _same_inode(_StableIdentity.from_stat(left), _StableIdentity.from_stat(right))
+
+
+def _restore_staged_private_name(
+    directory_fd: int,
+    name: str,
+    stage_fd: int,
+) -> bool:
+    """Best-effort no-clobber restoration; never overwrite an occupied name."""
+
+    try:
+        staged = _optional_named_stat("entry", stage_fd)
+        if staged is None:
+            return True
+        if _optional_named_stat(name, directory_fd) is not None:
+            return False
+        os.link(
+            "entry",
+            name,
+            src_dir_fd=stage_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        restored = _named_stat(name, directory_fd)
+        staged_after = _named_stat("entry", stage_fd)
+        if not _same_named_inode(staged, restored) or not _same_named_inode(
+            restored,
+            staged_after,
+        ):
+            return False
+        os.unlink("entry", dir_fd=stage_fd)
+        if _optional_named_stat("entry", stage_fd) is not None:
+            return False
+        _probe_directory_fsync(stage_fd)
+        _probe_directory_fsync(directory_fd)
+        restored_after = _named_stat(name, directory_fd)
+        return _same_named_inode(restored, restored_after)
+    except Exception:
+        return False
+
+
+def _remove_private_delete_stage(
+    directory_fd: int,
+    name: str,
+    expected: _StableIdentity,
+) -> bool:
+    try:
+        metadata = _optional_named_stat(name, directory_fd)
+        if metadata is None:
+            return True
+        if not _private_delete_stage_matches(metadata, expected):
+            return False
+        os.rmdir(name, dir_fd=directory_fd)
+        return _optional_named_stat(name, directory_fd) is None
+    except Exception:
+        return False
+
+
+def _delete_authorized_private_file(authorization: StableFileAuthorization) -> None:
+    """Atomically stage and then delete one exact PRIVATE_OWNER stable read."""
+
+    expected = authorization._target_complete_identity
+    expected_parent = authorization._parent_identity
+    if (
+        authorization._kind is not _AuthorizationKind.STABLE_READ
+        or authorization._read_policy is not StableReadPolicy.PRIVATE_OWNER
+        or authorization._sqlite_sidecars
+        or type(expected) is not _CompleteIdentity
+        or type(expected_parent) is not _StableIdentity
+        or authorization._target_identity != expected.stable
+        or type(authorization.path) is not str
+    ):
+        _fail()
+    path = _copy_path(authorization.path)
+    if os.fspath(path) != authorization.path:
+        _fail()
+    directory_fd, parent_identity = _open_parent(path)
+    stage_name: str | None = None
+    stage_fd: int | None = None
+    stage_identity: _StableIdentity | None = None
+    staged = False
+    try:
+        if parent_identity != expected_parent:
+            _fail()
+        _probe_directory_fsync(directory_fd)
+        _validate_private_read_target_at(directory_fd, path.name, expected)
+        stage_name, stage_fd, stage_identity = _create_private_delete_stage(
+            directory_fd,
+            forbidden_name=path.name,
+        )
+        _probe_directory_fsync(stage_fd)
+        _verify_parent(path, directory_fd, expected_parent)
+        _validate_private_read_target_at(directory_fd, path.name, expected)
+        _stage_authorized_private_name(directory_fd, path.name, stage_fd)
+        staged = True
+        _require_absent_target(directory_fd, path.name)
+        _probe_directory_fsync(directory_fd)
+        _probe_directory_fsync(stage_fd)
+        try:
+            _validate_staged_private_read_target_at(stage_fd, "entry", expected)
+        except Exception:
+            if _restore_staged_private_name(directory_fd, path.name, stage_fd):
+                staged = False
+            _fail()
+        os.unlink("entry", dir_fd=stage_fd)
+        staged = _optional_named_stat("entry", stage_fd) is not None
+        if staged:
+            _fail()
+        _probe_directory_fsync(stage_fd)
+        os.close(stage_fd)
+        stage_fd = None
+        if not _remove_private_delete_stage(directory_fd, stage_name, stage_identity):
+            _fail()
+        _probe_directory_fsync(directory_fd)
+        _verify_parent(path, directory_fd, expected_parent)
+        _require_absent_target(directory_fd, path.name)
+    finally:
+        if (
+            staged
+            and stage_fd is not None
+            and _restore_staged_private_name(
+                directory_fd,
+                path.name,
+                stage_fd,
+            )
+        ):
+            staged = False
+        if stage_fd is not None:
+            with suppress(OSError):
+                os.close(stage_fd)
+        if not staged and stage_name is not None and stage_identity is not None:
+            _remove_private_delete_stage(directory_fd, stage_name, stage_identity)
+        os.close(directory_fd)
+
+
+def _delete_authorized_private_file_at_descriptor(
+    directory: _PrivateDirectoryAuthorization,
+    directory_fd: int,
+    authorization: StableFileAuthorization,
+) -> None:
+    """Delete one stable child using the transaction's pinned directory descriptor."""
+
+    _require_private_delete_platform()
+    expected = authorization._target_complete_identity
+    if (
+        type(directory) is not _PrivateDirectoryAuthorization
+        or type(authorization) is not StableFileAuthorization
+        or authorization._kind is not _AuthorizationKind.STABLE_READ
+        or authorization._read_policy is not StableReadPolicy.PRIVATE_OWNER
+        or authorization._sqlite_sidecars
+        or type(expected) is not _CompleteIdentity
+        or authorization._parent_identity != directory._identity
+        or authorization._target_identity != expected.stable
+        or type(authorization.path) is not str
+    ):
+        _fail()
+    path = _copy_path(authorization.path)
+    if path.parent != Path(directory.path) or os.fspath(path) != authorization.path:
+        _fail()
+    name = _copy_private_child_name(path.name)
+    stage_name: str | None = None
+    stage_fd: int | None = None
+    stage_identity: _StableIdentity | None = None
+    staged = False
+    _require_authorized_private_directory_descriptor(directory, directory_fd)
+    try:
+        _probe_directory_fsync(directory_fd)
+        _validate_private_read_target_at(directory_fd, name, expected)
+        stage_name, stage_fd, stage_identity = _create_private_delete_stage(
+            directory_fd,
+            forbidden_name=name,
+        )
+        _probe_directory_fsync(stage_fd)
+        _require_authorized_private_directory_descriptor(directory, directory_fd)
+        _validate_private_read_target_at(directory_fd, name, expected)
+        _stage_authorized_private_name(directory_fd, name, stage_fd)
+        staged = True
+        _require_absent_target(directory_fd, name)
+        _probe_directory_fsync(directory_fd)
+        _probe_directory_fsync(stage_fd)
+        try:
+            _validate_staged_private_read_target_at(stage_fd, "entry", expected)
+        except Exception:
+            if _restore_staged_private_name(directory_fd, name, stage_fd):
+                staged = False
+            _fail()
+        os.unlink("entry", dir_fd=stage_fd)
+        staged = _optional_named_stat("entry", stage_fd) is not None
+        if staged:
+            _fail()
+        _probe_directory_fsync(stage_fd)
+        os.close(stage_fd)
+        stage_fd = None
+        if not _remove_private_delete_stage(directory_fd, stage_name, stage_identity):
+            _fail()
+        _probe_directory_fsync(directory_fd)
+        _require_authorized_private_directory_descriptor(directory, directory_fd)
+        _require_absent_target(directory_fd, name)
+    finally:
+        if (
+            staged
+            and stage_fd is not None
+            and _restore_staged_private_name(directory_fd, name, stage_fd)
+        ):
+            staged = False
+        if stage_fd is not None:
+            with suppress(OSError):
+                os.close(stage_fd)
+        if not staged and stage_name is not None and stage_identity is not None:
+            _remove_private_delete_stage(directory_fd, stage_name, stage_identity)
+
+
 def _validate_private_location_target(
     directory_fd: int,
     name: str,
@@ -1302,6 +2152,38 @@ def _require_absent_target(directory_fd: int, name: str) -> None:
     except FileNotFoundError:
         return
     _fail()
+
+
+def _inspect_private_file_location_at_descriptor(
+    directory: _PrivateDirectoryAuthorization,
+    directory_fd: int,
+    name: str,
+) -> StableFileAuthorization:
+    """Snapshot an exact child slot without resolving its directory path again."""
+
+    copied_name = _copy_private_child_name(name)
+    _require_authorized_private_directory_descriptor(directory, directory_fd)
+    try:
+        identity = _validate_private_location_target(directory_fd, copied_name)
+    except FileNotFoundError:
+        identity = None
+        _require_absent_target(directory_fd, copied_name)
+    _require_authorized_private_directory_descriptor(directory, directory_fd)
+    if identity is None:
+        _require_absent_target(directory_fd, copied_name)
+    else:
+        _validate_private_location_target(
+            directory_fd,
+            copied_name,
+            expected=identity,
+        )
+    return StableFileAuthorization(
+        path=os.fspath(Path(directory.path) / copied_name),
+        _parent_identity=directory._identity,
+        _target_identity=None if identity is None else identity.stable,
+        _target_complete_identity=identity,
+        _kind=_AuthorizationKind.PRIVATE_LOCATION,
+    )
 
 
 def _revalidate_private_location(authorization: StableFileAuthorization) -> None:
@@ -1627,6 +2509,26 @@ def _validate_publication_location_at(
         _validate_private_location_target(directory_fd, path.name, expected=expected)
 
 
+def _validate_publication_location_at_descriptor(
+    directory: _PrivateDirectoryAuthorization,
+    directory_fd: int,
+    authorization: StableFileAuthorization,
+) -> None:
+    path = Path(authorization.path)
+    expected = authorization._target_complete_identity
+    if (
+        authorization._kind is not _AuthorizationKind.PRIVATE_LOCATION
+        or authorization._parent_identity != directory._identity
+        or path.parent != Path(directory.path)
+    ):
+        _fail()
+    _require_authorized_private_directory_descriptor(directory, directory_fd)
+    if expected is None:
+        _require_absent_target(directory_fd, path.name)
+    else:
+        _validate_private_location_target(directory_fd, path.name, expected=expected)
+
+
 def _target_is_atomic_inode(
     directory_fd: int,
     target_name: str,
@@ -1802,6 +2704,60 @@ def _rollback_replacement(
     return restored_exactly
 
 
+def _rollback_replacement_at_descriptor(
+    directory: _PrivateDirectoryAuthorization,
+    directory_fd: int,
+    target_name: str,
+    new_identity: _StableIdentity,
+    backup: _AtomicTemporaryFile,
+    old_data: bytes,
+) -> bool:
+    if not _target_is_atomic_inode(directory_fd, target_name, new_identity):
+        return False
+    source = backup
+    if not _temporary_is_complete(directory_fd, backup):
+        try:
+            source = _create_atomic_temporary_file(
+                directory_fd,
+                old_data,
+                forbidden_names=frozenset({target_name, backup.name}),
+            )
+        except Exception:
+            return False
+    for _attempt in range(2):
+        if _optional_named_stat(source.name, directory_fd) is None:
+            break
+        if not _temporary_is_complete(directory_fd, source):
+            return False
+        with suppress(Exception):
+            os.rename(
+                source.name,
+                target_name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+    if _optional_named_stat(source.name, directory_fd) is not None:
+        if source is not backup:
+            _unlink_atomic_name(directory_fd, source.name, source.identity)
+        return False
+    if not _target_is_atomic_inode(directory_fd, target_name, source.identity):
+        return False
+    try:
+        os.fsync(directory_fd)
+        restored = _read_private_file_at_descriptor(
+            directory,
+            directory_fd,
+            target_name,
+            max(1, len(old_data)),
+        )
+    except Exception:
+        return False
+    restored_exactly = restored.data == old_data
+    if source is not backup:
+        _unlink_atomic_name(directory_fd, backup.name, backup.identity)
+    return restored_exactly
+
+
 def _publish_atomic_file(
     publication: AtomicFilePublication,
     data: bytes,
@@ -1921,6 +2877,236 @@ def _publish_atomic_file(
             os.close(directory_fd)
 
 
+def _publish_private_file_at_descriptor_unchecked(
+    directory: _PrivateDirectoryAuthorization,
+    directory_fd: int,
+    authorization: StableFileAuthorization,
+    replacement_data: bytes | None,
+    data: bytes,
+    maximum_bytes: int,
+    validate_published: Callable[[bytes], bool] | None,
+) -> StableFileRead:
+    """Publish through one pinned directory without resolving its path."""
+
+    path = Path(authorization.path)
+    new_temporary: _AtomicTemporaryFile | None = None
+    backup: _AtomicTemporaryFile | None = None
+    replacement_lock_fd: int | None = None
+    published = False
+    committed = False
+    preserve_backup = False
+    try:
+        _validate_publication_location_at_descriptor(
+            directory,
+            directory_fd,
+            authorization,
+        )
+        if replacement_data is not None:
+            replacement_lock_fd = _lock_replacement_target(directory_fd, authorization)
+            _validate_publication_location_at_descriptor(
+                directory,
+                directory_fd,
+                authorization,
+            )
+        forbidden = frozenset({path.name})
+        if replacement_data is not None:
+            backup = _create_atomic_temporary_file(
+                directory_fd,
+                replacement_data,
+                forbidden_names=forbidden,
+            )
+            forbidden = frozenset({path.name, backup.name})
+        new_temporary = _create_atomic_temporary_file(
+            directory_fd,
+            data,
+            forbidden_names=forbidden,
+        )
+        if backup is not None:
+            os.fsync(directory_fd)
+        _validate_publication_location_at_descriptor(
+            directory,
+            directory_fd,
+            authorization,
+        )
+        try:
+            if replacement_data is None:
+                _link_temporary_no_clobber(directory_fd, new_temporary, path.name)
+            else:
+                _rename_temporary_over_target(directory_fd, new_temporary, path.name)
+        except BaseException:
+            published = _target_is_atomic_inode(
+                directory_fd,
+                path.name,
+                new_temporary.identity,
+            )
+            if (
+                replacement_data is not None
+                and not published
+                and authorization._target_identity is not None
+                and not _target_is_atomic_inode(
+                    directory_fd,
+                    path.name,
+                    authorization._target_identity,
+                )
+            ):
+                preserve_backup = True
+            raise
+        published = True
+        os.fsync(directory_fd)
+        reopened = _read_private_file_at_descriptor(
+            directory,
+            directory_fd,
+            path.name,
+            maximum_bytes,
+        )
+        if (
+            reopened.data != data
+            or reopened.authorization._target_identity != new_temporary.identity
+        ):
+            _fail()
+        if validate_published is not None:
+            try:
+                validated = validate_published(reopened.data)
+            except Exception:
+                _fail()
+            if validated is not True:
+                _fail()
+        reopened_identity = reopened.authorization._target_complete_identity
+        if type(reopened_identity) is not _CompleteIdentity:
+            _fail()
+        _validate_private_read_target_at(
+            directory_fd,
+            path.name,
+            reopened_identity,
+        )
+        if backup is not None and not _unlink_atomic_name(
+            directory_fd,
+            backup.name,
+            backup.identity,
+        ):
+            _fail()
+        committed = True
+        return reopened
+    except BaseException:
+        if published and new_temporary is not None:
+            if replacement_data is None:
+                _rollback_absent_publication(
+                    directory_fd,
+                    path.name,
+                    new_temporary.identity,
+                )
+            elif backup is not None:
+                restored = _rollback_replacement_at_descriptor(
+                    directory,
+                    directory_fd,
+                    path.name,
+                    new_temporary.identity,
+                    backup,
+                    replacement_data,
+                )
+                preserve_backup = not restored
+        raise
+    finally:
+        if new_temporary is not None:
+            _unlink_atomic_name(directory_fd, new_temporary.name, new_temporary.identity)
+        if backup is not None and not preserve_backup and (committed or not published):
+            _unlink_atomic_name(directory_fd, backup.name, backup.identity)
+        if replacement_lock_fd is not None:
+            if _fcntl is not None:
+                with suppress(OSError):
+                    _fcntl.flock(replacement_lock_fd, _fcntl.LOCK_UN)
+            with suppress(OSError):
+                os.close(replacement_lock_fd)
+
+
+def _publish_private_file_at_descriptor(
+    directory: _PrivateDirectoryAuthorization,
+    directory_fd: int,
+    name: str,
+    data: bytes,
+    *,
+    maximum_bytes: int,
+    validate_replacement: Callable[[bytes], bool] | None = None,
+    validate_published: Callable[[bytes], bool] | None = None,
+) -> StableFileRead:
+    """Authorize and publish one private child within a pinned transaction."""
+
+    if type(maximum_bytes) is not int or not 1 <= maximum_bytes < sys.maxsize:
+        raise SecureFileBoundError()
+    if type(data) is not bytes:
+        raise SecureFileError()
+    if len(data) > maximum_bytes:
+        raise SecureFileBoundError()
+    if validate_replacement is not None and not callable(validate_replacement):
+        raise SecureFileError()
+    if validate_published is not None and not callable(validate_published):
+        raise SecureFileError()
+    result: StableFileRead | None = None
+    bound_exceeded = False
+    unsupported = False
+    try:
+        _require_atomic_publication_platform()
+        authorization = _inspect_private_file_location_at_descriptor(
+            directory,
+            directory_fd,
+            name,
+        )
+        _probe_directory_fsync(directory_fd)
+        replacement_data: bytes | None = None
+        if authorization._target_complete_identity is not None:
+            if validate_replacement is None:
+                _fail()
+            existing = _read_private_file_at_descriptor(
+                directory,
+                directory_fd,
+                name,
+                maximum_bytes,
+            )
+            if (
+                existing.authorization._target_complete_identity
+                != authorization._target_complete_identity
+            ):
+                _fail()
+            try:
+                accepted = validate_replacement(existing.data)
+            except Exception:
+                _fail()
+            if accepted is not True:
+                _fail()
+            _validate_publication_location_at_descriptor(
+                directory,
+                directory_fd,
+                authorization,
+            )
+            replacement_data = existing.data
+        result = _publish_private_file_at_descriptor_unchecked(
+            directory,
+            directory_fd,
+            authorization,
+            replacement_data,
+            data,
+            maximum_bytes,
+            validate_published,
+        )
+    except SecureFileBoundError:
+        bound_exceeded = True
+    except _UnsupportedFileOperationError:
+        unsupported = True
+    except OSError as error:
+        unsupported = error.errno in _UNSUPPORTED_OPERATION_ERRNOS
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        pass
+    if bound_exceeded:
+        raise SecureFileBoundError()
+    if unsupported:
+        raise SecureFileUnsupportedError()
+    if result is None:
+        raise SecureFileError()
+    return result
+
+
 def authorize_atomic_file_publication(
     path: str | os.PathLike[str],
     *,
@@ -2022,6 +3208,33 @@ def read_stable_file(
     return result
 
 
+def delete_authorized_private_file(
+    authorization: StableFileAuthorization,
+) -> None:
+    """Delete only the exact file authenticated by a PRIVATE_OWNER stable read."""
+
+    unsupported = False
+    failed = False
+    try:
+        _require_private_delete_platform()
+        if type(authorization) is not StableFileAuthorization:
+            _fail()
+        _delete_authorized_private_file(authorization)
+    except (SecureFileUnsupportedError, _UnsupportedFileOperationError):
+        unsupported = True
+    except OSError as error:
+        unsupported = error.errno in _UNSUPPORTED_OPERATION_ERRNOS
+        failed = not unsupported
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        failed = True
+    if unsupported:
+        raise SecureFileUnsupportedError()
+    if failed:
+        raise SecureFileError()
+
+
 def inspect_private_file_location(
     path: str | os.PathLike[str],
 ) -> StableFileAuthorization:
@@ -2095,6 +3308,24 @@ def _claim_private_sqlite_location(
     return authorization
 
 
+def claim_private_sqlite_location(
+    location: StableFileAuthorization,
+    *,
+    sidecar_locations: tuple[StableFileAuthorization, ...] | None = None,
+) -> StableFileAuthorization:
+    """Claim an exact inspected database and sidecar layout without path fallback."""
+
+    try:
+        return _claim_private_sqlite_location(
+            location,
+            sidecar_locations=sidecar_locations,
+        )
+    except SecureFileError:
+        raise
+    except Exception:
+        raise SecureFileError() from None
+
+
 def authorize_private_sqlite_path(
     path: str | os.PathLike[str],
 ) -> StableFileAuthorization:
@@ -2122,6 +3353,8 @@ __all__ = [
     "StableReadPolicy",
     "authorize_atomic_file_publication",
     "authorize_private_sqlite_path",
+    "claim_private_sqlite_location",
+    "delete_authorized_private_file",
     "inspect_private_file_location",
     "read_stable_file",
 ]
