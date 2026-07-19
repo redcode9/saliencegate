@@ -7,12 +7,17 @@ from pathlib import Path
 import pytest
 from scripts.check_public_tree import (
     REQUIRED_IGNORE_PATTERNS,
+    check_public_tree,
     find_path_violations,
     has_required_ignore_suffix,
 )
 
 ROOT = Path(__file__).parents[1]
 CHECKER = ROOT / "scripts" / "check_public_tree.py"
+
+
+def test_real_repository_public_tree_is_clean() -> None:
+    assert check_public_tree(ROOT) == ()
 
 
 @pytest.mark.parametrize(

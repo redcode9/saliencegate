@@ -30,6 +30,7 @@ EXPECTED_PROFILE_DIGESTS = {
     ),
 }
 EXPECTED_MANIFEST_DIGEST = "b12cdabc7a25644efb5da81aec3f8036f280e5d638e6b7aa07bb6593893967f2"
+EXPECTED_MANIFEST_RAW_SHA256 = "981bad10e0d7fdb5391656f7df153fec59d24324ccab21dceb17344b88bd0e8d"
 EXPECTED_ATIF_FIXTURE_SHA256 = {
     "tests/fixtures/shadow/atif/codex-bundled-synthetic.trajectory.json": (
         "9ee5263186de96695f3f80c50caf9073dc9a4010f10227119fc22ed4ded58b81"
@@ -972,6 +973,19 @@ def test_compatibility_manifest_is_installed_canonical_and_shared_by_both_profil
     assert len(manifest_digest) == 64
     assert all(character in "0123456789abcdef" for character in manifest_digest)
     assert all(manifest_digest.encode("ascii") in trace._descriptor_preimage() for trace in traces)
+
+
+def test_compatibility_manifest_source_and_installed_bytes_match_frozen_raw_digest() -> None:
+    source_bytes = Path("src/saliencegate/shadow/atif_profile_compatibility.json").read_bytes()
+    installed_bytes = (
+        resources.files("saliencegate.shadow")
+        .joinpath("atif_profile_compatibility.json")
+        .read_bytes()
+    )
+
+    assert source_bytes == installed_bytes
+    assert hashlib.sha256(source_bytes).hexdigest() == EXPECTED_MANIFEST_RAW_SHA256
+    assert hashlib.sha256(installed_bytes).hexdigest() == EXPECTED_MANIFEST_RAW_SHA256
 
 
 def test_compatibility_manifest_references_are_closed_and_fixture_bytes_are_frozen() -> None:
