@@ -263,11 +263,11 @@ wheels = [
 
 [[package]]
 name = "editables"
-version = "0.3"
+version = "0.6"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/01/b0/a2a87db4b6cb8e7d57004b6836faa634e0747e3e39ded126cdbe5a33ba36/editables-0.3.tar.gz", hash = "sha256:167524e377358ed1f1374e61c268f0d7a4bf7dbd046c656f7b410cde16161b1a", size = 4668, upload-time = "2022-04-10T15:35:32.237Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/82/f8/02a4e9a0cb961b0feeb431ac96b231c157ecdcbbeacafe9e2fdb4b1dde39/editables-0.6.tar.gz", hash = "sha256:1163834902381c4613787951c5914800fdf155ae08848a373b8ea5006780977c", size = 16763, upload-time = "2026-04-14T10:39:04.677Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ef/8c/87276afb1ba3193c4c05be83965a1e69b8a14821ce6d688464071b179383/editables-0.3-py3-none-any.whl", hash = "sha256:ee686a8db9f5d91da39849f175ffeef094dd0e9c36d6a59a2e8c7f92a3b80020", size = 4689, upload-time = "2022-04-10T15:35:29.912Z" },
+    { url = "https://files.pythonhosted.org/packages/cc/0e/d095533037fc9468f947b19f2da53f869804632b508808de41e86e801797/editables-0.6-py3-none-any.whl", hash = "sha256:d70e4698078a1d033e7786d9c64e5be070d058a67c21417024d38a58ac20aa43", size = 5438, upload-time = "2026-04-14T10:39:03.663Z" },
 ]
 
 [[package]]
@@ -1060,7 +1060,7 @@ provides-extras = ["model-runtime"]
 [package.metadata.requires-dev]
 dev = [
     { name = "coverage", extras = ["toml"], specifier = ">=7.10,<8" },
-    { name = "editables", specifier = ">=0.3,<0.4" },
+    { name = "editables", specifier = ">=0.6,<0.7" },
     { name = "hatchling", specifier = ">=1.27,<2" },
     { name = "httpx", specifier = ">=0.28.1,<0.29" },
     { name = "hypothesis", specifier = ">=6.135,<7" },
