@@ -191,6 +191,21 @@ SHADOW_RUNTIME_FILES = {
 SHADOW_RESOURCE_FILES = {
     "saliencegate/shadow/atif_profile_compatibility.json",
 }
+CAPTURE_RUNTIME_FILES = {
+    "saliencegate/capture/__init__.py",
+    "saliencegate/capture/adapters.py",
+    "saliencegate/capture/capabilities.py",
+    "saliencegate/capture/identities.py",
+    "saliencegate/capture/schema.py",
+    "saliencegate/integrations/__init__.py",
+}
+CAPTURE_RESOURCE_FILES = {
+    "saliencegate/integrations/fixtures/claude-code-hooks-v1.json",
+    "saliencegate/integrations/fixtures/codex-hooks-v1.json",
+    "saliencegate/integrations/fixtures/opencode-plugin-v1.json",
+    "saliencegate/integrations/fixtures/pi-extension-v1.json",
+    "saliencegate/integrations/profiles.json",
+}
 ROOT_SDIST_FILES = {
     ".gitignore",
     "CHANGELOG.md",
@@ -531,6 +546,8 @@ def test_built_wheel_has_exact_runtime_membership_and_payloads(
         "saliencegate/py.typed",
         "saliencegate/repository/migrations/0001_initial.sql",
         "saliencegate/repository/migrations/0002_unique_invocation_event.sql",
+        *CAPTURE_RESOURCE_FILES,
+        *CAPTURE_RUNTIME_FILES,
         *SHADOW_RUNTIME_FILES,
         *SHADOW_RESOURCE_FILES,
     } <= files.keys()
@@ -594,6 +611,8 @@ def test_built_sdist_has_exact_reviewable_membership_and_payloads(
         "tests/fixtures/shadow/atif/codex-bundled-synthetic.trajectory.json",
         "tests/fixtures/shadow/atif/terminus-context-sanitized.trajectory.json",
         "tests/fixtures/shadow/atif/terminus-timeout-sanitized.trajectory.json",
+        *(f"src/{path}" for path in CAPTURE_RESOURCE_FILES),
+        *(f"src/{path}" for path in CAPTURE_RUNTIME_FILES),
         *(f"src/{path}" for path in SHADOW_RUNTIME_FILES),
         *(f"src/{path}" for path in SHADOW_RESOURCE_FILES),
     } <= files.keys()

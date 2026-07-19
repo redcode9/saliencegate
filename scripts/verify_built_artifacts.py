@@ -301,9 +301,19 @@ def _prove_documented_cases(
     shadow_root.mkdir(mode=0o700)
     environment = _private_environment(case_root)
     guard = package_root / "scripts" / "run_without_sockets.py"
+    import_smoke = package_root / "scripts" / "smoke_package_imports.py"
     validator = package_root / "scripts" / "smoke_shadow_installed.py"
     examples = package_root / "examples" / "atif-shadow"
     saliencegate = python.parent / "saliencegate"
+
+    imported = _run(
+        (python, "-I", guard, import_smoke),
+        cwd=case_root,
+        env=environment,
+        capture_output=True,
+    )
+    if imported.stderr or re.fullmatch(rb"[0-9]+\.[0-9]+\.[0-9]+\n", imported.stdout) is None:
+        raise RuntimeError(f"{label} core import smoke returned unexpected output")
 
     demo = _run(
         (python, "-I", guard, saliencegate, "demo"),
@@ -456,6 +466,7 @@ def verify_built_artifacts(
         "pyproject.toml",
         "uv.lock",
         "scripts/run_without_sockets.py",
+        "scripts/smoke_package_imports.py",
         "scripts/smoke_shadow_installed.py",
         "examples/atif-shadow/one_call.py",
         "examples/atif-shadow/codex-minimal.trajectory.json",

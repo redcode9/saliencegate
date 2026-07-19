@@ -490,7 +490,9 @@ def test_ci_exercises_the_installed_sdist_from_locked_build_dependencies() -> No
     assert "scripts/smoke_package_imports.py" in sdist
     assert sdist.count("scripts/run_without_sockets.py") >= 19
     import_smoke = PACKAGE_IMPORT_SMOKE.read_text(encoding="utf-8")
+    assert "import saliencegate.capture" in import_smoke
     assert "import saliencegate.shadow" in import_smoke
+    assert "load_capture_capability_registry" in import_smoke
     assert "find_spec(optional_module)" in import_smoke
     assert "optional_module in sys.modules" in import_smoke
     for optional_module in FORBIDDEN_CORE_MODULES:
