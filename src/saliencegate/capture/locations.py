@@ -8,6 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
+import saliencegate.security.files as security_files
+from saliencegate.capture.identities import CaptureDigestContext
+from saliencegate.domain import canonical_json
+from saliencegate.security.windows import WindowsFileIdentity
+
 
 class CaptureLocationError(ValueError):
     """A capture store location could not be resolved safely."""
@@ -43,6 +48,64 @@ class CaptureStoreLocations:
 
     def __repr__(self) -> str:
         return "CaptureStoreLocations(<redacted>)"
+
+
+def _capture_spool_boundary_digest(
+    state_identity: object,
+    spool_identity: object,
+    *,
+    platform: str,
+    context: CaptureDigestContext,
+) -> str:
+    """Bind a store snapshot to the authorized state-directory object."""
+
+    if type(context) is not CaptureDigestContext:
+        raise CaptureLocationError()
+    if (
+        platform == "posix"
+        and type(state_identity) is security_files._StableIdentity
+        and type(spool_identity) is security_files._StableIdentity
+    ):
+        identity_material: dict[str, object] = {
+            "state": {
+                "device": state_identity.device,
+                "inode": state_identity.inode,
+                "mode": state_identity.mode,
+                "owner": state_identity.owner,
+            },
+            "spool": {
+                "device": spool_identity.device,
+                "inode": spool_identity.inode,
+                "mode": spool_identity.mode,
+                "owner": spool_identity.owner,
+            },
+        }
+    elif (
+        platform == "windows"
+        and type(state_identity) is WindowsFileIdentity
+        and type(spool_identity) is WindowsFileIdentity
+    ):
+        identity_material = {
+            "state": {
+                "file_id": state_identity.file_id.hex(),
+                "volume_serial_number": state_identity.volume_serial_number,
+            },
+            "spool": {
+                "file_id": spool_identity.file_id.hex(),
+                "volume_serial_number": spool_identity.volume_serial_number,
+            },
+        }
+    else:
+        raise CaptureLocationError()
+    return context.integrity_tag(
+        canonical_json(
+            {
+                "schema_version": "capture-spool-boundary/v1",
+                "platform": platform,
+                "state_directory_identity": identity_material,
+            }
+        )
+    )
 
 
 def _exact_absolute_path(value: object) -> Path | None:

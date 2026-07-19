@@ -375,6 +375,7 @@ _ACCESS_ALLOWED_ACE_TYPE = 0
 _INHERITED_ACE = 0x10
 _FILE_ALL_ACCESS = 0x001F01FF
 _SDDL_REVISION_1 = 1
+_LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
 _LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
 
 
@@ -708,10 +709,15 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
 
         _content_free_call(lambda: self._delete_authorized_file(authorization))
 
-    def private_file_lock(self, path: PureWindowsPath) -> _WindowsPrivateFileLock:
-        """Return a blocking cross-process lock over one exact private file."""
+    def private_file_lock(
+        self,
+        path: PureWindowsPath,
+        *,
+        blocking: bool = True,
+    ) -> _WindowsPrivateFileLock:
+        """Return a cross-process lock over one exact private file."""
 
-        return _content_free_call(lambda: self._private_file_lock(path))
+        return _content_free_call(lambda: self._private_file_lock(path, blocking=blocking))
 
     def _current_user_sid(self) -> str:
         token = wintypes.HANDLE()
@@ -1227,8 +1233,13 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
         finally:
             self._close_handle(handle)
 
-    def _private_file_lock(self, path: PureWindowsPath) -> _WindowsPrivateFileLock:
-        if not _is_valid_windows_path(path):
+    def _private_file_lock(
+        self,
+        path: PureWindowsPath,
+        *,
+        blocking: bool,
+    ) -> _WindowsPrivateFileLock:
+        if not _is_valid_windows_path(path) or type(blocking) is not bool:
             raise _NativeWindowsError()
         if self._inspect_path(path) is None:
             try:
@@ -1272,7 +1283,7 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
             overlapped = _Overlapped()
             if not self._bindings.kernel32.LockFileEx(
                 checked_handle,
-                _LOCKFILE_EXCLUSIVE_LOCK,
+                _LOCKFILE_EXCLUSIVE_LOCK | (0 if blocking else _LOCKFILE_FAIL_IMMEDIATELY),
                 0,
                 1,
                 0,

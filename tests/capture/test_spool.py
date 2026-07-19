@@ -5,6 +5,7 @@ import re
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 from tests.capture.store_support import (
@@ -30,15 +31,21 @@ from saliencegate.capture.spool import (
     CaptureSpool,
     CaptureSpoolError,
     CaptureSpoolIntegrityError,
+    CaptureSpoolObservation,
+    CaptureSpoolObservationError,
     admit_capture_intake,
+    verify_capture_spool_observation,
 )
 from saliencegate.capture.store import (
     CaptureStoreBusyError,
     CaptureStoreIntegrityError,
     CaptureStoreStateError,
 )
+from saliencegate.domain import canonical_json
 
 _SPOOL_ENTRY_NAME = re.compile(r"^[0-9a-f]{64}\.capture-intake$")
+_SNAPSHOT_DIGEST = "a" * 64
+_OTHER_SNAPSHOT_DIGEST = "b" * 64
 
 
 def _locations(tmp_path: Path, name: str = "state"):
@@ -120,9 +127,228 @@ def _assert_content_free_spool_error(
     assert error.__context__ is None
 
 
+def _assert_content_free_observation_error(
+    error: CaptureSpoolObservationError,
+    *,
+    secret: str,
+) -> None:
+    assert str(error) == "capture spool observation is invalid"
+    assert secret not in str(error)
+    assert secret not in repr(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
 def test_spool_v1_limits_are_fixed_per_installation() -> None:
     assert MAX_CAPTURE_SPOOL_BYTES == 32 * 1_024 * 1_024
     assert MAX_CAPTURE_SPOOL_EVENTS == 10_000
+
+
+def test_spool_observation_authenticates_real_clean_and_pending_health(
+    tmp_path: Path,
+) -> None:
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+
+    clean = spool.observe_health(_SNAPSHOT_DIGEST)
+
+    assert type(clean) is CaptureSpoolObservation
+    assert clean.schema_version == "capture-spool-observation/v1"
+    assert clean.snapshot_digest == _SNAPSHOT_DIGEST
+    assert clean.health == spool.health()
+    assert clean.queued_events == clean.queued_bytes == clean.dropped_events == 0
+    assert clean.coverage_degraded is False
+    assert clean.last_drop_reason is None
+    expected_tag = INSTALLATION_KEY._hmac_sha256(
+        canonical_json(
+            {
+                "schema_version": "capture-spool-observation-integrity/v1",
+                "observation": clean.model_dump(
+                    mode="json",
+                    exclude={"observation_tag"},
+                    warnings="error",
+                ),
+            }
+        ),
+        domain=b"saliencegate:capture-spool:observation:v1",
+    )
+    assert clean.observation_tag == expected_tag
+
+    spool.enqueue(authenticated_intake("session_started", producer_index=1))
+    pending = spool.observe_health(_SNAPSHOT_DIGEST)
+    repeated = spool.observe_health(_SNAPSHOT_DIGEST)
+
+    assert pending == repeated
+    assert pending.observation_tag == repeated.observation_tag
+    assert pending.queued_events == 1
+    assert pending.queued_bytes > 0
+    assert pending.dropped_events == 0
+    assert pending.coverage_degraded is False
+    assert pending.last_drop_reason is None
+    assert pending.health == spool.health()
+
+
+def test_spool_observation_verifier_is_key_and_snapshot_bound_and_defensive(
+    tmp_path: Path,
+) -> None:
+    spool = CaptureSpool.open(_locations(tmp_path), INSTALLATION_KEY)
+    spool.enqueue(authenticated_intake("session_started", producer_index=1))
+    observation = spool.observe_health(_SNAPSHOT_DIGEST)
+
+    first = verify_capture_spool_observation(
+        observation,
+        expected_snapshot_digest=_SNAPSHOT_DIGEST,
+        expected_spool_boundary_digest=observation.spool_boundary_digest,
+        installation_key=INSTALLATION_KEY,
+    )
+    second = verify_capture_spool_observation(
+        observation,
+        expected_snapshot_digest=_SNAPSHOT_DIGEST,
+        expected_spool_boundary_digest=observation.spool_boundary_digest,
+        installation_key=INSTALLATION_KEY,
+    )
+
+    assert first == second == observation
+    assert first is not observation
+    assert first.health is not observation.health
+    assert repr(first) == "CaptureSpoolObservation(<redacted>)"
+    assert str(first) == "CaptureSpoolObservation(<redacted>)"
+
+    marker = "provider-native-observation-secret"
+    invalid = (
+        (observation, _SNAPSHOT_DIGEST, WRONG_INSTALLATION_KEY),
+        (observation, _OTHER_SNAPSHOT_DIGEST, INSTALLATION_KEY),
+        (
+            observation.model_copy(update={"snapshot_digest": _OTHER_SNAPSHOT_DIGEST}),
+            _SNAPSHOT_DIGEST,
+            INSTALLATION_KEY,
+        ),
+        (
+            observation.model_copy(update={"queued_events": observation.queued_events + 1}),
+            _SNAPSHOT_DIGEST,
+            INSTALLATION_KEY,
+        ),
+        (
+            observation.model_copy(update={"observation_tag": "f" * 64}),
+            _SNAPSHOT_DIGEST,
+            INSTALLATION_KEY,
+        ),
+        ({marker: marker}, _SNAPSHOT_DIGEST, INSTALLATION_KEY),
+    )
+    for value, expected_digest, key in invalid:
+        with pytest.raises(CaptureSpoolObservationError) as captured:
+            verify_capture_spool_observation(
+                value,
+                expected_snapshot_digest=expected_digest,
+                expected_spool_boundary_digest=observation.spool_boundary_digest,
+                installation_key=key,
+            )
+        _assert_content_free_observation_error(captured.value, secret=marker)
+
+    with pytest.raises(CaptureSpoolObservationError) as wrong_boundary:
+        verify_capture_spool_observation(
+            observation,
+            expected_snapshot_digest=_SNAPSHOT_DIGEST,
+            expected_spool_boundary_digest=_OTHER_SNAPSHOT_DIGEST,
+            installation_key=INSTALLATION_KEY,
+        )
+    _assert_content_free_observation_error(wrong_boundary.value, secret=marker)
+
+    with pytest.raises(CaptureSpoolObservationError) as wrong_key_type:
+        verify_capture_spool_observation(
+            observation,
+            expected_snapshot_digest=_SNAPSHOT_DIGEST,
+            expected_spool_boundary_digest=observation.spool_boundary_digest,
+            installation_key=b"k" * 32,  # type: ignore[arg-type]
+        )
+    _assert_content_free_observation_error(wrong_key_type.value, secret=marker)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"queued_events": -1},
+        {"queued_events": MAX_CAPTURE_SPOOL_EVENTS + 1},
+        {"queued_events": True},
+        {"queued_bytes": 0},
+        {"queued_bytes": MAX_CAPTURE_SPOOL_BYTES + 1},
+        {"dropped_events": -1},
+        {"dropped_events": 1 << 63},
+        {"dropped_events": 1},
+        {"dropped_events": 1, "coverage_degraded": True},
+        {"coverage_degraded": True},
+        {"last_drop_reason": "spool_quota"},
+    ),
+)
+def test_spool_observation_rejects_invalid_count_and_state_bounds(
+    tmp_path: Path,
+    changes: dict[str, object],
+) -> None:
+    spool = CaptureSpool.open(_locations(tmp_path), INSTALLATION_KEY)
+    spool.enqueue(authenticated_intake("session_started", producer_index=1))
+    observation = spool.observe_health(_SNAPSHOT_DIGEST)
+    forged = observation.model_copy(update=changes)
+
+    with pytest.raises(CaptureSpoolObservationError):
+        verify_capture_spool_observation(
+            forged,
+            expected_snapshot_digest=_SNAPSHOT_DIGEST,
+            expected_spool_boundary_digest=observation.spool_boundary_digest,
+            installation_key=INSTALLATION_KEY,
+        )
+
+
+def test_spool_observation_invalid_inputs_fail_content_free(tmp_path: Path) -> None:
+    marker = "provider-native-observation-secret"
+    spool = CaptureSpool.open(_locations(tmp_path / marker), INSTALLATION_KEY)
+
+    with pytest.raises(CaptureSpoolObservationError) as observed:
+        spool.observe_health(marker)
+    _assert_content_free_observation_error(observed.value, secret=marker)
+
+    with pytest.raises(CaptureSpoolObservationError) as verified:
+        verify_capture_spool_observation(
+            {"snapshot_digest": marker},
+            expected_snapshot_digest=marker,
+            expected_spool_boundary_digest="0" * 64,
+            installation_key=INSTALLATION_KEY,
+        )
+    _assert_content_free_observation_error(verified.value, secret=marker)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="native Windows lock boundary is the R01 gate")
+def test_spool_observation_fails_fast_when_the_cross_process_lock_is_held(
+    tmp_path: Path,
+) -> None:
+    import fcntl
+
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    spool.health()
+    descriptor = os.open(locations.spool_directory / ".capture-spool-lock", os.O_RDWR)
+    completed = Event()
+    outcomes: list[BaseException] = []
+
+    def observe() -> None:
+        try:
+            spool.observe_health(_SNAPSHOT_DIGEST)
+        except BaseException as error:
+            outcomes.append(error)
+        finally:
+            completed.set()
+
+    thread = Thread(target=observe, daemon=True)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        thread.start()
+        assert completed.wait(timeout=1)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+        thread.join(timeout=2)
+
+    assert len(outcomes) == 1
+    assert type(outcomes[0]) is CaptureSpoolError
 
 
 def test_enqueue_persists_one_exact_canonical_intake_without_admission_metadata(

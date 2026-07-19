@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import saliencegate.capture as public_capture
-from saliencegate.capture import locations, migrations, publication, spool, store
+from saliencegate.capture import (
+    locations,
+    migrations,
+    normalization,
+    publication,
+    report,
+    sessions,
+    spool,
+    store,
+)
 
 
 def test_capture_root_exports_the_stable_store_contract() -> None:
     expected = {
+        "CAPTURE_SESSION_REPORT_SCHEMA_VERSION": (report.CAPTURE_SESSION_REPORT_SCHEMA_VERSION),
         "MAX_CAPTURE_EVENTS_PER_SESSION": store.MAX_CAPTURE_EVENTS_PER_SESSION,
         "MAX_CAPTURE_SPOOL_BYTES": spool.MAX_CAPTURE_SPOOL_BYTES,
         "MAX_CAPTURE_SPOOL_EVENTS": spool.MAX_CAPTURE_SPOOL_EVENTS,
@@ -15,13 +25,31 @@ def test_capture_root_exports_the_stable_store_contract() -> None:
         "CaptureConnectionRegistration": store.CaptureConnectionRegistration,
         "CaptureConnectionState": store.CaptureConnectionState,
         "CaptureConnectionTransition": store.CaptureConnectionTransition,
+        "CaptureDetectorEvidence": normalization.CaptureDetectorEvidence,
+        "CaptureHumanSessionId": sessions.CaptureHumanSessionId,
         "CaptureIntakeAuthenticationError": publication.CaptureIntakeAuthenticationError,
         "CaptureLocationError": locations.CaptureLocationError,
         "CaptureMigrationError": migrations.CaptureMigrationError,
         "CaptureMigrationIntegrityError": migrations.CaptureMigrationIntegrityError,
         "CaptureMigrationReceipt": migrations.CaptureMigrationReceipt,
+        "CaptureNormalization": normalization.CaptureNormalization,
+        "CaptureNormalizationCounts": normalization.CaptureNormalizationCounts,
+        "CaptureNormalizationDiagnostic": normalization.CaptureNormalizationDiagnostic,
+        "CaptureNormalizationDiagnosticCode": (normalization.CaptureNormalizationDiagnosticCode),
+        "CaptureNormalizationError": normalization.CaptureNormalizationError,
+        "CaptureReportCounts": report.CaptureReportCounts,
+        "CaptureReportCoverage": report.CaptureReportCoverage,
+        "CaptureReportDetector": report.CaptureReportDetector,
+        "CaptureReportError": report.CaptureReportError,
+        "CaptureReportHeadline": report.CaptureReportHeadline,
+        "CaptureReportHealthCount": report.CaptureReportHealthCount,
+        "CaptureReportInterval": report.CaptureReportInterval,
+        "CaptureReportLimit": report.CaptureReportLimit,
         "CaptureSchemaTooNewError": migrations.CaptureSchemaTooNewError,
         "CaptureSessionState": store.CaptureSessionState,
+        "CaptureSessionReport": report.CaptureSessionReport,
+        "CaptureSessionSnapshot": sessions.CaptureSessionSnapshot,
+        "CaptureSessionSnapshotError": sessions.CaptureSessionSnapshotError,
         "CaptureSessionVerification": store.CaptureSessionVerification,
         "CaptureSpool": spool.CaptureSpool,
         "CaptureSpoolDrainReceipt": spool.CaptureSpoolDrainReceipt,
@@ -29,6 +57,11 @@ def test_capture_root_exports_the_stable_store_contract() -> None:
         "CaptureSpoolError": spool.CaptureSpoolError,
         "CaptureSpoolHealth": spool.CaptureSpoolHealth,
         "CaptureSpoolIntegrityError": spool.CaptureSpoolIntegrityError,
+        "CaptureSpoolObservation": spool.CaptureSpoolObservation,
+        "CaptureSpoolObservationError": spool.CaptureSpoolObservationError,
+        "CaptureSpoolReportStatus": report.CaptureSpoolReportStatus,
+        "CaptureSnapshotEvent": sessions.CaptureSnapshotEvent,
+        "CaptureSnapshotHealth": sessions.CaptureSnapshotHealth,
         "CaptureStore": store.CaptureStore,
         "CaptureStoreBusyError": store.CaptureStoreBusyError,
         "CaptureStoreClosedError": store.CaptureStoreClosedError,
@@ -39,9 +72,18 @@ def test_capture_root_exports_the_stable_store_contract() -> None:
         "CaptureStoreStateError": store.CaptureStoreStateError,
         "admit_capture_intake": spool.admit_capture_intake,
         "authenticate_capture_intake": publication.authenticate_capture_intake,
+        "build_capture_session_report": report.build_capture_session_report,
+        "decode_capture_session_report": report.decode_capture_session_report,
+        "encode_capture_session_report": report.encode_capture_session_report,
         "initialize_capture_store": migrations.initialize_capture_store,
+        "normalize_capture_session_snapshot": (normalization.normalize_capture_session_snapshot),
+        "render_capture_session_report_human": (report.render_capture_session_report_human),
+        "render_capture_session_report_json": report.render_capture_session_report_json,
         "resolve_capture_store_locations": locations.resolve_capture_store_locations,
         "verify_capture_intake_authentication": (publication.verify_capture_intake_authentication),
+        "verify_capture_normalization": normalization.verify_capture_normalization,
+        "verify_capture_session_snapshot": sessions.verify_capture_session_snapshot,
+        "verify_capture_spool_observation": spool.verify_capture_spool_observation,
     }
 
     assert len(public_capture.__all__) == len(set(public_capture.__all__))

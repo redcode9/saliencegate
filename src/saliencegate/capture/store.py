@@ -14,10 +14,11 @@ from enum import StrEnum
 from pathlib import Path, PureWindowsPath
 from threading import Lock
 from types import TracebackType
-from typing import Annotated, ClassVar, Final, Never, Self, cast
+from typing import TYPE_CHECKING, Annotated, ClassVar, Final, Never, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
+import saliencegate.security.files as security_files
 from saliencegate.capture.capabilities import (
     CaptureProfile,
     CompatibilityStatus,
@@ -29,6 +30,7 @@ from saliencegate.capture.health import (
     capture_health_integrity_material,
 )
 from saliencegate.capture.identities import CaptureDigestContext
+from saliencegate.capture.locations import _capture_spool_boundary_digest
 from saliencegate.capture.migrations import (
     CaptureMigrationError,
     validate_capture_store_schema,
@@ -58,6 +60,9 @@ from saliencegate.security.windows import (
     authorize_windows_private_path,
     authorize_windows_sqlite_path,
 )
+
+if TYPE_CHECKING:
+    from saliencegate.capture.sessions import CaptureSessionSnapshot
 
 MAX_CAPTURE_EVENTS_PER_SESSION: Final = 1_000
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
@@ -240,6 +245,15 @@ class _CaptureStoreIntegrity:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _stored_timestamp(value: object) -> datetime:
+    if type(value) is not str:
+        raise CaptureStoreIntegrityError()
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        raise CaptureStoreIntegrityError() from None
 
 
 def _connection_material(row: sqlite3.Row | dict[str, object]) -> dict[str, object]:
@@ -927,13 +941,13 @@ class CaptureStore:
             raise CaptureStoreIntegrityError()
         return event
 
-    def _verify_chain(
+    def _verify_chain_rows(
         self,
         connection_id: str,
         session_id: str,
         session: sqlite3.Row,
         head: sqlite3.Row,
-    ) -> tuple[CaptureEvent, ...]:
+    ) -> tuple[tuple[tuple[CaptureEvent, sqlite3.Row], ...], tuple[sqlite3.Row, ...]]:
         rows = self._connection.execute(
             """
             SELECT *
@@ -943,7 +957,7 @@ class CaptureStore:
             """,
             (connection_id, session_id),
         ).fetchall()
-        events: list[CaptureEvent] = []
+        events: list[tuple[CaptureEvent, sqlite3.Row]] = []
         previous: str | None = None
         for ordinal, row in enumerate(rows, start=1):
             event = self._load_verified_event(row)
@@ -958,15 +972,30 @@ class CaptureStore:
             ):
                 raise CaptureStoreIntegrityError()
             previous = event.event_tag
-            events.append(event)
+            events.append((event, cast(sqlite3.Row, row)))
         if (
             len(events) != session["event_count"]
             or len(events) != head["receipt_count"]
             or previous != head["head_event_tag"]
         ):
             raise CaptureStoreIntegrityError()
-        self._verify_health_set(connection_id, session_id, session)
-        return tuple(events)
+        health = self._verify_health_set(connection_id, session_id, session)
+        return tuple(events), health
+
+    def _verify_chain(
+        self,
+        connection_id: str,
+        session_id: str,
+        session: sqlite3.Row,
+        head: sqlite3.Row,
+    ) -> tuple[CaptureEvent, ...]:
+        events, _health = self._verify_chain_rows(
+            connection_id,
+            session_id,
+            session,
+            head,
+        )
+        return tuple(event for event, _row in events)
 
     def _verify_all_state(self) -> None:
         """Authenticate every currently persisted mutable row before use."""
@@ -1593,6 +1622,192 @@ class CaptureStore:
             head_event_tag=head["head_event_tag"],
             head_tag=head["head_tag"],
         )
+
+    def snapshot_session(
+        self,
+        connection_id: str,
+        session_id: str,
+    ) -> CaptureSessionSnapshot:
+        """Return one authenticated, coherent MVCC session snapshot."""
+
+        from saliencegate.capture.sessions import (
+            CaptureSessionSnapshot,
+            CaptureSnapshotEvent,
+            CaptureSnapshotHealth,
+            _authenticate_capture_session_snapshot,
+        )
+
+        self._ensure_open()
+        if type(connection_id) is not str or type(session_id) is not str:
+            raise CaptureStoreError()
+        with self._lock:
+            self._ensure_open()
+            self._revalidate_boundary()
+            try:
+                # A deferred read transaction establishes an SQLite MVCC view on
+                # the first SELECT without excluding a concurrent WAL writer.
+                self._connection.execute("BEGIN")
+                connection = self._connection_row(connection_id)
+                if connection["state"] == CaptureConnectionState.DELETING.value:
+                    raise CaptureStoreStateError()
+                session = self._session_row(connection_id, session_id)
+                if session is None:
+                    raise CaptureStoreStateError()
+                if session["state"] == CaptureSessionState.DELETING.value:
+                    raise CaptureStoreStateError()
+                if (
+                    type(session["coverage_degraded"]) is not int
+                    or session["coverage_degraded"] not in (0, 1)
+                    or type(session["unattributed_drop"]) is not int
+                    or session["unattributed_drop"] not in (0, 1)
+                ):
+                    raise CaptureStoreIntegrityError()
+                head = self._head_row(connection_id, session_id)
+                event_rows, health_rows = self._verify_chain_rows(
+                    connection_id,
+                    session_id,
+                    session,
+                    head,
+                )
+
+                # Re-read the authenticated commitments in the same transaction.
+                # A peer may have committed a newer revision, but this reader must
+                # keep observing and returning one coherent older revision.
+                checked_connection = self._connection_row(connection_id)
+                checked_session = self._session_row(connection_id, session_id)
+                checked_head = self._head_row(connection_id, session_id)
+                checked_health = self._verify_health_set(
+                    connection_id,
+                    session_id,
+                    session,
+                )
+                if (
+                    checked_session is None
+                    or checked_connection["row_tag"] != connection["row_tag"]
+                    or checked_session["row_tag"] != session["row_tag"]
+                    or checked_head["head_tag"] != head["head_tag"]
+                    or tuple((row["marker_id"], row["row_tag"]) for row in checked_health)
+                    != tuple((row["marker_id"], row["row_tag"]) for row in health_rows)
+                ):
+                    raise CaptureStoreIntegrityError()
+
+                profile_id = CaptureProfile(connection["profile_id"])
+                validate_capture_capability_binding(
+                    profile_id,
+                    connection["capability_manifest_digest"],
+                )
+                snapshot = CaptureSessionSnapshot(
+                    connection_id=connection["connection_id"],
+                    project_digest=connection["project_digest"],
+                    profile_id=profile_id,
+                    capability_manifest_digest=connection["capability_manifest_digest"],
+                    host_version=connection["host_version"],
+                    compatibility_status=CompatibilityStatus(connection["compatibility_status"]),
+                    connection_state=CaptureConnectionState(connection["state"]),
+                    session_id=session["session_id"],
+                    human_id=session["human_id"],
+                    state=CaptureSessionState(session["state"]),
+                    event_count=session["event_count"],
+                    coverage_degraded=bool(session["coverage_degraded"]),
+                    unattributed_drop=bool(session["unattributed_drop"]),
+                    opened_at=_stored_timestamp(session["opened_at"]),
+                    updated_at=_stored_timestamp(session["updated_at"]),
+                    closed_at=(
+                        None
+                        if session["closed_at"] is None
+                        else _stored_timestamp(session["closed_at"])
+                    ),
+                    events=tuple(
+                        CaptureSnapshotEvent(
+                            receipt_ordinal=event.receipt_ordinal,
+                            admission_source=CaptureAdmissionSource(row["admission_source"]),
+                            admitted_at=_stored_timestamp(row["admitted_at"]),
+                            event=event,
+                        )
+                        for event, row in event_rows
+                    ),
+                    health=tuple(
+                        CaptureSnapshotHealth(
+                            code=CaptureHealthCode(row["code"]),
+                            count=row["count"],
+                            lower_bound=row["lower_bound"],
+                            created_at=_stored_timestamp(row["created_at"]),
+                            updated_at=_stored_timestamp(row["updated_at"]),
+                        )
+                        for row in health_rows
+                    ),
+                    spool_boundary_digest=self._snapshot_spool_boundary_digest(),
+                    snapshot_digest="0" * 64,
+                )
+                authenticated = _authenticate_capture_session_snapshot(
+                    snapshot,
+                    context=self._context,
+                )
+                self._fault("snapshot_after_verification")
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+        return authenticated
+
+    def _snapshot_spool_boundary_digest(self) -> str | None:
+        """Observe the exact sibling spool directory without creating one."""
+
+        authorization = self._authorization
+        if isinstance(authorization, WindowsSQLiteAuthorization):  # pragma: no cover - R01
+            state = authorization._parent
+            spool_path = state.path / "capture-spool"
+            try:
+                if authorization._operations.inspect_path(spool_path) is None:
+                    return None
+                spool = authorize_windows_private_path(
+                    spool_path,
+                    kind=WindowsPathKind.DIRECTORY,
+                    operations=authorization._operations,
+                )
+                digest = _capture_spool_boundary_digest(
+                    state.security.identity,
+                    spool.security.identity,
+                    platform="windows",
+                    context=self._context,
+                )
+                state.revalidate()
+                spool.revalidate()
+                return digest
+            except (SecureFileError, WindowsSecurityError):
+                return None
+
+        parent_identity = authorization._parent_identity
+        if parent_identity is None:
+            return None
+        posix_state = security_files._PrivateDirectoryAuthorization(
+            path=os.fspath(Path(authorization.path).parent),
+            _identity=parent_identity,
+        )
+        try:
+            posix_spool = security_files._authorize_private_directory_child(
+                posix_state,
+                "capture-spool",
+                create=False,
+            )
+            digest = _capture_spool_boundary_digest(
+                posix_state._identity,
+                posix_spool._identity,
+                platform="posix",
+                context=self._context,
+            )
+            posix_state.revalidate()
+            posix_spool.revalidate()
+            return digest
+        except SecureFileError:
+            return None
 
 
 __all__ = [

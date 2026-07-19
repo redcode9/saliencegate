@@ -10,11 +10,16 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Final, Literal, Protocol, cast
+from typing import Annotated, Final, Literal, Protocol, Self, cast
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import saliencegate.security.files as security_files
 from saliencegate.capture.identities import CaptureDigestContext
-from saliencegate.capture.locations import CaptureStoreLocations
+from saliencegate.capture.locations import (
+    CaptureStoreLocations,
+    _capture_spool_boundary_digest,
+)
 from saliencegate.capture.publication import verify_capture_intake_authentication
 from saliencegate.capture.schema import (
     MAX_CAPTURE_EVENT_BYTES,
@@ -23,6 +28,7 @@ from saliencegate.capture.schema import (
     load_capture_intake,
 )
 from saliencegate.domain import canonical_json
+from saliencegate.domain.records import Sha256Digest
 from saliencegate.security import (
     InstallationKey,
     SecureFileError,
@@ -46,6 +52,7 @@ _ENTRY_DOMAIN = b"saliencegate:capture-spool:record:v1"
 _HEALTH_NAME = ".capture-spool-health"
 _HEALTH_HEADER = b"capture-spool-health/v1"
 _HEALTH_DOMAIN = b"saliencegate:capture-spool:health:v1"
+_OBSERVATION_DOMAIN = b"saliencegate:capture-spool:observation:v1"
 _LOCK_NAME = ".capture-spool-lock"
 _MAX_ENTRY_BYTES = MAX_CAPTURE_EVENT_BYTES + 256
 _MAX_HEALTH_BYTES = 4_096
@@ -78,6 +85,15 @@ class CaptureSpoolIntegrityError(CaptureSpoolError):
         RuntimeError.__init__(self, "capture spool integrity check failed")
 
 
+class CaptureSpoolObservationError(ValueError):
+    """A spool observation failed validation or key-bound authentication."""
+
+    __slots__ = ()
+
+    def __init__(self) -> None:
+        super().__init__("capture spool observation is invalid")
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class CaptureSpoolEnqueueReceipt:
     disposition: Literal["queued", "already_queued", "dropped_quota"]
@@ -107,6 +123,161 @@ class CaptureSpoolHealth:
         return "CaptureSpoolHealth(<redacted>)"
 
 
+class CaptureSpoolObservation(BaseModel):
+    """A deterministic, snapshot-bound proof of one locked spool health view."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+        strict=True,
+        validate_default=True,
+    )
+
+    schema_version: Literal["capture-spool-observation/v1"] = "capture-spool-observation/v1"
+    snapshot_digest: Sha256Digest = Field(repr=False)
+    spool_boundary_digest: Sha256Digest = Field(repr=False)
+    queued_events: Annotated[int, Field(ge=0, le=MAX_CAPTURE_SPOOL_EVENTS)]
+    queued_bytes: Annotated[int, Field(ge=0, le=MAX_CAPTURE_SPOOL_BYTES)]
+    dropped_events: Annotated[int, Field(ge=0, le=(1 << 63) - 1)]
+    coverage_degraded: bool
+    last_drop_reason: Literal["spool_quota"] | None
+    observation_tag: Sha256Digest = Field(repr=False)
+
+    @model_validator(mode="after")
+    def health_state_is_exact(self) -> Self:
+        if (
+            type(self.snapshot_digest) is not str
+            or type(self.spool_boundary_digest) is not str
+            or type(self.queued_events) is not int
+            or type(self.queued_bytes) is not int
+            or type(self.dropped_events) is not int
+            or type(self.coverage_degraded) is not bool
+            or (self.last_drop_reason is not None and type(self.last_drop_reason) is not str)
+            or type(self.observation_tag) is not str
+            or ((self.queued_events == 0) != (self.queued_bytes == 0))
+            or self.coverage_degraded is not (self.dropped_events > 0)
+            or ((self.dropped_events == 0) != (self.last_drop_reason is None))
+        ):
+            raise ValueError("capture spool observation health is invalid")
+        return self
+
+    @property
+    def health(self) -> CaptureSpoolHealth:
+        """Return a fresh compatibility DTO for the authenticated health values."""
+
+        return CaptureSpoolHealth(
+            queued_events=self.queued_events,
+            queued_bytes=self.queued_bytes,
+            dropped_events=self.dropped_events,
+            coverage_degraded=self.coverage_degraded,
+            last_drop_reason=self.last_drop_reason,
+        )
+
+    def __repr__(self) -> str:
+        return "CaptureSpoolObservation(<redacted>)"
+
+    __str__ = __repr__
+
+
+def _validated_spool_observation(value: object) -> CaptureSpoolObservation:
+    if type(value) is CaptureSpoolObservation:
+        value = value.model_dump(mode="python", warnings="error")
+    return CaptureSpoolObservation.model_validate(value)
+
+
+def _spool_observation_preimage(observation: CaptureSpoolObservation) -> bytes:
+    return canonical_json(
+        {
+            "schema_version": "capture-spool-observation-integrity/v1",
+            "observation": observation.model_dump(
+                mode="json",
+                exclude={"observation_tag"},
+                warnings="error",
+            ),
+        }
+    )
+
+
+def _seal_spool_observation(
+    health: CaptureSpoolHealth,
+    *,
+    snapshot_digest: str,
+    spool_boundary_digest: str,
+    installation_key: InstallationKey,
+) -> CaptureSpoolObservation:
+    result: CaptureSpoolObservation | None = None
+    try:
+        if type(health) is not CaptureSpoolHealth or type(installation_key) is not InstallationKey:
+            raise CaptureSpoolObservationError()
+        draft = CaptureSpoolObservation(
+            snapshot_digest=snapshot_digest,
+            spool_boundary_digest=spool_boundary_digest,
+            queued_events=health.queued_events,
+            queued_bytes=health.queued_bytes,
+            dropped_events=health.dropped_events,
+            coverage_degraded=health.coverage_degraded,
+            last_drop_reason=health.last_drop_reason,
+            observation_tag="0" * 64,
+        )
+        tag = installation_key._hmac_sha256(
+            _spool_observation_preimage(draft),
+            domain=_OBSERVATION_DOMAIN,
+        )
+        result = _validated_spool_observation(draft.model_copy(update={"observation_tag": tag}))
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        result = None
+    if result is None:
+        raise CaptureSpoolObservationError()
+    return result
+
+
+def verify_capture_spool_observation(
+    observation: object,
+    *,
+    expected_snapshot_digest: str,
+    expected_spool_boundary_digest: str,
+    installation_key: InstallationKey,
+) -> CaptureSpoolObservation:
+    """Defensively copy and authenticate one snapshot-bound spool observation."""
+
+    result: CaptureSpoolObservation | None = None
+    try:
+        if (
+            type(expected_snapshot_digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", expected_snapshot_digest) is None
+            or type(expected_spool_boundary_digest) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", expected_spool_boundary_digest) is None
+            or type(installation_key) is not InstallationKey
+        ):
+            raise CaptureSpoolObservationError()
+        validated = _validated_spool_observation(observation)
+        if not hmac.compare_digest(validated.snapshot_digest, expected_snapshot_digest):
+            raise CaptureSpoolObservationError()
+        if not hmac.compare_digest(
+            validated.spool_boundary_digest,
+            expected_spool_boundary_digest,
+        ):
+            raise CaptureSpoolObservationError()
+        expected = installation_key._hmac_sha256(
+            _spool_observation_preimage(validated),
+            domain=_OBSERVATION_DOMAIN,
+        )
+        if not hmac.compare_digest(validated.observation_tag, expected):
+            raise CaptureSpoolObservationError()
+        result = validated
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        result = None
+    if result is None:
+        raise CaptureSpoolObservationError()
+    return result
+
+
 class _AppendStore(Protocol):
     def append(self, intake: CaptureIntake) -> object: ...
 
@@ -119,6 +290,7 @@ class CaptureSpool:
     """One installation-key-bound spool directory."""
 
     __slots__ = (
+        "_boundary_digest",
         "_context",
         "_key",
         "_locations",
@@ -128,6 +300,7 @@ class CaptureSpool:
     )
 
     _context: CaptureDigestContext
+    _boundary_digest: str
     _key: InstallationKey
     _locations: CaptureStoreLocations
     _spool_identity: _SpoolDirectoryIdentity
@@ -190,6 +363,20 @@ class CaptureSpool:
             instance._locations = locations
             instance._key = installation_key._copy()
             instance._context = CaptureDigestContext(installation_key)
+            instance._boundary_digest = _capture_spool_boundary_digest(
+                (
+                    state_identity.security.identity
+                    if isinstance(state_identity, WindowsPathAuthorization)
+                    else state_identity._identity
+                ),
+                (
+                    spool_identity.security.identity
+                    if isinstance(spool_identity, WindowsPathAuthorization)
+                    else spool_identity._identity
+                ),
+                platform=locations.platform,
+                context=instance._context,
+            )
             instance._state_identity = state_identity
             instance._spool_identity = spool_identity
             instance._windows_operations = windows_operations
@@ -222,11 +409,16 @@ class CaptureSpool:
         self._spool_identity.revalidate()
 
     @contextmanager
-    def _locked(self) -> Iterator[int | None]:
+    def _locked(self, *, blocking: bool = True) -> Iterator[int | None]:
+        if type(blocking) is not bool:
+            raise CaptureSpoolError()
         self._revalidate()
         lock_path = self._locations.spool_directory / _LOCK_NAME
         if self._windows_operations is not None:  # pragma: no cover - native Windows R01
-            with self._windows_operations.private_file_lock(PureWindowsPath(str(lock_path))):
+            with self._windows_operations.private_file_lock(
+                PureWindowsPath(str(lock_path)),
+                blocking=blocking,
+            ):
                 self._revalidate()
                 yield None
                 self._revalidate()
@@ -247,7 +439,10 @@ class CaptureSpool:
                 raise SecureFileError()
             import fcntl
 
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            fcntl.flock(
+                descriptor,
+                fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB),
+            )
             security_files._require_safe_acl(descriptor)
             named = os.stat(_LOCK_NAME, dir_fd=directory_fd, follow_symlinks=False)
             opened_locked = os.fstat(descriptor)
@@ -570,6 +765,28 @@ class CaptureSpool:
             raise CaptureSpoolError()
         raise CaptureSpoolError()
 
+    def observe_health(self, snapshot_digest: str) -> CaptureSpoolObservation:
+        """Authenticate one locked spool health view against a session snapshot."""
+
+        try:
+            if (
+                type(snapshot_digest) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", snapshot_digest) is None
+            ):
+                raise CaptureSpoolObservationError()
+            with self._locked(blocking=False) as directory_fd:
+                health = self._health_locked(directory_fd)
+                return _seal_spool_observation(
+                    health,
+                    snapshot_digest=snapshot_digest,
+                    spool_boundary_digest=self._boundary_digest,
+                    installation_key=self._key,
+                )
+        except (CaptureSpoolError, CaptureSpoolObservationError):
+            raise
+        except Exception:
+            raise CaptureSpoolError() from None
+
     def enqueue(self, intake: CaptureIntake) -> CaptureSpoolEnqueueReceipt:
         failed = False
         try:
@@ -713,5 +930,8 @@ __all__ = [
     "CaptureSpoolError",
     "CaptureSpoolHealth",
     "CaptureSpoolIntegrityError",
+    "CaptureSpoolObservation",
+    "CaptureSpoolObservationError",
     "admit_capture_intake",
+    "verify_capture_spool_observation",
 ]
