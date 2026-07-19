@@ -1,0 +1,52 @@
+name: Bug report
+description: Report a reproducible SalienceGate defect
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Thank you for the report. Remove secrets, credentials, private traces, and other
+        sensitive data before submitting anything publicly.
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest deterministic reproduction and exact command.
+      placeholder: Steps, fixture identifiers, seed, and command
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What invariant or result did you expect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include sanitized output where useful.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include SalienceGate revision, Python, uv, operating system, and hardware.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Public-data check
+      options:
+        - label: I removed every secret, credential, private trace, and sensitive value.
+          required: true

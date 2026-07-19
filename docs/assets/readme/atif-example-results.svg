@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="100%" role="img" aria-labelledby="atif-title atif-desc" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+  <title id="atif-title">Codex and Terminus 2 synthetic ATIF example results</title>
+  <desc id="atif-desc">Two synthetic field-shape examples show admitted actions, structured outcomes, mapped records, flagged events, and outcome authority for Codex and Terminus 2.</desc>
+  <rect data-surface="true" x="0" y="0" width="1600" height="900" fill="#f6f1e8"/>
+  <text x="60" y="72" fill="#22211f" font-size="52" font-weight="700">What the two ATIF examples expose</text>
+  <text x="60" y="118" fill="#22211f" font-size="30">Independent evidence surfaces under two sealed mappings</text>
+
+  <rect data-surface="true" x="60" y="160" width="710" height="430" rx="14" fill="#dce9e9" stroke="#315f6f" stroke-width="4"/>
+  <rect data-series="codex" aria-label="Codex field-shape lane" x="60" y="160" width="710" height="14" rx="7" fill="#315f6f"/>
+  <text x="94" y="226" fill="#22211f" font-size="40" font-weight="700">Codex field shape</text>
+  <text x="94" y="270" fill="#22211f" font-size="28">harbor-codex/v1</text>
+
+  <text data-metric="codex.actions" x="100" y="354" fill="#22211f" font-size="54" font-weight="700">2</text>
+  <text x="100" y="394" fill="#22211f" font-size="28">actions</text>
+  <text data-metric="codex.outcomes" x="260" y="354" fill="#22211f" font-size="54" font-weight="700">2</text>
+  <text x="260" y="394" fill="#22211f" font-size="28">outcomes</text>
+  <text data-metric="codex.records" x="430" y="354" fill="#22211f" font-size="54" font-weight="700">6</text>
+  <text x="430" y="394" fill="#22211f" font-size="28">records</text>
+  <text data-metric="codex.flagged" x="590" y="354" fill="#22211f" font-size="54" font-weight="700">3</text>
+  <text x="590" y="394" fill="#22211f" font-size="28">flagged</text>
+
+  <text x="100" y="478" fill="#22211f" font-size="28">Outcome authority</text>
+  <text data-metric="codex.outcome_authority" x="100" y="526" fill="#22211f" font-size="30" font-weight="700">producer_claimed_structured</text>
+
+  <rect data-surface="true" x="830" y="160" width="710" height="430" rx="14" fill="#f1e0c6" stroke="#9b5c13" stroke-width="4"/>
+  <rect data-series="terminus" aria-label="Terminus 2 field-shape lane" x="830" y="160" width="710" height="14" rx="7" fill="#9b5c13"/>
+  <text x="864" y="226" fill="#22211f" font-size="40" font-weight="700">Terminus 2 field shape</text>
+  <text x="864" y="270" fill="#22211f" font-size="28">harbor-terminus-2/v1</text>
+
+  <text data-metric="terminus.actions" x="870" y="354" fill="#22211f" font-size="54" font-weight="700">2</text>
+  <text x="870" y="394" fill="#22211f" font-size="28">actions</text>
+  <text data-metric="terminus.outcomes" x="1030" y="354" fill="#22211f" font-size="54" font-weight="700">0</text>
+  <text x="1030" y="394" fill="#22211f" font-size="28">outcomes</text>
+  <text data-metric="terminus.records" x="1200" y="354" fill="#22211f" font-size="54" font-weight="700">4</text>
+  <text x="1200" y="394" fill="#22211f" font-size="28">records</text>
+  <text data-metric="terminus.flagged" x="1360" y="354" fill="#22211f" font-size="54" font-weight="700">1</text>
+  <text x="1360" y="394" fill="#22211f" font-size="28">flagged</text>
+
+  <text x="870" y="478" fill="#22211f" font-size="28">Outcome authority</text>
+  <text data-metric="terminus.outcome_authority" x="870" y="526" fill="#22211f" font-size="34" font-weight="700">none</text>
+
+  <rect data-surface="true" x="60" y="626" width="1480" height="214" rx="12" fill="#ffffff"/>
+  <text x="94" y="674" fill="#22211f" font-size="28">Producer authentication</text>
+  <text data-metric="examples.producer_authentication" x="94" y="716" fill="#22211f" font-size="32" font-weight="700">none</text>
+  <text x="520" y="674" fill="#22211f" font-size="28">Root segment only</text>
+  <text data-metric="examples.root_segment_only" x="520" y="716" fill="#22211f" font-size="32" font-weight="700">true</text>
+  <text x="940" y="674" fill="#22211f" font-size="28">Complete session</text>
+  <text data-metric="examples.complete_session" x="940" y="716" fill="#22211f" font-size="32" font-weight="700">false</text>
+  <line x1="94" y1="756" x2="1506" y2="756" stroke="#c7c0b4" stroke-width="3"/>
+  <text x="94" y="808" fill="#22211f" font-size="30" font-weight="700">Synthetic, not a quality comparison.</text>
+</svg>

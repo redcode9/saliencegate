@@ -1,0 +1,79 @@
+name: Benchmark evidence
+description: Submit reproducible synthetic or external benchmark evidence
+title: "[Benchmark]: "
+labels:
+  - benchmark
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Report synthetic diagnostic evidence separately from external task evidence. A
+        synthetic result alone does not support an external efficacy claim. Remove secrets
+        and private traces before submission.
+
+  - type: dropdown
+    id: evidence-kind
+    attributes:
+      label: Evidence kind
+      options:
+        - Synthetic diagnostic
+        - External benchmark
+    validations:
+      required: true
+
+  - type: input
+    id: model-runtime
+    attributes:
+      label: Model and runtime
+      description: Exact model/checkpoint and runtime or adapter versions.
+    validations:
+      required: true
+
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware
+      description: CPU, accelerator, memory, and operating system.
+    validations:
+      required: true
+
+  - type: input
+    id: configuration-digest
+    attributes:
+      label: Configuration digest
+      description: Digest of the complete resolved benchmark configuration.
+    validations:
+      required: true
+
+  - type: input
+    id: seed
+    attributes:
+      label: Seed
+      description: Exact task or rollout seed or complete seed set.
+    validations:
+      required: true
+
+  - type: input
+    id: artifact-digest
+    attributes:
+      label: Artifact digest
+      description: Validated digest of the benchmark result artifact.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction-command
+    attributes:
+      label: Reproduction command
+      description: One non-interactive command from a clean checkout.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: results
+    attributes:
+      label: Results and exclusions
+      description: Report denominators, failures, exclusions, and claim scope.
+    validations:
+      required: true

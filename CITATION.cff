@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use SalienceGate, cite this software record."
+title: "SalienceGate"
+type: software
+authors:
+  - family-names: "Carrieri"
+    given-names: "Piero"
+version: 0.1.0
+license: Apache-2.0
+abstract: >-
+  A budget-aware memory intervention runtime for long-horizon agents.
+keywords:
+  - agent memory
+  - long-horizon agents
+  - memory intervention
+  - behavioral state decay

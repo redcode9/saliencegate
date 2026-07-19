@@ -1,0 +1,1 @@
+"""Shadow Mode contract tests."""

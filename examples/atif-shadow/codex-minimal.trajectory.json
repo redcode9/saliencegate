@@ -1,0 +1,76 @@
+{
+  "schema_version": "ATIF-v1.7",
+  "agent": {
+    "name": "codex"
+  },
+  "session_id": "synthetic-codex-example",
+  "steps": [
+    {
+      "step_id": 1,
+      "source": "user",
+      "message": "Synthetic example; no user data."
+    },
+    {
+      "step_id": 2,
+      "source": "agent",
+      "tool_calls": [
+        {
+          "tool_call_id": "synthetic-codex-call-1",
+          "function_name": "exec_command",
+          "arguments": {
+            "cmd": "printf saliencegate-atif-example"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "synthetic-codex-call-1",
+            "content": "Synthetic output ignored by the profile."
+          }
+        ]
+      },
+      "extra": {
+        "tool_call_details": {
+          "synthetic-codex-call-1": {
+            "status": "completed",
+            "metadata": {
+              "exit_code": 1
+            }
+          }
+        }
+      }
+    },
+    {
+      "step_id": 3,
+      "source": "agent",
+      "tool_calls": [
+        {
+          "tool_call_id": "synthetic-codex-call-2",
+          "function_name": "exec_command",
+          "arguments": {
+            "cmd": "printf saliencegate-atif-example"
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "source_call_id": "synthetic-codex-call-2",
+            "content": "Synthetic output ignored by the profile."
+          }
+        ]
+      },
+      "extra": {
+        "tool_call_details": {
+          "synthetic-codex-call-2": {
+            "status": "completed",
+            "metadata": {
+              "exit_code": 1
+            }
+          }
+        }
+      }
+    }
+  ]
+}

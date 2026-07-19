@@ -1,0 +1,97 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# Coverage and test output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit.xml
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# SalienceGate local state
+.saliencegate/
+.artifacts/
+/artifacts/
+traces/
+/runs/
+reports/generated/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Generated benchmark data
+benchmarks/**/generated/
+benchmarks/**/runs/
+benchmarks/**/reports/
+
+# Model weights and inference caches
+/models/
+checkpoints/
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+*.pth
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# Local development tools
+/.agents/
+/.codex/
+/.claude/
+/.cursor/
+/.gemini/
+/.continue/
+/.windsurf/
+/.cline/
+/.roo/
+/.aider*
+/docs/superpowers/
+/AGENTS.md
+/CLAUDE.md
+/CODEX.md
+/GEMINI.md
+/.github/copilot-instructions.md
+/.github/agents/
+/.github/prompts/
+/.github/instructions/

@@ -1,0 +1,56 @@
+{
+  "schema_version": "ATIF-v1.7",
+  "agent": {
+    "name": "terminus-2"
+  },
+  "session_id": "synthetic-terminus-example",
+  "steps": [
+    {
+      "step_id": 1,
+      "source": "user",
+      "message": "Synthetic example; no user data."
+    },
+    {
+      "step_id": 2,
+      "source": "agent",
+      "tool_calls": [
+        {
+          "tool_call_id": "synthetic-terminus-call-1",
+          "function_name": "bash_command",
+          "arguments": {
+            "keystrokes": "printf saliencegate-atif-example\n",
+            "duration": 0.1
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "content": "Synthetic terminal output ignored by the profile."
+          }
+        ]
+      }
+    },
+    {
+      "step_id": 3,
+      "source": "agent",
+      "tool_calls": [
+        {
+          "tool_call_id": "synthetic-terminus-call-2",
+          "function_name": "bash_command",
+          "arguments": {
+            "keystrokes": "printf saliencegate-atif-example\n",
+            "duration": 0.1
+          }
+        }
+      ],
+      "observation": {
+        "results": [
+          {
+            "content": "Synthetic terminal output ignored by the profile."
+          }
+        ]
+      }
+    }
+  ]
+}

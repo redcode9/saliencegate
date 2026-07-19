@@ -1,0 +1,1 @@
+"""Memory-cycle contract tests."""

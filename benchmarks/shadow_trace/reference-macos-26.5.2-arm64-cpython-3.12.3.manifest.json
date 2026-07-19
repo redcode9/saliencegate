@@ -1,0 +1,46 @@
+{
+  "schema_version": "shadow-trace-benchmark-evidence-manifest/v1",
+  "report": {
+    "path": "benchmarks/shadow_trace/reference-macos-26.5.2-arm64-cpython-3.12.3.json",
+    "sha256": "6b0e2b1e9e39570210df67a56163c56b2695fc3ec6b903b2fab530274fdcf0ba"
+  },
+  "benchmark_script": {
+    "path": "scripts/benchmark_shadow_trace.py",
+    "sha256": "dfd56de94e9b4d763c024e9569f1ef06c9a9701f16a8fb442fbbe747ff94f445"
+  },
+  "runtime_source": {
+    "path": "src/saliencegate",
+    "git_tracked_regular_file_count": 141,
+    "digest_algorithm": "sha256",
+    "framing": "uint64be(path_utf8_length) || path_utf8 || uint64be(content_length) || content",
+    "sha256": "d9505c7deff0b726223790eb53b5c04339c9f82fe0b0b2e7642678b2106683a1"
+  },
+  "socket_guard": {
+    "path": "scripts/run_without_sockets.py",
+    "sha256": "09baf500018417335d043caca4a0d77e8cf02f44ea30bfaafc447a9f8d6b4e69"
+  },
+  "project_runtime_metadata": {
+    "path": "pyproject.toml",
+    "selection": [
+      "project.requires-python",
+      "project.dependencies",
+      "project.optional-dependencies",
+      "dependency-groups.dev"
+    ],
+    "canonicalization": "UTF-8 JSON with sorted keys and compact separators",
+    "sha256": "737030da04aba59a02b8f0974823e60f4a6dd865a27332c3e7b30eae1e6e5ce7"
+  },
+  "python_version_file": {
+    "path": ".python-version",
+    "sha256": "7b55f8e67b5623c4bef3fa691288da9437d79d3aba156de48d481db32ac7d16d"
+  },
+  "dependency_lock": {
+    "path": "uv.lock",
+    "sha256": "38e550c83a5c4b7ba25afbe7b5ac46199423d92970a506988f6720c6e2317d7b"
+  },
+  "toolchain": {
+    "python": "CPython 3.12.3",
+    "uv": "uv 0.11.26"
+  },
+  "reproduction_command": "uv --cache-dir /private/tmp/saliencegate-uv-cache run --python 3.12.3 --locked python scripts/benchmark_shadow_trace.py --assert-budgets"
+}
