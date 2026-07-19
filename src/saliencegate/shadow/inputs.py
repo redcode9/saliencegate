@@ -33,6 +33,7 @@ from saliencegate.signals.fingerprints import (
     ActionCommandText,
     ArgumentText,
     DirectoryText,
+    OpaqueActionEvidence,
     ShellActionEvidence,
     ShortText,
     SignatureText,
@@ -51,6 +52,7 @@ _RESERVED_OBSERVATION_KEYS = frozenset(
         "shadow_run",
         "shadow_run_end",
         "action",
+        "action_identity",
         "tool_outcome",
         "test_report",
         "controller_error",
@@ -90,6 +92,7 @@ class ShadowInputKind(StrEnum):
     OBSERVATION = "observation"
     CONTROLLER_ERROR = "controller_error"
     FINISH = "finish"
+    ACTION_IDENTITY = "action_identity"
 
 
 class ShadowObservationSource(StrEnum):
@@ -179,6 +182,39 @@ class ShadowActionInput(_ShadowInputBase):
             argv=self.argv,
             working_directory=self.working_directory,
             environment_digest=self.environment_digest,
+        )
+        return self
+
+
+class ShadowActionIdentityInput(_ShadowInputBase):
+    kind: Literal["action_identity"] = "action_identity"
+    action_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", repr=False)]
+    workspace_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", repr=False)]
+    environment_digest: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$", repr=False)]
+    identity_authority: Literal["exact", "coarse", "unavailable"]
+
+    @field_validator(
+        "action_digest",
+        "workspace_digest",
+        "environment_digest",
+        "identity_authority",
+        mode="before",
+    )
+    @classmethod
+    def require_exact_identity_text(cls, value: object) -> object:
+        if type(value) is not str:
+            raise ValueError("action identity is invalid")
+        return value
+
+    @model_validator(mode="after")
+    def validate_opaque_evidence(self) -> ShadowActionIdentityInput:
+        OpaqueActionEvidence(
+            schema_version="1.0",
+            kind="opaque",
+            action_digest=self.action_digest,
+            workspace_digest=self.workspace_digest,
+            environment_digest=self.environment_digest,
+            identity_authority=self.identity_authority,
         )
         return self
 
@@ -360,6 +396,7 @@ class ShadowFinishInput(_ShadowInputBase):
 ShadowInputRecord: TypeAlias = (
     ShadowStartInput
     | ShadowActionInput
+    | ShadowActionIdentityInput
     | ShadowToolResultInput
     | ShadowTestResultInput
     | ShadowObservationInput
@@ -435,6 +472,14 @@ SHADOW_PROJECTION_MATRIX: Mapping[ShadowInputKind, ShadowProjectionSpec] = Mappi
             parent="none",
             applicable_detectors=(),
         ),
+        ShadowInputKind.ACTION_IDENTITY: ShadowProjectionSpec(
+            event_type=EventType.ACTION_PROPOSAL,
+            phase=EventPhase.PRE_ACTION,
+            trust_label=TrustLabel.UNTRUSTED_MODEL_OUTPUT,
+            payload_namespace="action_identity",
+            parent="none",
+            applicable_detectors=(SignalType.REPEATED_ACTION,),
+        ),
     }
 )
 
@@ -490,6 +535,7 @@ def _validated_input(value: object) -> ShadowInputRecord:
     if model_type not in (
         ShadowStartInput,
         ShadowActionInput,
+        ShadowActionIdentityInput,
         ShadowToolResultInput,
         ShadowTestResultInput,
         ShadowObservationInput,
@@ -543,6 +589,16 @@ def _project_validated_input(
                 environment_digest=value.environment_digest,
             )
             payload = {spec.payload_namespace: action_evidence.model_dump(mode="json")}
+        elif type(value) is ShadowActionIdentityInput:
+            opaque_action_evidence = OpaqueActionEvidence(
+                schema_version="1.0",
+                kind="opaque",
+                action_digest=value.action_digest,
+                workspace_digest=value.workspace_digest,
+                environment_digest=value.environment_digest,
+                identity_authority=value.identity_authority,
+            )
+            payload = {spec.payload_namespace: opaque_action_evidence.model_dump(mode="json")}
         elif type(value) is ShadowToolResultInput:
             if value.action.run_id != run_id:
                 raise ValueError("tool result parent belongs to another run")
@@ -624,6 +680,7 @@ def project_shadow_input(
 
 __all__ = [
     "SHADOW_PROJECTION_MATRIX",
+    "ShadowActionIdentityInput",
     "ShadowActionInput",
     "ShadowControllerErrorInput",
     "ShadowEventRef",

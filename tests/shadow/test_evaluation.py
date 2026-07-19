@@ -177,6 +177,24 @@ def test_complete_applicable_no_match_is_not_flagged() -> None:
     assert result.reason_codes == ()
 
 
+def test_action_identity_uses_action_applicability_without_extending_reference_config() -> None:
+    report = extraction_report({SignalType.REPEATED_ACTION: (DetectionStatus.NO_MATCH, None)})
+
+    identity = evaluate(report, ShadowInputKind.ACTION_IDENTITY)
+    legacy = evaluate(report, ShadowInputKind.ACTION)
+
+    assert identity == legacy
+    assert tuple(row.input_kind for row in ShadowConfig.reference().applicability) == (
+        ShadowInputKind.START,
+        ShadowInputKind.ACTION,
+        ShadowInputKind.TOOL_RESULT,
+        ShadowInputKind.TEST_RESULT,
+        ShadowInputKind.OBSERVATION,
+        ShadowInputKind.CONTROLLER_ERROR,
+        ShadowInputKind.FINISH,
+    )
+
+
 def test_non_applicable_detection_and_applicable_not_applicable_abstention_fail_closed() -> None:
     outside_mask = extraction_report({SignalType.TOOL_ERROR: (DetectionStatus.DETECTED, None)})
     invalid_abstention = extraction_report(

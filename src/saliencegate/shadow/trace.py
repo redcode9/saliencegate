@@ -28,6 +28,7 @@ from saliencegate.domain import canonical_json, length_prefixed_sha256
 from saliencegate.domain.records import Sha256Digest
 from saliencegate.shadow.errors import ShadowTraceInputError
 from saliencegate.shadow.inputs import (
+    ShadowActionIdentityInput,
     ShadowActionInput,
     ShadowControllerErrorInput,
     ShadowEventRef,
@@ -77,6 +78,7 @@ _WIRE_TO_INPUT_KIND: Mapping[str, ShadowInputKind] = MappingProxyType(
     {
         "run_start": ShadowInputKind.START,
         "action": ShadowInputKind.ACTION,
+        "action_identity": ShadowInputKind.ACTION_IDENTITY,
         "tool_result": ShadowInputKind.TOOL_RESULT,
         "test_result": ShadowInputKind.TEST_RESULT,
         "observation": ShadowInputKind.OBSERVATION,
@@ -91,6 +93,18 @@ _WIRE_FIELDS: Mapping[ShadowInputKind, tuple[frozenset[str], frozenset[str]]] = 
         ShadowInputKind.ACTION: (
             _COMMON_WIRE_FIELDS | frozenset({"working_directory", "environment_digest"}),
             frozenset({"command", "argv"}),
+        ),
+        ShadowInputKind.ACTION_IDENTITY: (
+            _COMMON_WIRE_FIELDS
+            | frozenset(
+                {
+                    "action_digest",
+                    "workspace_digest",
+                    "environment_digest",
+                    "identity_authority",
+                }
+            ),
+            frozenset(),
         ),
         ShadowInputKind.TOOL_RESULT: (
             _COMMON_WIRE_FIELDS | frozenset({"action_source_event_id"}),
@@ -121,6 +135,20 @@ _WIRE_FIELDS: Mapping[ShadowInputKind, tuple[frozenset[str], frozenset[str]]] = 
     }
 )
 _TRACE_FACTORY_TOKEN = object()
+
+_LEGACY_INPUT_KINDS = (
+    ShadowInputKind.START,
+    ShadowInputKind.ACTION,
+    ShadowInputKind.TOOL_RESULT,
+    ShadowInputKind.TEST_RESULT,
+    ShadowInputKind.OBSERVATION,
+    ShadowInputKind.CONTROLLER_ERROR,
+    ShadowInputKind.FINISH,
+)
+_EXTENDED_INPUT_KINDS = (
+    *_LEGACY_INPUT_KINDS,
+    ShadowInputKind.ACTION_IDENTITY,
+)
 
 CaptureScope: TypeAlias = Literal[
     "unknown",
@@ -380,11 +408,16 @@ class ShadowRecordDiagnostics(_TraceModel):
 
     @model_validator(mode="after")
     def validate_counts_and_digest(self) -> ShadowRecordDiagnostics:
-        expected_kinds = tuple(ShadowInputKind)
-        if len(self.input_kind_counts) != len(expected_kinds):
+        observed_kinds = tuple(item[0] for item in self.input_kind_counts)
+        if len(observed_kinds) not in (
+            len(_LEGACY_INPUT_KINDS),
+            len(_EXTENDED_INPUT_KINDS),
+        ):
             raise ValueError("trace diagnostics kinds are incomplete")
-        if tuple(item[0] for item in self.input_kind_counts) != expected_kinds:
+        if observed_kinds not in (_LEGACY_INPUT_KINDS, _EXTENDED_INPUT_KINDS):
             raise ValueError("trace diagnostics kinds are not canonical")
+        if observed_kinds == _EXTENDED_INPUT_KINDS and self.input_kind_counts[-1][1] == 0:
+            raise ValueError("trace diagnostics identity count is not canonical")
         if sum(item[1] for item in self.input_kind_counts) != self.source_record_count:
             raise ValueError("trace diagnostics count equation is invalid")
         if self.repeated_source_identifier_count > self.source_record_count:
@@ -555,6 +588,7 @@ class _Occurrence:
     occurred_at: datetime
     event_ref: ShadowEventRef
     parent_source_event_id: str | None
+    record_bytes: bytes
 
 
 def _source_adapter(
@@ -811,7 +845,10 @@ def _parent_ref(
     if type(value) is not str:
         raise ValueError("action parent is invalid")
     occurrence = known.get(value)
-    if occurrence is None or occurrence.kind is not ShadowInputKind.ACTION:
+    if occurrence is None or occurrence.kind not in (
+        ShadowInputKind.ACTION,
+        ShadowInputKind.ACTION_IDENTITY,
+    ):
         raise ValueError("action parent is missing")
     return value, occurrence.event_ref
 
@@ -857,6 +894,16 @@ def _validate_wire_record(
                 "argv": argv,
                 "working_directory": value["working_directory"],
                 "environment_digest": value["environment_digest"],
+            }
+        )
+    elif kind is ShadowInputKind.ACTION_IDENTITY:
+        ShadowActionIdentityInput.model_validate(
+            {
+                **common,
+                "action_digest": value["action_digest"],
+                "workspace_digest": value["workspace_digest"],
+                "environment_digest": value["environment_digest"],
+                "identity_authority": value["identity_authority"],
             }
         )
     elif kind is ShadowInputKind.TOOL_RESULT:
@@ -1037,6 +1084,7 @@ def _canonical_records(
                 existing.kind is not kind
                 or existing.occurred_at != occurred_at
                 or existing.parent_source_event_id != parent_source_event_id
+                or (kind is ShadowInputKind.ACTION_IDENTITY and existing.record_bytes != encoded)
             ):
                 raise ShadowTraceInputError("invalid_step", step_ordinal=ordinal)
             repeated += 1
@@ -1056,6 +1104,7 @@ def _canonical_records(
                 occurred_at=occurred_at,
                 event_ref=event_ref,
                 parent_source_event_id=parent_source_event_id,
+                record_bytes=encoded,
             )
             latest_timestamp = occurred_at
         kinds.append(kind)
@@ -1078,7 +1127,9 @@ def _canonical_records(
         raise ShadowTraceInputError("invalid_step")
     if capture_scope == "complete_run_declared" and finish_positions != (len(kinds),):
         raise ShadowTraceInputError("invalid_step")
-    counts = tuple((kind, kinds.count(kind)) for kind in ShadowInputKind)
+    identity_count = kinds.count(ShadowInputKind.ACTION_IDENTITY)
+    diagnostic_kinds = _EXTENDED_INPUT_KINDS if identity_count else _LEGACY_INPUT_KINDS
+    counts = tuple((kind, kinds.count(kind)) for kind in diagnostic_kinds)
     return tuple(snapshots), tuple(encoded_records), counts, repeated
 
 

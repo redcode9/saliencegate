@@ -8,6 +8,8 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+import saliencegate.signals as public_signals
+import saliencegate.signals.fingerprints as fingerprints_module
 from saliencegate.domain import EventPhase, EventType
 from saliencegate.signals.base import AbstentionReason
 from saliencegate.signals.fingerprints import (
@@ -42,6 +44,9 @@ from saliencegate.signals.fingerprints import (
 SCHEMA_VERSION = "1.0"
 ENVIRONMENT_DIGEST = "a" * 64
 WORKING_DIRECTORY = "/workspace"
+OPAQUE_ACTION_DIGEST = "b" * 64
+OPAQUE_WORKSPACE_DIGEST = "c" * 64
+OPAQUE_ENVIRONMENT_DIGEST = "d" * 64
 
 
 def action_payload(**source: object) -> dict[str, object]:
@@ -60,6 +65,35 @@ def action(event_factory: Any, sequence: int, value: dict[str, object]) -> objec
         event_type=EventType.ACTION_PROPOSAL,
         phase=EventPhase.PRE_ACTION,
         payload={"action": value},
+    )
+
+
+def opaque_action_payload(
+    *,
+    identity_authority: str = "exact",
+    **overrides: object,
+) -> dict[str, object]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "opaque",
+        "action_digest": OPAQUE_ACTION_DIGEST,
+        "workspace_digest": OPAQUE_WORKSPACE_DIGEST,
+        "environment_digest": OPAQUE_ENVIRONMENT_DIGEST,
+        "identity_authority": identity_authority,
+        **overrides,
+    }
+
+
+def opaque_action(
+    event_factory: Any,
+    sequence: int,
+    value: dict[str, object] | None = None,
+) -> object:
+    return event_factory(
+        sequence,
+        event_type=EventType.ACTION_PROPOSAL,
+        phase=EventPhase.PRE_ACTION,
+        payload={"action_identity": opaque_action_payload() if value is None else value},
     )
 
 
@@ -105,6 +139,163 @@ def unavailable_reason(call: Any) -> AbstentionReason:
     with pytest.raises(FingerprintUnavailableError) as error:
         call()
     return error.value.reason
+
+
+def test_public_opaque_action_contract_is_strict_frozen_and_value_safe() -> None:
+    model_type = fingerprints_module.OpaqueActionEvidence
+    assert public_signals.OpaqueActionEvidence is model_type
+    assert "OpaqueActionEvidence" in public_signals.__all__
+    evidence = model_type(
+        schema_version="1.0",
+        kind="opaque",
+        action_digest=OPAQUE_ACTION_DIGEST,
+        workspace_digest=OPAQUE_WORKSPACE_DIGEST,
+        environment_digest=OPAQUE_ENVIRONMENT_DIGEST,
+        identity_authority="exact",
+    )
+
+    assert evidence.model_dump(mode="json") == opaque_action_payload()
+    assert all(
+        digest not in repr(evidence)
+        for digest in (
+            OPAQUE_ACTION_DIGEST,
+            OPAQUE_WORKSPACE_DIGEST,
+            OPAQUE_ENVIRONMENT_DIGEST,
+        )
+    )
+    with pytest.raises(ValidationError):
+        evidence.identity_authority = "coarse"
+
+    for authority in ("exact", "coarse", "unavailable"):
+        assert model_type(
+            **opaque_action_payload(identity_authority=authority)
+        ).identity_authority == (authority)
+
+    class DigestSubclass(str):
+        pass
+
+    invalid_values = (
+        {"action_digest": "A" * 64},
+        {"workspace_digest": "c" * 63},
+        {"environment_digest": DigestSubclass(OPAQUE_ENVIRONMENT_DIGEST)},
+        {"identity_authority": "unknown"},
+        {"kind": "shell"},
+        {"unknown": True},
+    )
+    for invalid in invalid_values:
+        with pytest.raises(ValidationError):
+            model_type(**opaque_action_payload(**invalid))
+
+    sensitive = "fixture-sensitive-opaque-digest"
+    with pytest.raises(ValidationError) as caught:
+        model_type(**opaque_action_payload(action_digest=sensitive))
+    assert sensitive not in str(caught.value)
+    assert sensitive not in repr(caught.value)
+
+
+def test_exact_opaque_action_fingerprints_compare_all_three_digests(
+    event_factory: Any,
+) -> None:
+    baseline = opaque_action(event_factory, 1)
+    equivalent = opaque_action(event_factory, 2)
+    changed_action = opaque_action(
+        event_factory,
+        3,
+        opaque_action_payload(action_digest="e" * 64),
+    )
+    changed_workspace = opaque_action(
+        event_factory,
+        4,
+        opaque_action_payload(workspace_digest="e" * 64),
+    )
+    changed_environment = opaque_action(
+        event_factory,
+        5,
+        opaque_action_payload(environment_digest="e" * 64),
+    )
+
+    baseline_fingerprint = action_fingerprint(baseline)
+    assert baseline_fingerprint.execution_mode == "opaque"
+    assert baseline_fingerprint == action_fingerprint(equivalent)
+    assert baseline_fingerprint != action_fingerprint(changed_action)
+    assert baseline_fingerprint != action_fingerprint(changed_workspace)
+    assert baseline_fingerprint != action_fingerprint(changed_environment)
+    assert all(
+        digest not in repr(baseline_fingerprint)
+        for digest in (
+            OPAQUE_ACTION_DIGEST,
+            OPAQUE_WORKSPACE_DIGEST,
+            OPAQUE_ENVIRONMENT_DIGEST,
+        )
+    )
+
+    coarse = fingerprints_module.OpaqueActionEvidence(
+        **opaque_action_payload(identity_authority="coarse")
+    )
+    with pytest.raises(ValueError, match="opaque action fingerprint is invalid"):
+        ActionFingerprint._from_opaque(coarse)
+
+
+def test_opaque_and_shell_action_namespaces_never_compare_equal(event_factory: Any) -> None:
+    opaque = opaque_action(event_factory, 1)
+    shell = action(
+        event_factory,
+        2,
+        action_payload(
+            argv=(OPAQUE_ACTION_DIGEST,),
+            working_directory=OPAQUE_WORKSPACE_DIGEST,
+            environment_digest=OPAQUE_ENVIRONMENT_DIGEST,
+        ),
+    )
+
+    assert action_fingerprint(opaque) != action_fingerprint(shell)
+
+
+@pytest.mark.parametrize("identity_authority", ("coarse", "unavailable"))
+def test_non_exact_opaque_action_identity_abstains_without_exposing_digests(
+    event_factory: Any,
+    identity_authority: str,
+) -> None:
+    exact_fingerprint = action_fingerprint(opaque_action(event_factory, 1))
+    event = opaque_action(
+        event_factory,
+        2,
+        opaque_action_payload(identity_authority=identity_authority),
+    )
+
+    assert exact_fingerprint == action_fingerprint(opaque_action(event_factory, 3))
+    with pytest.raises(FingerprintUnavailableError) as caught:
+        action_fingerprint(event)
+
+    assert caught.value.reason is AbstentionReason.STRUCTURED_EVIDENCE_MISSING
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    assert all(
+        digest not in repr(caught.value)
+        for digest in (
+            OPAQUE_ACTION_DIGEST,
+            OPAQUE_WORKSPACE_DIGEST,
+            OPAQUE_ENVIRONMENT_DIGEST,
+        )
+    )
+
+
+def test_action_fingerprint_rejects_ambiguous_shell_and_opaque_namespaces(
+    event_factory: Any,
+) -> None:
+    event = event_factory(
+        1,
+        event_type=EventType.ACTION_PROPOSAL,
+        phase=EventPhase.PRE_ACTION,
+        payload={
+            "action": action_payload(argv=("echo", "ok")),
+            "action_identity": opaque_action_payload(),
+        },
+    )
+
+    assert unavailable_reason(lambda: action_fingerprint(event)) is (
+        AbstentionReason.STRUCTURED_EVIDENCE_INVALID
+    )
 
 
 def test_simple_ascii_shell_whitespace_converges_but_argv_remains_distinct(

@@ -26,10 +26,41 @@ from saliencegate.shadow.trace import (
 
 RUN_ID = UUID("11111111-1111-4111-8111-111111111111")
 ENVIRONMENT_DIGEST = "a" * 64
+OPAQUE_ACTION_DIGEST = "b" * 64
+OPAQUE_WORKSPACE_DIGEST = "c" * 64
+OPAQUE_ENVIRONMENT_DIGEST = "d" * 64
 DESCRIPTOR: dict[str, object] = {
     "schema_version": "example-shadow-adapter/v1",
     "mapping": {"mode": "structured", "selected": ["tool", "test"]},
 }
+
+LEGACY_RECORD_BYTES = (
+    b'{"kind":"run_start","occurred_at":"2026-07-17T09:00:00Z",'
+    b'"schema_version":"shadow-input/v1","source_event_id":"start-1"}',
+    b'{"command":"pytest -q","environment_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"action","occurred_at":'
+    b'"2026-07-17T09:00:01Z","schema_version":"shadow-input/v1",'
+    b'"source_event_id":"action-1","working_directory":"/private/project"}',
+    b'{"action_source_event_id":"action-1","error_code":"TEST_FAILURE",'
+    b'"exit_status":1,"kind":"tool_result","occurred_at":"2026-07-17T09:00:01Z",'
+    b'"schema_version":"shadow-input/v1","source_event_id":"tool-1",'
+    b'"status":"failed"}',
+    b'{"action_source_event_id":"action-1","failures":[{"failure_type":'
+    b'"AssertionError","schema_version":"1.0","signature":"expected-one-got-two",'
+    b'"test_id":"tests/test_unit.py::test_example"}],"framework":"pytest",'
+    b'"kind":"test_result","occurred_at":"2026-07-17T09:00:02Z",'
+    b'"schema_version":"shadow-input/v1","source_event_id":"test-1",'
+    b'"status":"failed"}',
+    b'{"kind":"observation","occurred_at":"2026-07-17T09:00:03Z",'
+    b'"payload":{"request":{"kind":"unit","labels":["a","b"]}},'
+    b'"schema_version":"shadow-input/v1","source":"task_input",'
+    b'"source_event_id":"observation-1"}',
+    b'{"error_code":"controller_timeout","kind":"controller_error",'
+    b'"occurred_at":"2026-07-17T09:00:04Z","schema_version":"shadow-input/v1",'
+    b'"source_event_id":"controller-1"}',
+    b'{"kind":"run_end","occurred_at":"2026-07-17T09:00:05Z",'
+    b'"schema_version":"shadow-input/v1","source_event_id":"finish-1"}',
+)
 
 
 def complete_records() -> list[dict[str, object]]:
@@ -100,6 +131,43 @@ def complete_records() -> list[dict[str, object]]:
     ]
 
 
+def identity_records() -> list[dict[str, object]]:
+    records = complete_records()
+    records[1] = {
+        "schema_version": "shadow-input/v1",
+        "kind": "action_identity",
+        "source_event_id": "identity-exact",
+        "occurred_at": "2026-07-17T09:00:01Z",
+        "action_digest": OPAQUE_ACTION_DIGEST,
+        "workspace_digest": OPAQUE_WORKSPACE_DIGEST,
+        "environment_digest": OPAQUE_ENVIRONMENT_DIGEST,
+        "identity_authority": "exact",
+    }
+    records[2]["action_source_event_id"] = "identity-exact"
+    records[3]["action_source_event_id"] = "identity-exact"
+    records[4] = {
+        "schema_version": "shadow-input/v1",
+        "kind": "action_identity",
+        "source_event_id": "identity-coarse",
+        "occurred_at": "2026-07-17T09:00:03Z",
+        "action_digest": "e" * 64,
+        "workspace_digest": OPAQUE_WORKSPACE_DIGEST,
+        "environment_digest": OPAQUE_ENVIRONMENT_DIGEST,
+        "identity_authority": "coarse",
+    }
+    records[5] = {
+        "schema_version": "shadow-input/v1",
+        "kind": "action_identity",
+        "source_event_id": "identity-unavailable",
+        "occurred_at": "2026-07-17T09:00:04Z",
+        "action_digest": "f" * 64,
+        "workspace_digest": OPAQUE_WORKSPACE_DIGEST,
+        "environment_digest": OPAQUE_ENVIRONMENT_DIGEST,
+        "identity_authority": "unavailable",
+    }
+    return records
+
+
 def build_trace(
     records: list[dict[str, object]] | Iterator[dict[str, object]] | None = None,
     **overrides: object,
@@ -145,6 +213,7 @@ def test_from_records_builds_a_complete_content_addressed_trace() -> None:
     trace = build_trace(records)
 
     record_bytes = tuple(canonical_json(record) for record in records)
+    assert record_bytes == LEGACY_RECORD_BYTES
     source_bytes = b"[" + b",".join(record_bytes) + b"]"
     descriptor_bytes = canonical_json(DESCRIPTOR)
     profile_digest = length_prefixed_sha256(
@@ -187,7 +256,15 @@ def test_from_records_builds_a_complete_content_addressed_trace() -> None:
     )
     diagnostics = direct_diagnostics(trace)
     assert diagnostics.source_record_count == 7
-    assert diagnostics.input_kind_counts == tuple((kind, 1) for kind in ShadowInputKind)
+    assert diagnostics.input_kind_counts == (
+        (ShadowInputKind.START, 1),
+        (ShadowInputKind.ACTION, 1),
+        (ShadowInputKind.TOOL_RESULT, 1),
+        (ShadowInputKind.TEST_RESULT, 1),
+        (ShadowInputKind.OBSERVATION, 1),
+        (ShadowInputKind.CONTROLLER_ERROR, 1),
+        (ShadowInputKind.FINISH, 1),
+    )
     assert diagnostics.repeated_source_identifier_count == 0
     assert diagnostics.mapped_shadow_record_count == 7
     assert trace._descriptor_preimage() == descriptor_bytes
@@ -211,6 +288,129 @@ def test_from_records_builds_a_complete_content_addressed_trace() -> None:
     assert trace.mapped_record_digest == (
         "957401f3820d57146026cb5814ee99798afdf959b9a87632c6eb9438b31c560b"
     )
+
+
+def test_identity_records_round_trip_with_canonical_diagnostics() -> None:
+    records = identity_records()
+
+    trace = build_trace(records)
+
+    assert trace._wire_record_bytes() == tuple(canonical_json(record) for record in records)
+    diagnostics = direct_diagnostics(trace)
+    expected_counts = (
+        (ShadowInputKind.START, 1),
+        (ShadowInputKind.ACTION, 0),
+        (ShadowInputKind.TOOL_RESULT, 1),
+        (ShadowInputKind.TEST_RESULT, 1),
+        (ShadowInputKind.OBSERVATION, 0),
+        (ShadowInputKind.CONTROLLER_ERROR, 0),
+        (ShadowInputKind.FINISH, 1),
+        (ShadowInputKind.ACTION_IDENTITY, 3),
+    )
+    expected_body = {
+        "schema_version": "shadow-record-diagnostics/v1",
+        "source_record_count": 7,
+        "input_kind_counts": expected_counts,
+        "repeated_source_identifier_count": 0,
+        "mapped_shadow_record_count": 7,
+    }
+    assert diagnostics.input_kind_counts == expected_counts
+    assert diagnostics.model_dump(mode="python", exclude={"diagnostics_digest"}) == expected_body
+    assert diagnostics.diagnostics_digest == length_prefixed_sha256(
+        canonical_json(expected_body),
+        domain="saliencegate:shadow:record-diagnostics:v1",
+    )
+
+    zero_identity = diagnostics.model_copy(
+        update={
+            "input_kind_counts": (
+                *diagnostics.input_kind_counts[:-1],
+                (ShadowInputKind.ACTION_IDENTITY, 0),
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="identity count is not canonical"):
+        ShadowRecordDiagnostics.model_validate(zero_identity)
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    (
+        ("action_digest", "A" * 64),
+        ("workspace_digest", "c" * 63),
+        ("environment_digest", "d" * 65),
+        ("identity_authority", "unknown"),
+        ("working_directory", "/synthetic-placeholder"),
+    ),
+)
+def test_identity_wire_records_reject_noncanonical_digests_and_shell_placeholders(
+    changed_field: str,
+    changed_value: str,
+) -> None:
+    rows = identity_records()
+    build_trace(rows)
+    rows[1][changed_field] = changed_value
+
+    with pytest.raises(ShadowTraceInputError) as raised:
+        build_trace(rows)
+
+    assert raised.value.reason_code == "invalid_step"
+    assert raised.value.step_ordinal == 2
+    assert changed_value not in repr(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("result_index", "parent_source_event_id"),
+    (
+        (2, "missing-action"),
+        (2, "start-1"),
+        (2, "identity-coarse"),
+        (3, "tool-1"),
+    ),
+)
+def test_identity_result_parents_must_reference_one_prior_action_exactly(
+    result_index: int,
+    parent_source_event_id: str,
+) -> None:
+    rows = identity_records()
+    build_trace(rows)
+    rows[result_index]["action_source_event_id"] = parent_source_event_id
+
+    with pytest.raises(ShadowTraceInputError) as raised:
+        build_trace(rows)
+
+    assert raised.value.reason_code == "invalid_step"
+    assert raised.value.step_ordinal == result_index + 1
+    assert parent_source_event_id not in repr(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    (
+        ("action_digest", "9" * 64),
+        ("workspace_digest", "8" * 64),
+        ("environment_digest", "7" * 64),
+        ("identity_authority", "coarse"),
+    ),
+)
+def test_identity_retries_require_the_whole_canonical_record_to_match(
+    changed_field: str,
+    changed_value: str,
+) -> None:
+    rows = identity_records()
+    retry = dict(rows[1])
+    rows.insert(2, retry)
+
+    accepted = build_trace(rows)
+    assert direct_diagnostics(accepted).repeated_source_identifier_count == 1
+
+    retry[changed_field] = changed_value
+    with pytest.raises(ShadowTraceInputError) as raised:
+        build_trace(rows)
+
+    assert raised.value.reason_code == "invalid_step"
+    assert raised.value.step_ordinal == 3
+    assert changed_value not in repr(raised.value)
 
 
 def test_original_source_bytes_have_an_exact_plain_sha256_identity() -> None:

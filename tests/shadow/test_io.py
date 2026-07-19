@@ -27,6 +27,7 @@ from saliencegate.shadow import (
     ShadowSession,
 )
 from saliencegate.shadow.inputs import (
+    ShadowActionIdentityInput,
     ShadowActionInput,
     ShadowControllerErrorInput,
     ShadowFinishInput,
@@ -68,6 +69,8 @@ TAG = PayloadDigest(
     ),
 )
 ENVIRONMENT_DIGEST = "b" * 64
+ACTION_DIGEST = "c" * 64
+WORKSPACE_DIGEST = "d" * 64
 
 
 def _private_file(path: Path, data: bytes) -> Path:
@@ -189,6 +192,56 @@ def _complete_trace() -> bytes:
     )
 
 
+def _action_identity_trace() -> tuple[bytes, bytes]:
+    identity = _row(
+        schema_version="shadow-input/v1",
+        kind="action_identity",
+        source_event_id="opaque-action-1",
+        occurred_at="2026-07-16T10:01:00Z",
+        action_digest=ACTION_DIGEST,
+        workspace_digest=WORKSPACE_DIGEST,
+        environment_digest=ENVIRONMENT_DIGEST,
+        identity_authority="exact",
+    )
+    data = b"".join(
+        (
+            _row(
+                schema_version="shadow-input/v1",
+                kind="run_start",
+                source_event_id="start",
+                occurred_at="2026-07-16T10:00:00Z",
+            ),
+            identity,
+            _row(
+                schema_version="shadow-input/v1",
+                kind="tool_result",
+                source_event_id="tool-1",
+                occurred_at="2026-07-16T10:02:00Z",
+                action_source_event_id="opaque-action-1",
+                status="succeeded",
+                exit_status=0,
+            ),
+            _row(
+                schema_version="shadow-input/v1",
+                kind="test_result",
+                source_event_id="tests-1",
+                occurred_at="2026-07-16T10:03:00Z",
+                action_source_event_id="opaque-action-1",
+                framework="pytest",
+                status="passed",
+                failures=[],
+            ),
+            _row(
+                schema_version="shadow-input/v1",
+                kind="run_end",
+                source_event_id="finish",
+                occurred_at="2026-07-16T10:04:00Z",
+            ),
+        )
+    )
+    return data, identity
+
+
 def test_reader_preflights_all_wire_kinds_and_preserves_exact_bytes(tmp_path: Path) -> None:
     data = _complete_trace()
     path = _private_file(tmp_path / "events.ndjson", data)
@@ -209,7 +262,15 @@ def test_reader_preflights_all_wire_kinds_and_preserves_exact_bytes(tmp_path: Pa
         ShadowControllerErrorInput,
         ShadowFinishInput,
     )
-    assert tuple(row.input_kind for row in trace.rows) == tuple(ShadowInputKind)
+    assert tuple(row.input_kind for row in trace.rows) == (
+        ShadowInputKind.START,
+        ShadowInputKind.ACTION,
+        ShadowInputKind.TOOL_RESULT,
+        ShadowInputKind.TEST_RESULT,
+        ShadowInputKind.OBSERVATION,
+        ShadowInputKind.CONTROLLER_ERROR,
+        ShadowInputKind.FINISH,
+    )
     assert tuple(row.event_sequence for row in trace.rows) == tuple(range(1, 8))
     assert all(row.retry_target_ordinal is None for row in trace.rows)
     tool = trace.rows[2].input_record
@@ -220,6 +281,44 @@ def test_reader_preflights_all_wire_kinds_and_preserves_exact_bytes(tmp_path: Pa
     assert tool.action.sequence == 2
     assert trace.rows[-1].input_kind is ShadowInputKind.FINISH
     assert "action-1" not in repr(trace)
+
+
+def test_action_identity_wire_round_trip_is_canonical_opaque_and_parentable(
+    tmp_path: Path,
+) -> None:
+    data, identity_row = _action_identity_trace()
+    trace = _read(
+        _private_file(tmp_path / "opaque-events.ndjson", data),
+        capture_scope="complete_run_declared",
+    )
+
+    assert trace.input_bytes == data
+    assert tuple(row.input_kind for row in trace.rows) == (
+        ShadowInputKind.START,
+        ShadowInputKind.ACTION_IDENTITY,
+        ShadowInputKind.TOOL_RESULT,
+        ShadowInputKind.TEST_RESULT,
+        ShadowInputKind.FINISH,
+    )
+    identity = trace.rows[1].input_record
+    tool_result = trace.rows[2].input_record
+    test_result = trace.rows[3].input_record
+    assert type(identity) is ShadowActionIdentityInput
+    assert isinstance(tool_result, ShadowToolResultInput)
+    assert isinstance(test_result, ShadowTestResultInput)
+    assert canonical_json(identity.model_dump(mode="json", warnings=False)) == (
+        identity_row.removesuffix(b"\n")
+    )
+    assert tool_result.action == test_result.action == trace.rows[1].event_ref
+    assert {
+        "command",
+        "argv",
+        "working_directory",
+    }.isdisjoint(identity.model_dump())
+    rendered = repr(trace)
+    assert ACTION_DIGEST not in rendered
+    assert WORKSPACE_DIGEST not in rendered
+    assert ENVIRONMENT_DIGEST not in rendered
 
 
 def test_decoded_record_preflight_matches_the_ndjson_wrapper_exactly() -> None:
@@ -614,6 +713,41 @@ def test_reader_rejects_forward_and_non_action_parents(
         _read(_private_file(tmp_path / "events.ndjson", b"".join(rows)))
 
 
+def test_reader_rejects_a_forward_action_identity_parent(tmp_path: Path) -> None:
+    data = b"".join(
+        (
+            _row(
+                schema_version="shadow-input/v1",
+                kind="run_start",
+                source_event_id="start",
+                occurred_at="2026-07-16T10:00:00Z",
+            ),
+            _row(
+                schema_version="shadow-input/v1",
+                kind="tool_result",
+                source_event_id="result",
+                occurred_at="2026-07-16T10:01:00Z",
+                action_source_event_id="future-opaque-action",
+                status="failed",
+                exit_status=1,
+            ),
+            _row(
+                schema_version="shadow-input/v1",
+                kind="action_identity",
+                source_event_id="future-opaque-action",
+                occurred_at="2026-07-16T10:02:00Z",
+                action_digest=ACTION_DIGEST,
+                workspace_digest=WORKSPACE_DIGEST,
+                environment_digest=ENVIRONMENT_DIGEST,
+                identity_authority="exact",
+            ),
+        )
+    )
+
+    with pytest.raises(ShadowInputError):
+        _read(_private_file(tmp_path / "forward-parent.ndjson", data))
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -638,6 +772,87 @@ def test_wire_schema_is_strict_and_forbids_extra_fields(
 
     with pytest.raises(ShadowInputError):
         _read(_private_file(tmp_path / "events.ndjson", _row(**values)))
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("action_digest", "A" * 64),
+        ("workspace_digest", "d" * 63),
+        ("environment_digest", "g" * 64),
+        ("identity_authority", "derived"),
+    ),
+)
+def test_action_identity_wire_rejects_noncanonical_values(
+    tmp_path: Path,
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    identity: dict[str, object] = {
+        "schema_version": "shadow-input/v1",
+        "kind": "action_identity",
+        "source_event_id": "opaque-action-1",
+        "occurred_at": "2026-07-16T10:01:00Z",
+        "action_digest": ACTION_DIGEST,
+        "workspace_digest": WORKSPACE_DIGEST,
+        "environment_digest": ENVIRONMENT_DIGEST,
+        "identity_authority": "exact",
+    }
+    identity[field_name] = invalid_value
+    data = b"".join(
+        (
+            _row(
+                schema_version="shadow-input/v1",
+                kind="run_start",
+                source_event_id="start",
+                occurred_at="2026-07-16T10:00:00Z",
+            ),
+            _row(**identity),
+        )
+    )
+
+    with pytest.raises(ShadowInputError, match=r"^shadow input is invalid$") as caught:
+        _read(_private_file(tmp_path / f"invalid-{field_name}.ndjson", data))
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("shell_field", ("command", "argv", "working_directory"))
+def test_action_identity_wire_rejects_shell_values_without_echoing_them(
+    tmp_path: Path,
+    shell_field: str,
+) -> None:
+    sentinel = "wire-opaque-action-secret-sentinel"
+    identity: dict[str, object] = {
+        "schema_version": "shadow-input/v1",
+        "kind": "action_identity",
+        "source_event_id": "opaque-action-1",
+        "occurred_at": "2026-07-16T10:01:00Z",
+        "action_digest": ACTION_DIGEST,
+        "workspace_digest": WORKSPACE_DIGEST,
+        "environment_digest": ENVIRONMENT_DIGEST,
+        "identity_authority": "exact",
+        shell_field: [sentinel] if shell_field == "argv" else sentinel,
+    }
+    data = b"".join(
+        (
+            _row(
+                schema_version="shadow-input/v1",
+                kind="run_start",
+                source_event_id="start",
+                occurred_at="2026-07-16T10:00:00Z",
+            ),
+            _row(**identity),
+        )
+    )
+
+    with pytest.raises(ShadowInputError, match=r"^shadow input is invalid$") as caught:
+        _read(_private_file(tmp_path / f"forbidden-{shell_field}.ndjson", data))
+
+    assert sentinel not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_complete_capture_requires_a_unique_final_run_end(tmp_path: Path) -> None:

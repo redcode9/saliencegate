@@ -150,6 +150,39 @@ class ShellActionEvidence(_EvidenceModel):
         return self
 
 
+class OpaqueActionEvidence(_EvidenceModel):
+    """Versioned adapter-owned envelope for opaque action identity."""
+
+    schema_version: Literal["1.0"]
+    kind: Literal["opaque"]
+    action_digest: str = Field(repr=False)
+    workspace_digest: str = Field(repr=False)
+    environment_digest: str = Field(repr=False)
+    identity_authority: Literal["exact", "coarse", "unavailable"]
+
+    @field_validator(
+        "schema_version",
+        "kind",
+        "action_digest",
+        "workspace_digest",
+        "environment_digest",
+        "identity_authority",
+        mode="before",
+    )
+    @classmethod
+    def require_exact_text(cls, value: object) -> object:
+        if type(value) is not str:
+            raise ValueError("opaque action identity is invalid")
+        return value
+
+    @field_validator("action_digest", "workspace_digest", "environment_digest")
+    @classmethod
+    def require_digest(cls, value: str) -> str:
+        if _DIGEST.fullmatch(value) is None:
+            raise ValueError("opaque action identity digest is invalid")
+        return value
+
+
 class ToolOutcomeEvidence(_EvidenceModel):
     """Versioned adapter-owned envelope for a structured tool completion."""
 
@@ -303,7 +336,7 @@ def _validate_derived_text(
 class ActionFingerprint:
     """Transient, non-serializable action equivalence value."""
 
-    execution_mode: Literal["argv", "shell"]
+    execution_mode: Literal["argv", "shell", "opaque"]
     tokens: InitVar[tuple[str, ...]]
     working_directory: InitVar[str]
     environment_digest: InitVar[str]
@@ -351,6 +384,25 @@ class ActionFingerprint:
         return "ActionFingerprint(<structured>)"
 
     __str__ = __repr__
+
+    @classmethod
+    def _from_opaque(cls, payload: OpaqueActionEvidence) -> Self:
+        if type(payload) is not OpaqueActionEvidence or payload.identity_authority != "exact":
+            raise ValueError("opaque action fingerprint is invalid")
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "execution_mode", "opaque")
+        object.__setattr__(instance, "algorithm_version", _FINGERPRINT_VERSION)
+        object.__setattr__(
+            instance,
+            "_digest",
+            length_prefixed_sha256(
+                payload.action_digest,
+                payload.workspace_digest,
+                payload.environment_digest,
+                domain="saliencegate:signals:opaque-action-fingerprint:v1",
+            ),
+        )
+        return instance
 
     def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
         del protocol
@@ -571,13 +623,24 @@ def _load_payload(
     return parsed
 
 
-def _load_action(event: TraceEvent) -> ShellActionEvidence:
+def _load_action(event: TraceEvent) -> ShellActionEvidence | OpaqueActionEvidence:
     if type(event) is not TraceEvent or event.event_type is not EventType.ACTION_PROPOSAL:
         raise FingerprintUnavailableError(AbstentionReason.EVENT_NOT_APPLICABLE)
     if type(event.payload) is not MappingProxyType:
         raise FingerprintUnavailableError(AbstentionReason.STRUCTURED_EVIDENCE_INVALID)
-    if "action" not in event.payload:
+    has_shell = "action" in event.payload
+    has_opaque = "action_identity" in event.payload
+    if has_shell and has_opaque:
+        raise FingerprintUnavailableError(AbstentionReason.STRUCTURED_EVIDENCE_INVALID)
+    if not has_shell and not has_opaque:
         raise FingerprintUnavailableError(AbstentionReason.STRUCTURED_EVIDENCE_MISSING)
+    if has_opaque:
+        return _load_payload(
+            OpaqueActionEvidence,
+            event.payload["action_identity"],
+            max_bytes=_MAX_ACTION_PAYLOAD_BYTES,
+            max_nodes=_MAX_ACTION_PAYLOAD_NODES,
+        )
     value = event.payload["action"]
     return _load_payload(
         ShellActionEvidence,
@@ -686,6 +749,11 @@ def _shell_tokens(payload: ShellActionEvidence) -> tuple[str, ...]:
 
 def action_fingerprint(event: TraceEvent) -> ActionFingerprint:
     payload = _load_action(event)
+    if type(payload) is OpaqueActionEvidence:
+        if payload.identity_authority != "exact":
+            raise FingerprintUnavailableError(AbstentionReason.STRUCTURED_EVIDENCE_MISSING)
+        return ActionFingerprint._from_opaque(payload)
+    assert type(payload) is ShellActionEvidence
     return ActionFingerprint(
         execution_mode="argv" if payload.argv is not None else "shell",
         tokens=_shell_tokens(payload),
@@ -844,6 +912,7 @@ __all__ = [
     "FailureFingerprint",
     "FingerprintUnavailableError",
     "NormalizedTestFailure",
+    "OpaqueActionEvidence",
     "ShellActionEvidence",
     "TestFailureEvidence",
     "TestReport",

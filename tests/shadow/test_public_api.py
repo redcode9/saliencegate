@@ -23,7 +23,7 @@ from saliencegate.shadow.errors import (
     ShadowStateError,
     ShadowTraceInputError,
 )
-from saliencegate.shadow.inputs import ShadowEventRef
+from saliencegate.shadow.inputs import ShadowActionIdentityInput, ShadowEventRef
 from saliencegate.shadow.observation import ShadowEventResult, ShadowObservation
 from saliencegate.shadow.report import ShadowRunReport, build_shadow_run_report
 from saliencegate.shadow.session import ShadowSession
@@ -66,6 +66,7 @@ def test_shadow_root_exports_the_public_contract() -> None:
     assert public_shadow.__all__ == [
         "ATIFProfile",
         "ATIFShadowAdapter",
+        "ShadowActionIdentityInput",
         "ShadowAnalyzer",
         "ShadowConfig",
         "ShadowConfigurationError",
@@ -93,6 +94,7 @@ def test_shadow_root_exports_the_public_contract() -> None:
     assert public_shadow.ATIFProfile is ATIFProfile
     assert public_shadow.ATIFShadowAdapter is ATIFShadowAdapter
     assert public_shadow.ShadowAnalyzer is ShadowAnalyzer
+    assert public_shadow.ShadowActionIdentityInput is ShadowActionIdentityInput
     assert public_shadow.ShadowConfig is ShadowConfig
     assert public_shadow.ShadowConfigurationError is ShadowConfigurationError
     assert public_shadow.ShadowEventRef is ShadowEventRef
@@ -251,6 +253,18 @@ def test_shadow_regular_callable_signatures_are_semantically_frozen() -> None:
 
 def test_shadow_session_factory_signatures_are_semantically_frozen() -> None:
     assert_signature_contract(
+        ShadowSession.action_identity,
+        positional=("self",),
+        keyword_only=(
+            "source_event_id",
+            "occurred_at",
+            "action_digest",
+            "workspace_digest",
+            "environment_digest",
+            "identity_authority",
+        ),
+    )
+    assert_signature_contract(
         ShadowSession.in_memory_for_trace,
         keyword_only=(
             "run_id",
@@ -310,6 +324,11 @@ def test_shadow_session_factory_signatures_are_semantically_frozen() -> None:
 
 def test_exported_shadow_model_fields_and_schema_defaults_are_frozen() -> None:
     expected = {
+        ShadowActionIdentityInput: (
+            "shadow-input/v1",
+            """schema_version source_event_id occurred_at kind action_digest workspace_digest
+            environment_digest identity_authority""",
+        ),
         ShadowConfig: (
             "shadow-config/v1",
             """schema_version detectors supported_signal_types unsupported_signal_types

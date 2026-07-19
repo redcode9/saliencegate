@@ -66,6 +66,7 @@ from saliencegate.shadow.errors import (
 from saliencegate.shadow.evaluation import evaluate_shadow_heuristic
 from saliencegate.shadow.inputs import (
     SHADOW_PROJECTION_MATRIX,
+    ShadowActionIdentityInput,
     ShadowActionInput,
     ShadowControllerErrorInput,
     ShadowEventRef,
@@ -93,6 +94,7 @@ from saliencegate.signals import (
     DetectionContext,
     DeterministicSignalExtractor,
     ExtractionReport,
+    OpaqueActionEvidence,
     ShellActionEvidence,
     TestFailureEvidence,
     TestReportEvidence,
@@ -110,7 +112,15 @@ _CAPTURE_SCOPES = frozenset(
     {"unknown", "selected_events", "bounded_window", "complete_run_declared"}
 )
 _RESERVED_OBSERVATION_KEYS = frozenset(
-    {"shadow_run", "shadow_run_end", "action", "tool_outcome", "test_report", "controller_error"}
+    {
+        "shadow_run",
+        "shadow_run_end",
+        "action",
+        "action_identity",
+        "tool_outcome",
+        "test_report",
+        "controller_error",
+    }
 )
 
 CaptureScope: TypeAlias = Literal[
@@ -163,6 +173,7 @@ class _RunState:
 _INPUT_TYPES = (
     ShadowStartInput,
     ShadowActionInput,
+    ShadowActionIdentityInput,
     ShadowToolResultInput,
     ShadowTestResultInput,
     ShadowObservationInput,
@@ -972,6 +983,27 @@ class ShadowSession:
         )
         return await self._submit(value, cli_input_ordinal=None)
 
+    async def action_identity(
+        self,
+        *,
+        source_event_id: str,
+        occurred_at: datetime,
+        action_digest: str,
+        workspace_digest: str,
+        environment_digest: str,
+        identity_authority: Literal["exact", "coarse", "unavailable"],
+    ) -> ShadowEventResult:
+        value = self._public_input(
+            ShadowActionIdentityInput,
+            source_event_id=source_event_id,
+            occurred_at=occurred_at,
+            action_digest=action_digest,
+            workspace_digest=workspace_digest,
+            environment_digest=environment_digest,
+            identity_authority=identity_authority,
+        )
+        return await self._submit(value, cli_input_ordinal=None)
+
     async def tool_result(
         self,
         *,
@@ -1291,7 +1323,12 @@ class ShadowSession:
         if candidate is None or not self._payload_is_valid(candidate, kind):
             raise ShadowInputError()
 
-        applicability = next(item for item in self._config.applicability if item.input_kind is kind)
+        applicability_kind = (
+            ShadowInputKind.ACTION if kind is ShadowInputKind.ACTION_IDENTITY else kind
+        )
+        applicability = next(
+            item for item in self._config.applicability if item.input_kind is applicability_kind
+        )
         for detector_index, detector in enumerate(self._config.detectors):
             if detector.signal_type not in applicability.applicable_signal_types:
                 continue
@@ -1508,6 +1545,11 @@ class ShadowSession:
             if kind is ShadowInputKind.ACTION:
                 action_evidence = ShellActionEvidence.model_validate_json(canonical_json(value))
                 return canonical_json(action_evidence) == canonical_json(value)
+            if kind is ShadowInputKind.ACTION_IDENTITY:
+                opaque_action_evidence = OpaqueActionEvidence.model_validate_json(
+                    canonical_json(value)
+                )
+                return canonical_json(opaque_action_evidence) == canonical_json(value)
             if kind is ShadowInputKind.TOOL_RESULT:
                 tool_evidence = ToolOutcomeEvidence.model_validate_json(canonical_json(value))
                 return canonical_json(tool_evidence) == canonical_json(value)

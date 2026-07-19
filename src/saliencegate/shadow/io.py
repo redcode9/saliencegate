@@ -45,6 +45,7 @@ from saliencegate.shadow.config import ShadowConfig, validate_shadow_config
 from saliencegate.shadow.errors import ShadowInputError, ShadowInvariantError
 from saliencegate.shadow.inputs import (
     SHADOW_PROJECTION_MATRIX,
+    ShadowActionIdentityInput,
     ShadowActionInput,
     ShadowControllerErrorInput,
     ShadowEventRef,
@@ -69,6 +70,7 @@ from saliencegate.shadow.trace_report import (
     encode_shadow_trace_report,
 )
 from saliencegate.signals import (
+    OpaqueActionEvidence,
     ShellActionEvidence,
     TestFailureEvidence,
     TestReportEvidence,
@@ -98,6 +100,7 @@ _RESERVED_OBSERVATION_KEYS = frozenset(
         "shadow_run",
         "shadow_run_end",
         "action",
+        "action_identity",
         "tool_outcome",
         "test_report",
         "controller_error",
@@ -114,6 +117,7 @@ CaptureScope: TypeAlias = Literal[
 _WIRE_TO_INPUT_KIND: Mapping[str, ShadowInputKind] = {
     "run_start": ShadowInputKind.START,
     "action": ShadowInputKind.ACTION,
+    "action_identity": ShadowInputKind.ACTION_IDENTITY,
     "tool_result": ShadowInputKind.TOOL_RESULT,
     "test_result": ShadowInputKind.TEST_RESULT,
     "observation": ShadowInputKind.OBSERVATION,
@@ -127,6 +131,18 @@ _WIRE_FIELDS: Mapping[ShadowInputKind, tuple[frozenset[str], frozenset[str]]] = 
     ShadowInputKind.ACTION: (
         _COMMON_FIELDS | frozenset({"working_directory", "environment_digest"}),
         frozenset({"command", "argv"}),
+    ),
+    ShadowInputKind.ACTION_IDENTITY: (
+        _COMMON_FIELDS
+        | frozenset(
+            {
+                "action_digest",
+                "workspace_digest",
+                "environment_digest",
+                "identity_authority",
+            }
+        ),
+        frozenset(),
     ),
     ShadowInputKind.TOOL_RESULT: (
         _COMMON_FIELDS | frozenset({"action_source_event_id"}),
@@ -607,7 +623,10 @@ def _action_parent(
     if type(value) is not str:
         raise ValueError("action parent is invalid")
     known = known_sources.get(value)
-    if known is None or known.kind is not ShadowInputKind.ACTION:
+    if known is None or known.kind not in (
+        ShadowInputKind.ACTION,
+        ShadowInputKind.ACTION_IDENTITY,
+    ):
         raise ValueError("action parent is missing or not an action")
     return known.row.event_ref
 
@@ -651,6 +670,16 @@ def _parse_input_record(
                 "argv": argv,
                 "working_directory": value["working_directory"],
                 "environment_digest": value["environment_digest"],
+            }
+        )
+    elif kind is ShadowInputKind.ACTION_IDENTITY:
+        record = ShadowActionIdentityInput.model_validate(
+            {
+                **common,
+                "action_digest": value["action_digest"],
+                "workspace_digest": value["workspace_digest"],
+                "environment_digest": value["environment_digest"],
+                "identity_authority": value["identity_authority"],
             }
         )
     elif kind is ShadowInputKind.TOOL_RESULT:
@@ -745,6 +774,9 @@ def _event_payload_is_valid(
         if kind is ShadowInputKind.ACTION:
             action_evidence = ShellActionEvidence.model_validate_json(canonical_json(value))
             return canonical_json(action_evidence) == canonical_json(value)
+        if kind is ShadowInputKind.ACTION_IDENTITY:
+            opaque_action_evidence = OpaqueActionEvidence.model_validate_json(canonical_json(value))
+            return canonical_json(opaque_action_evidence) == canonical_json(value)
         if kind is ShadowInputKind.TOOL_RESULT:
             tool_evidence = ToolOutcomeEvidence.model_validate_json(canonical_json(value))
             return canonical_json(tool_evidence) == canonical_json(value)
@@ -847,7 +879,10 @@ def _preflight_redacted_event(
     if not _event_payload_is_valid(options, candidate, kind):
         raise ValueError("redacted event payload is not canonical")
 
-    applicability = next(item for item in options.config.applicability if item.input_kind is kind)
+    applicability_kind = ShadowInputKind.ACTION if kind is ShadowInputKind.ACTION_IDENTITY else kind
+    applicability = next(
+        item for item in options.config.applicability if item.input_kind is applicability_kind
+    )
     for detector_index, detector in enumerate(options.config.detectors):
         if detector.signal_type not in applicability.applicable_signal_types:
             continue

@@ -92,6 +92,16 @@ def _event(
         ShadowInputKind.ACTION: {
             "action": {"schema_version": "1.0", "command": "private-command"},
         },
+        ShadowInputKind.ACTION_IDENTITY: {
+            "action_identity": {
+                "schema_version": "1.0",
+                "kind": "opaque",
+                "action_digest": "b" * 64,
+                "workspace_digest": "c" * 64,
+                "environment_digest": "d" * 64,
+                "identity_authority": "exact",
+            },
+        },
         ShadowInputKind.TOOL_RESULT: {
             "tool_outcome": {"schema_version": "1.0", "message": "private-tool-text"},
         },
@@ -369,6 +379,46 @@ def _make_case(
         **_builder_kwargs(rows, observations, run_id=run_id)
     )
     return ReportCase(rows=rows, observations=observations, report=report)
+
+
+def test_report_accepts_action_identity_without_changing_the_legacy_case(
+    trace_event_factory: TraceEventFactory,
+) -> None:
+    events = (
+        _event(trace_event_factory, 1, ShadowInputKind.START),
+        _event(trace_event_factory, 2, ShadowInputKind.ACTION_IDENTITY),
+        _event(trace_event_factory, 3, ShadowInputKind.FINISH),
+    )
+    kinds = (
+        ShadowInputKind.START,
+        ShadowInputKind.ACTION_IDENTITY,
+        ShadowInputKind.FINISH,
+    )
+    observations = tuple(
+        _observation(
+            prefix=events[:index],
+            kind=kind,
+            cli_input_ordinal=index,
+        )
+        for index, kind in enumerate(kinds, start=1)
+    )
+    rows = tuple(
+        _row(
+            observation,
+            input_ordinal=index,
+            kind=kind,
+            first_occurrence_ordinal=index,
+            retry_target_ordinal=None,
+        )
+        for index, (observation, kind) in enumerate(
+            zip(observations, kinds, strict=True),
+            start=1,
+        )
+    )
+
+    report = build_shadow_run_report(**_builder_kwargs(rows, observations))  # type: ignore[arg-type]
+
+    assert tuple(row.input_kind for row in report.rows) == kinds
 
 
 def _counts_by_pair(values: tuple[tuple[Any, ...], ...]) -> dict[tuple[Any, ...], int]:

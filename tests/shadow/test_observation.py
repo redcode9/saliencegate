@@ -424,6 +424,13 @@ def test_context_selector_finds_and_verifies_the_longest_suffix_above_ten_megaby
             TrustLabel.UNTRUSTED_MODEL_OUTPUT,
         ),
         (
+            EventType.ACTION_PROPOSAL,
+            EventPhase.PRE_ACTION,
+            {"action_identity": {"schema_version": "1.0"}},
+            (),
+            TrustLabel.UNTRUSTED_MODEL_OUTPUT,
+        ),
+        (
             EventType.TOOL_COMPLETION,
             EventPhase.POST_ACTION,
             {"tool_outcome": {"schema_version": "1.0"}},
@@ -793,6 +800,66 @@ def test_builder_binds_source_identity_and_recomputes_the_exact_heuristic(
             )
         assert caught.value.__cause__ is None
         assert caught.value.__context__ is None
+
+
+def test_action_and_action_identity_cannot_be_cross_labeled(
+    trace_event_factory: TraceEventFactory,
+) -> None:
+    config = ShadowConfig.reference()
+    cases = (
+        (
+            trace_event_factory(
+                1,
+                event_type=EventType.ACTION_PROPOSAL,
+                phase=EventPhase.PRE_ACTION,
+                payload={"action": {"schema_version": "1.0"}},
+                trust_label=TrustLabel.UNTRUSTED_MODEL_OUTPUT,
+            ),
+            ShadowInputKind.ACTION_IDENTITY,
+        ),
+        (
+            trace_event_factory(
+                1,
+                event_type=EventType.ACTION_PROPOSAL,
+                phase=EventPhase.PRE_ACTION,
+                payload={"action_identity": {"schema_version": "1.0"}},
+                trust_label=TrustLabel.UNTRUSTED_MODEL_OUTPUT,
+            ),
+            ShadowInputKind.ACTION,
+        ),
+    )
+
+    for event, wrong_kind in cases:
+        prefix = (event,)
+        context = select_detection_context(prefix)
+        report = no_match_report(prefix, config)
+        feature_digest = derive_shadow_feature_snapshot_digest(
+            prefix=prefix,
+            context=context,
+            report=report,
+            config=config,
+        )
+        heuristic = evaluate_shadow_heuristic(
+            report,
+            input_kind=wrong_kind,
+            config=config,
+            feature_snapshot_digest=feature_digest,
+        )
+
+        with pytest.raises(ShadowInvariantError):
+            build_shadow_observation(
+                prefix=prefix,
+                context=context,
+                report=report,
+                config=config,
+                input_kind=wrong_kind,
+                heuristic=heuristic,
+                source_event_digest=derive_shadow_source_event_digest(
+                    RUN_ID,
+                    event.source_event_id,
+                ),
+                redaction_policy_tag=REDACTION_POLICY_TAG,
+            )
 
 
 def test_report_references_must_be_ordered_members_of_the_selected_context(

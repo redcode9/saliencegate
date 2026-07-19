@@ -52,6 +52,7 @@ _WIRE_INPUT_KINDS = MappingProxyType(
     {
         "run_start": ShadowInputKind.START,
         "action": ShadowInputKind.ACTION,
+        "action_identity": ShadowInputKind.ACTION_IDENTITY,
         "tool_result": ShadowInputKind.TOOL_RESULT,
         "test_result": ShadowInputKind.TEST_RESULT,
         "observation": ShadowInputKind.OBSERVATION,

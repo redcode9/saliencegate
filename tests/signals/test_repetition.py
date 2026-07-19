@@ -21,6 +21,9 @@ from saliencegate.signals.repetition import (
 )
 
 EventFactory = Callable[..., TraceEvent]
+OPAQUE_ACTION_DIGEST = "b" * 64
+OPAQUE_WORKSPACE_DIGEST = "c" * 64
+OPAQUE_ENVIRONMENT_DIGEST = "d" * 64
 
 
 def context(*events: TraceEvent) -> DetectionContext:
@@ -43,6 +46,32 @@ def action(
                 "command": command,
                 "working_directory": "/workspace",
                 "environment_digest": "a" * 64,
+            }
+        },
+    )
+
+
+def opaque_action(
+    event_factory: EventFactory,
+    sequence: int,
+    *,
+    identity_authority: str = "exact",
+    action_digest: str = OPAQUE_ACTION_DIGEST,
+    workspace_digest: str = OPAQUE_WORKSPACE_DIGEST,
+    environment_digest: str = OPAQUE_ENVIRONMENT_DIGEST,
+) -> TraceEvent:
+    return event_factory(
+        sequence,
+        event_type=EventType.ACTION_PROPOSAL,
+        phase=EventPhase.PRE_ACTION,
+        payload={
+            "action_identity": {
+                "schema_version": "1.0",
+                "kind": "opaque",
+                "action_digest": action_digest,
+                "workspace_digest": workspace_digest,
+                "environment_digest": environment_digest,
+                "identity_authority": identity_authority,
             }
         },
     )
@@ -183,6 +212,120 @@ def test_repeated_action_uses_normalized_fingerprint_and_most_recent_match(
     assert outcome.signal_type is SignalType.REPEATED_ACTION
     assert outcome.strength == 1.0
     assert outcome.evidence_event_ids == (first.event_id, current.event_id)
+
+
+def test_repeated_action_detects_matching_exact_opaque_identities(
+    event_factory: EventFactory,
+) -> None:
+    prior = opaque_action(event_factory, 1)
+    current = opaque_action(event_factory, 2)
+
+    outcome = RepeatedActionDetector(RepetitionConfig(window_events=2)).evaluate(
+        context(prior, current)
+    )
+
+    assert outcome.status is DetectionStatus.DETECTED
+    assert outcome.signal_type is SignalType.REPEATED_ACTION
+    assert outcome.evidence_event_ids == (prior.event_id, current.event_id)
+
+
+@pytest.mark.parametrize(
+    "changed_digest",
+    (
+        {"action_digest": "e" * 64},
+        {"workspace_digest": "e" * 64},
+        {"environment_digest": "e" * 64},
+    ),
+)
+def test_repeated_action_compares_every_exact_opaque_digest(
+    event_factory: EventFactory,
+    changed_digest: dict[str, str],
+) -> None:
+    prior = opaque_action(event_factory, 1)
+    current = opaque_action(event_factory, 2, **changed_digest)
+
+    outcome = RepeatedActionDetector(RepetitionConfig(window_events=2)).evaluate(
+        context(prior, current)
+    )
+
+    assert outcome.status is DetectionStatus.NO_MATCH
+    assert outcome.related_event_ids == (current.event_id,)
+
+
+@pytest.mark.parametrize("identity_authority", ("coarse", "unavailable"))
+def test_repeated_action_abstains_when_current_opaque_identity_is_not_exact(
+    event_factory: EventFactory,
+    identity_authority: str,
+) -> None:
+    prior = opaque_action(event_factory, 1)
+    current = opaque_action(
+        event_factory,
+        2,
+        identity_authority=identity_authority,
+    )
+    exact_current = opaque_action(event_factory, 2)
+
+    detector = RepeatedActionDetector(RepetitionConfig(window_events=2))
+    exact_outcome = detector.evaluate(context(prior, exact_current))
+    outcome = detector.evaluate(context(prior, current))
+
+    assert exact_outcome.status is DetectionStatus.DETECTED
+    assert outcome.status is DetectionStatus.ABSTAINED
+    assert outcome.abstention_reason is AbstentionReason.STRUCTURED_EVIDENCE_MISSING
+    assert outcome.related_event_ids == (current.event_id,)
+
+
+@pytest.mark.parametrize("identity_authority", ("coarse", "unavailable"))
+def test_repeated_action_abstains_when_only_prior_opaque_identity_is_not_exact(
+    event_factory: EventFactory,
+    identity_authority: str,
+) -> None:
+    prior = opaque_action(
+        event_factory,
+        1,
+        identity_authority=identity_authority,
+    )
+    current = opaque_action(event_factory, 2)
+
+    outcome = RepeatedActionDetector(RepetitionConfig(window_events=2)).evaluate(
+        context(prior, current)
+    )
+
+    assert outcome.status is DetectionStatus.ABSTAINED
+    assert outcome.abstention_reason is AbstentionReason.STRUCTURED_EVIDENCE_MISSING
+    assert outcome.related_event_ids == (prior.event_id, current.event_id)
+
+
+def test_non_exact_opaque_identity_does_not_suppress_an_exact_match(
+    event_factory: EventFactory,
+) -> None:
+    exact_prior = opaque_action(event_factory, 1)
+    unavailable = opaque_action(
+        event_factory,
+        2,
+        identity_authority="unavailable",
+    )
+    current = opaque_action(event_factory, 3)
+
+    outcome = RepeatedActionDetector(RepetitionConfig(window_events=3)).evaluate(
+        context(exact_prior, unavailable, current)
+    )
+
+    assert outcome.status is DetectionStatus.DETECTED
+    assert outcome.evidence_event_ids == (exact_prior.event_id, current.event_id)
+
+
+def test_repeated_action_does_not_equate_opaque_and_shell_evidence(
+    event_factory: EventFactory,
+) -> None:
+    prior = action(event_factory, 1, OPAQUE_ACTION_DIGEST)
+    current = opaque_action(event_factory, 2)
+
+    outcome = RepeatedActionDetector(RepetitionConfig(window_events=2)).evaluate(
+        context(prior, current)
+    )
+
+    assert outcome.status is DetectionStatus.NO_MATCH
 
 
 def test_repeated_action_window_includes_current_and_excludes_older_prefix(

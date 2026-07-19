@@ -15,7 +15,7 @@ from saliencegate.shadow.errors import (
     ShadowStateError,
     ShadowTraceInputError,
 )
-from saliencegate.shadow.inputs import ShadowEventRef
+from saliencegate.shadow.inputs import ShadowActionIdentityInput, ShadowEventRef
 from saliencegate.shadow.observation import ShadowEventResult, ShadowObservation
 from saliencegate.shadow.report import ShadowRunReport, build_shadow_run_report
 from saliencegate.shadow.session import ShadowSession
@@ -34,6 +34,7 @@ from saliencegate.shadow.trace_report import (
 __all__ = [
     "ATIFProfile",
     "ATIFShadowAdapter",
+    "ShadowActionIdentityInput",
     "ShadowAnalyzer",
     "ShadowConfig",
     "ShadowConfigurationError",

@@ -262,7 +262,10 @@ def _evaluate(
     if observed_evaluations != expected_evaluations:
         return None
 
-    rows = tuple(row for row in config.applicability if row.input_kind is input_kind)
+    applicability_kind = (
+        ShadowInputKind.ACTION if input_kind is ShadowInputKind.ACTION_IDENTITY else input_kind
+    )
+    rows = tuple(row for row in config.applicability if row.input_kind is applicability_kind)
     if len(rows) != 1:
         return None
     applicable_types = rows[0].applicable_signal_types

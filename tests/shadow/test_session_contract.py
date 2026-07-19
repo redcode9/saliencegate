@@ -21,7 +21,11 @@ from saliencegate.shadow.errors import (
     ShadowInvariantError,
     ShadowStateError,
 )
-from saliencegate.shadow.inputs import ShadowEventRef, ShadowObservationSource
+from saliencegate.shadow.inputs import (
+    ShadowEventRef,
+    ShadowObservationSource,
+    derive_shadow_event_id,
+)
 from saliencegate.shadow.observation import ShadowEventResult
 from saliencegate.shadow.session import ShadowSession
 from saliencegate.signals import DetectionContext
@@ -36,6 +40,9 @@ _LINEAGE_DIGEST = "2" * 64
 _MANIFEST_DIGEST = "3" * 64
 _SOURCE_ADAPTER = "shadow-contract/v1"
 _POLICY_TAG_DOMAIN = b"saliencegate:shadow:redaction-policy:v1"
+_OPAQUE_ACTION_DIGEST = "b" * 64
+_OPAQUE_WORKSPACE_DIGEST = "c" * 64
+_OPAQUE_ENVIRONMENT_DIGEST = "d" * 64
 
 
 class _InstallationKeySubclass(InstallationKey):
@@ -359,6 +366,191 @@ async def test_memory_and_sqlite_emit_byte_identical_results_for_fixed_inputs(
     sqlite = _factory("sqlite", tmp_path / "parity.sqlite3", **_fixed_options())
 
     assert await _fixed_result_bytes(memory) == await _fixed_result_bytes(sqlite)
+
+
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.asyncio
+async def test_action_identity_round_trips_every_authority_without_shell_placeholders(
+    backend: Backend,
+    tmp_path: Path,
+) -> None:
+    session = _factory(
+        backend,
+        tmp_path / "identity-authorities.sqlite3",
+        run_id=RUN_ID,
+        installation_key=InstallationKey(_KEY_MATERIAL),
+    )
+    authorities = ("exact", "coarse", "unavailable")
+
+    async with session:
+        await session.start(source_event_id="start", occurred_at=NOW)
+        submitted = []
+        for index, authority in enumerate(authorities, start=1):
+            submitted.append(
+                await session.action_identity(
+                    source_event_id=f"identity-{authority}",
+                    occurred_at=NOW + timedelta(seconds=index),
+                    action_digest=f"{index}" * 64,
+                    workspace_digest=_OPAQUE_WORKSPACE_DIGEST,
+                    environment_digest=_OPAQUE_ENVIRONMENT_DIGEST,
+                    identity_authority=authority,
+                )
+            )
+        await session.finish(
+            source_event_id="finish",
+            occurred_at=NOW + timedelta(seconds=4),
+        )
+        entries = await session._repository.ledger(RUN_ID)
+
+    events = tuple(entry.record for entry in entries if type(entry.record) is TraceEvent)
+    assert len(events) == 5
+    for index, (authority, result, event) in enumerate(
+        zip(authorities, submitted, events[1:-1], strict=True),
+        start=1,
+    ):
+        expected = {
+            "schema_version": "1.0",
+            "kind": "opaque",
+            "action_digest": f"{index}" * 64,
+            "workspace_digest": _OPAQUE_WORKSPACE_DIGEST,
+            "environment_digest": _OPAQUE_ENVIRONMENT_DIGEST,
+            "identity_authority": authority,
+        }
+        assert result.ref.event_id == event.event_id
+        assert event.parent_ids == ()
+        assert canonical_json(event.payload) == canonical_json({"action_identity": expected})
+        assert set(event.payload) == {"action_identity"}
+        assert not {"command", "argv", "working_directory"}.intersection(expected)
+
+
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("identity_authority", ("exact", "coarse", "unavailable"))
+@pytest.mark.asyncio
+async def test_tool_and_test_results_accept_the_exact_identity_event_reference(
+    backend: Backend,
+    identity_authority: Literal["exact", "coarse", "unavailable"],
+    tmp_path: Path,
+) -> None:
+    session = _factory(
+        backend,
+        tmp_path / "identity-results.sqlite3",
+        run_id=RUN_ID,
+        installation_key=InstallationKey(_KEY_MATERIAL),
+    )
+
+    async with session:
+        await session.start(source_event_id="start", occurred_at=NOW)
+        action = await session.action_identity(
+            source_event_id="identity-exact",
+            occurred_at=NOW + timedelta(seconds=1),
+            action_digest=_OPAQUE_ACTION_DIGEST,
+            workspace_digest=_OPAQUE_WORKSPACE_DIGEST,
+            environment_digest=_OPAQUE_ENVIRONMENT_DIGEST,
+            identity_authority=identity_authority,
+        )
+        tool = await session.tool_result(
+            source_event_id="tool-result",
+            occurred_at=NOW + timedelta(seconds=2),
+            action=action.ref,
+            status="succeeded",
+            exit_status=0,
+        )
+        test = await session.test_result(
+            source_event_id="test-result",
+            occurred_at=NOW + timedelta(seconds=3),
+            action=action.ref,
+            framework="pytest",
+            status="passed",
+            failures=(),
+        )
+        entries = await session._repository.ledger(RUN_ID)
+
+    events = tuple(entry.record for entry in entries if type(entry.record) is TraceEvent)
+    by_id = {event.event_id: event for event in events}
+    assert by_id[tool.ref.event_id].parent_ids == (action.ref.event_id,)
+    assert by_id[test.ref.event_id].parent_ids == (action.ref.event_id,)
+
+
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("result_kind", ("tool", "test"))
+@pytest.mark.asyncio
+async def test_identity_result_parents_reject_wrong_forward_and_non_action_references(
+    backend: Backend,
+    result_kind: Literal["tool", "test"],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _factory(
+        backend,
+        tmp_path / f"identity-invalid-parent-{result_kind}.sqlite3",
+        run_id=RUN_ID,
+        installation_key=InstallationKey(_KEY_MATERIAL),
+    )
+    async with session:
+        started = await session.start(source_event_id="start", occurred_at=NOW)
+        action = await session.action_identity(
+            source_event_id="identity-exact",
+            occurred_at=NOW + timedelta(seconds=1),
+            action_digest=_OPAQUE_ACTION_DIGEST,
+            workspace_digest=_OPAQUE_WORKSPACE_DIGEST,
+            environment_digest=_OPAQUE_ENVIRONMENT_DIGEST,
+            identity_authority="exact",
+        )
+
+        def forbidden_detector(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("detector evaluation must not run")
+
+        monkeypatch.setattr(
+            type(session._extractor),
+            "extract_report",
+            forbidden_detector,
+        )
+        invalid_parents = (
+            ShadowEventRef(
+                run_id=action.ref.run_id,
+                event_id=action.ref.event_id,
+                sequence=action.ref.sequence + 1,
+            ),
+            ShadowEventRef(
+                run_id=OTHER_RUN_ID,
+                event_id=action.ref.event_id,
+                sequence=action.ref.sequence,
+            ),
+            ShadowEventRef(
+                run_id=RUN_ID,
+                event_id=derive_shadow_event_id(RUN_ID, "future-identity"),
+                sequence=action.ref.sequence + 1,
+            ),
+            started.ref,
+        )
+        for index, parent in enumerate(invalid_parents, start=1):
+            source_event_id = f"invalid-{result_kind}-parent-{index}"
+            with pytest.raises(ShadowInputError) as raised:
+                if result_kind == "tool":
+                    await session.tool_result(
+                        source_event_id=source_event_id,
+                        occurred_at=NOW + timedelta(seconds=2),
+                        action=parent,
+                        status="failed",
+                    )
+                else:
+                    await session.test_result(
+                        source_event_id=source_event_id,
+                        occurred_at=NOW + timedelta(seconds=2),
+                        action=parent,
+                        framework="pytest",
+                        status="passed",
+                        failures=(),
+                    )
+            _assert_sanitized(
+                raised.value,
+                ShadowInputError,
+                "shadow input is invalid",
+                source_event_id,
+            )
+
+        entries = await session._repository.ledger(RUN_ID)
+        assert sum(type(entry.record) is TraceEvent for entry in entries) == 2
 
 
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))

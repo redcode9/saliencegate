@@ -16,6 +16,7 @@ from saliencegate.shadow.errors import (
 )
 from saliencegate.shadow.inputs import (
     SHADOW_PROJECTION_MATRIX,
+    ShadowActionIdentityInput,
     ShadowActionInput,
     ShadowControllerErrorInput,
     ShadowEventRef,
@@ -37,6 +38,8 @@ RUN_ID = UUID("11111111-1111-4111-8111-111111111111")
 OTHER_RUN_ID = UUID("22222222-2222-4222-8222-222222222222")
 ACTION_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 OCCURRED_AT = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
+ACTION_DIGEST = "b" * 64
+WORKSPACE_DIGEST = "c" * 64
 ENVIRONMENT_DIGEST = "a" * 64
 SOURCE_ADAPTER = "example-adapter/v1"
 
@@ -98,6 +101,16 @@ def test_public_errors_are_argument_free_value_free_families() -> None:
                 environment_digest=ENVIRONMENT_DIGEST,
             ),
             ShadowInputKind.ACTION,
+        ),
+        (
+            ShadowActionIdentityInput(
+                **common_fields(),
+                action_digest=ACTION_DIGEST,
+                workspace_digest=WORKSPACE_DIGEST,
+                environment_digest=ENVIRONMENT_DIGEST,
+                identity_authority="exact",
+            ),
+            ShadowInputKind.ACTION_IDENTITY,
         ),
         (
             ShadowToolResultInput(
@@ -221,6 +234,113 @@ def test_action_requires_exactly_one_bounded_shell_form() -> None:
                 **common_fields(),
                 **model_fields,
             )
+
+
+def test_action_identity_is_opaque_strict_and_contains_no_shell_projection() -> None:
+    identity = ShadowActionIdentityInput(
+        **common_fields(),
+        action_digest=ACTION_DIGEST,
+        workspace_digest=WORKSPACE_DIGEST,
+        environment_digest=ENVIRONMENT_DIGEST,
+        identity_authority="exact",
+    )
+
+    assert identity.model_dump(mode="json") == {
+        "schema_version": "shadow-input/v1",
+        "source_event_id": "event-1",
+        "occurred_at": "2026-07-16T10:00:00Z",
+        "kind": "action_identity",
+        "action_digest": ACTION_DIGEST,
+        "workspace_digest": WORKSPACE_DIGEST,
+        "environment_digest": ENVIRONMENT_DIGEST,
+        "identity_authority": "exact",
+    }
+    assert {
+        "command",
+        "argv",
+        "working_directory",
+    }.isdisjoint(type(identity).model_fields)
+    rendered = repr(identity)
+    assert ACTION_DIGEST not in rendered
+    assert WORKSPACE_DIGEST not in rendered
+    assert ENVIRONMENT_DIGEST not in rendered
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ("action_digest", "workspace_digest", "environment_digest"),
+)
+@pytest.mark.parametrize(
+    "invalid_digest",
+    (
+        "A" * 64,
+        "a" * 63,
+        "g" * 64,
+        _StringSubclass("a" * 64),
+        b"a" * 64,
+    ),
+)
+def test_action_identity_requires_exact_lowercase_sha256_digests(
+    field_name: str,
+    invalid_digest: object,
+) -> None:
+    values: dict[str, object] = {
+        **common_fields(),
+        "action_digest": ACTION_DIGEST,
+        "workspace_digest": WORKSPACE_DIGEST,
+        "environment_digest": ENVIRONMENT_DIGEST,
+        "identity_authority": "exact",
+    }
+    values[field_name] = invalid_digest
+
+    with pytest.raises(ValidationError) as caught:
+        ShadowActionIdentityInput.model_validate(values)
+
+    assert str(invalid_digest) not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "identity_authority",
+    ("exact", "coarse", "unavailable"),
+)
+def test_action_identity_accepts_only_declared_authorities(identity_authority: str) -> None:
+    identity = ShadowActionIdentityInput(
+        **common_fields(),
+        action_digest=ACTION_DIGEST,
+        workspace_digest=WORKSPACE_DIGEST,
+        environment_digest=ENVIRONMENT_DIGEST,
+        identity_authority=identity_authority,  # type: ignore[arg-type]
+    )
+
+    assert identity.identity_authority == identity_authority
+
+    for invalid in ("derived", "", _StringSubclass(identity_authority)):
+        with pytest.raises(ValidationError):
+            ShadowActionIdentityInput(
+                **common_fields(),
+                action_digest=ACTION_DIGEST,
+                workspace_digest=WORKSPACE_DIGEST,
+                environment_digest=ENVIRONMENT_DIGEST,
+                identity_authority=invalid,  # type: ignore[arg-type]
+            )
+
+
+@pytest.mark.parametrize("shell_field", ("command", "argv", "working_directory"))
+def test_action_identity_rejects_shell_fields_without_echoing_values(shell_field: str) -> None:
+    sentinel = "opaque-action-secret-sentinel"
+    values: dict[str, object] = {
+        **common_fields(),
+        "action_digest": ACTION_DIGEST,
+        "workspace_digest": WORKSPACE_DIGEST,
+        "environment_digest": ENVIRONMENT_DIGEST,
+        "identity_authority": "exact",
+        shell_field: (sentinel,) if shell_field == "argv" else sentinel,
+    }
+
+    with pytest.raises(ValidationError) as caught:
+        ShadowActionIdentityInput.model_validate(values)
+
+    assert sentinel not in str(caught.value)
 
 
 def test_event_reference_is_exact_frozen_and_contains_no_source_id() -> None:
@@ -420,6 +540,7 @@ def test_observation_accepts_only_approved_untrusted_sources_and_copies_payload(
         "shadow_run",
         "shadow_run_end",
         "action",
+        "action_identity",
         "tool_outcome",
         "test_report",
         "controller_error",
@@ -536,6 +657,14 @@ def test_projection_matrix_freezes_every_normative_row() -> None:
             parent="none",
             applicable_detectors=(),
         ),
+        ShadowInputKind.ACTION_IDENTITY: ShadowProjectionSpec(
+            event_type=EventType.ACTION_PROPOSAL,
+            phase=EventPhase.PRE_ACTION,
+            trust_label=TrustLabel.UNTRUSTED_MODEL_OUTPUT,
+            payload_namespace="action_identity",
+            parent="none",
+            applicable_detectors=(SignalType.REPEATED_ACTION,),
+        ),
     } == SHADOW_PROJECTION_MATRIX
 
     with pytest.raises(TypeError):
@@ -627,6 +756,29 @@ def test_projection_builds_exact_normalized_drafts() -> None:
                     "argv": ["pytest", "-q"],
                     "working_directory": "/project",
                     "environment_digest": ENVIRONMENT_DIGEST,
+                }
+            },
+            (),
+            TrustLabel.UNTRUSTED_MODEL_OUTPUT,
+            EventType.ACTION_PROPOSAL,
+            EventPhase.PRE_ACTION,
+        ),
+        (
+            ShadowActionIdentityInput(
+                **common_fields(source_event_id="opaque-action"),
+                action_digest=ACTION_DIGEST,
+                workspace_digest=WORKSPACE_DIGEST,
+                environment_digest=ENVIRONMENT_DIGEST,
+                identity_authority="exact",
+            ),
+            {
+                "action_identity": {
+                    "schema_version": "1.0",
+                    "kind": "opaque",
+                    "action_digest": ACTION_DIGEST,
+                    "workspace_digest": WORKSPACE_DIGEST,
+                    "environment_digest": ENVIRONMENT_DIGEST,
+                    "identity_authority": "exact",
                 }
             },
             (),
@@ -846,6 +998,7 @@ def test_inputs_module_exports_only_the_deliberate_contract() -> None:
 
     assert inputs.__all__ == [
         "SHADOW_PROJECTION_MATRIX",
+        "ShadowActionIdentityInput",
         "ShadowActionInput",
         "ShadowControllerErrorInput",
         "ShadowEventRef",

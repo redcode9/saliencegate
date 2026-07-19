@@ -9,6 +9,7 @@ from tests.shadow.test_trace import (
     ENVIRONMENT_DIGEST,
     build_trace,
     complete_records,
+    identity_records,
 )
 
 import saliencegate
@@ -32,6 +33,7 @@ from saliencegate.shadow import (
     ShadowSession,
     ShadowStateError,
     ShadowTraceReport,
+    decode_shadow_trace_report,
     encode_shadow_trace_report,
 )
 from saliencegate.shadow.analyzer import (
@@ -40,6 +42,7 @@ from saliencegate.shadow.analyzer import (
     _preview_prepared,
 )
 from saliencegate.shadow.inputs import (
+    ShadowInputKind,
     ShadowToolResultInput,
     derive_shadow_event_id,
     project_shadow_input,
@@ -146,6 +149,28 @@ async def test_in_memory_for_trace_uses_an_ephemeral_key_without_key_file_lookup
         report = await ShadowAnalyzer(session).analyze(trace)
 
     assert type(report) is ShadowTraceReport
+
+
+@pytest.mark.asyncio
+async def test_identity_trace_analyzes_and_encodes_through_the_report_boundary() -> None:
+    trace = build_trace(identity_records())
+    session = _memory_session(trace)
+
+    async with session:
+        report = await ShadowAnalyzer(session).analyze(trace)
+
+    assert tuple(row.input_kind for row in report.shadow_report.rows) == (
+        ShadowInputKind.START,
+        ShadowInputKind.ACTION_IDENTITY,
+        ShadowInputKind.TOOL_RESULT,
+        ShadowInputKind.TEST_RESULT,
+        ShadowInputKind.ACTION_IDENTITY,
+        ShadowInputKind.ACTION_IDENTITY,
+        ShadowInputKind.FINISH,
+    )
+    encoded = encode_shadow_trace_report(report)
+    assert decode_shadow_trace_report(encoded) == report
+    assert report.diagnostics == trace.diagnostics
 
 
 @pytest.mark.asyncio
