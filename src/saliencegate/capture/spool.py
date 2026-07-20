@@ -49,13 +49,21 @@ _ENTRY_SUFFIX = ".capture-intake"
 _ENTRY_NAME = re.compile(r"^[0-9a-f]{64}\.capture-intake$")
 _ENTRY_HEADER = b"capture-spool/v1"
 _ENTRY_DOMAIN = b"saliencegate:capture-spool:record:v1"
+_SESSION_MARKER_SUFFIX = ".capture-session"
+_SESSION_MARKER_NAME = re.compile(r"^[0-9a-f]{64}\.capture-session$")
+_SESSION_MARKER_HEADER = b"capture-spool-session/v1"
+_SESSION_MARKER_NAME_DOMAIN = b"saliencegate:capture-spool:session-name:v1"
+_SESSION_MARKER_DOMAIN = b"saliencegate:capture-spool:session:v1"
+_COMPONENT_IDENTIFIER = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._:/+\-]{0,255}$")
 _HEALTH_NAME = ".capture-spool-health"
 _HEALTH_HEADER = b"capture-spool-health/v1"
 _HEALTH_DOMAIN = b"saliencegate:capture-spool:health:v1"
 _OBSERVATION_DOMAIN = b"saliencegate:capture-spool:observation:v1"
 _LOCK_NAME = ".capture-spool-lock"
 _MAX_ENTRY_BYTES = MAX_CAPTURE_EVENT_BYTES + 256
+_MAX_SESSION_MARKER_BYTES = 1_024
 _MAX_HEALTH_BYTES = 4_096
+_MAX_LOCK_BYTES = 4_096
 
 
 def _safe_lock_metadata(value: os.stat_result) -> bool:
@@ -83,6 +91,12 @@ class CaptureSpoolIntegrityError(CaptureSpoolError):
 
     def __init__(self) -> None:
         RuntimeError.__init__(self, "capture spool integrity check failed")
+
+
+class CaptureSpoolUnavailableError(CaptureSpoolError):
+    """The spool fence was unavailable before admission began."""
+
+    __slots__ = ()
 
 
 class CaptureSpoolObservationError(ValueError):
@@ -117,7 +131,7 @@ class CaptureSpoolHealth:
     queued_bytes: int
     dropped_events: int
     coverage_degraded: bool
-    last_drop_reason: Literal["spool_quota"] | None
+    last_drop_reason: Literal["spool_incomplete", "spool_quota"] | None
 
     def __repr__(self) -> str:
         return "CaptureSpoolHealth(<redacted>)"
@@ -142,7 +156,7 @@ class CaptureSpoolObservation(BaseModel):
     queued_bytes: Annotated[int, Field(ge=0, le=MAX_CAPTURE_SPOOL_BYTES)]
     dropped_events: Annotated[int, Field(ge=0, le=(1 << 63) - 1)]
     coverage_degraded: bool
-    last_drop_reason: Literal["spool_quota"] | None
+    last_drop_reason: Literal["spool_incomplete", "spool_quota"] | None
     observation_tag: Sha256Digest = Field(repr=False)
 
     @model_validator(mode="after")
@@ -284,6 +298,39 @@ class _AppendStore(Protocol):
 
 _SpoolFileRead = StableFileRead | WindowsStableFileRead
 _SpoolDirectoryIdentity = security_files._PrivateDirectoryAuthorization | WindowsPathAuthorization
+_SpoolEntry = tuple[Path, CaptureIntake, _SpoolFileRead]
+_SpoolSessionKey = tuple[str, str]
+_SpoolSessionMarkerState = Literal["acknowledged", "pending"]
+_SpoolSessionMarker = tuple[Path, _SpoolSessionMarkerState, _SpoolFileRead]
+
+
+class CaptureSpoolMaintenance:
+    """One short-lived exclusive spool lease for lifecycle maintenance."""
+
+    __slots__ = ("_active", "_directory_fd", "_spool")
+
+    def __init__(self, spool: CaptureSpool, directory_fd: int | None) -> None:
+        self._spool = spool
+        self._directory_fd = directory_fd
+        self._active = True
+
+    def __repr__(self) -> str:
+        return "CaptureSpoolMaintenance(<redacted>)"
+
+    def drain(self, store: _AppendStore) -> CaptureSpoolDrainReceipt:
+        if not self._active:
+            raise CaptureSpoolError()
+        return self._spool._drain_locked(store, self._directory_fd)
+
+    def clear_drop_health_if_empty(self) -> bool:
+        """Clear global quota-drop health only after the queue is empty."""
+
+        if not self._active:
+            raise CaptureSpoolError()
+        return self._spool._clear_drop_health_if_empty_locked(self._directory_fd)
+
+    def _close(self) -> None:
+        self._active = False
 
 
 class CaptureSpool:
@@ -318,9 +365,22 @@ class CaptureSpool:
     ) -> CaptureSpool:
         """Open or create the exact owner-private spool boundary."""
 
+        return cls._open(locations, installation_key, create=True)
+
+    @classmethod
+    def _open(
+        cls,
+        locations: CaptureStoreLocations,
+        installation_key: InstallationKey,
+        *,
+        create: bool,
+    ) -> CaptureSpool:
+        """Authorize one exact spool boundary with explicit creation policy."""
+
         if (
             type(locations) is not CaptureStoreLocations
             or type(installation_key) is not InstallationKey
+            or type(create) is not bool
         ):
             raise CaptureSpoolError()
         result: CaptureSpool | None = None
@@ -337,25 +397,25 @@ class CaptureSpool:
                     PureWindowsPath(str(locations.state_directory)),
                     kind=WindowsPathKind.DIRECTORY,
                     operations=windows_operations,
-                    create=True,
+                    create=create,
                 )
                 spool_identity = authorize_windows_private_path(
                     PureWindowsPath(str(locations.spool_directory)),
                     kind=WindowsPathKind.DIRECTORY,
                     operations=windows_operations,
-                    create=True,
+                    create=create,
                 )
                 state_identity.revalidate()
                 spool_identity.revalidate()
             else:
                 state_identity = security_files._authorize_private_directory(
                     locations.state_directory,
-                    create=True,
+                    create=create,
                 )
                 spool_identity = security_files._authorize_private_directory_child(
                     state_identity,
                     locations.spool_directory.name,
-                    create=True,
+                    create=create,
                 )
                 state_identity.revalidate()
                 spool_identity.revalidate()
@@ -386,6 +446,23 @@ class CaptureSpool:
         if failed or result is None:
             raise CaptureSpoolError()
         return result
+
+    @classmethod
+    def audit_read_only(
+        cls,
+        locations: CaptureStoreLocations,
+        *,
+        installation_key: InstallationKey,
+    ) -> CaptureSpoolHealth:
+        """Authenticate a quiescent existing spool without creating or draining."""
+
+        try:
+            instance = cls._open(locations, installation_key, create=False)
+            return instance._audit_read_only()
+        except CaptureSpoolError:
+            raise
+        except Exception:
+            raise CaptureSpoolError() from None
 
     def __repr__(self) -> str:
         return "CaptureSpool(<redacted>)"
@@ -505,8 +582,237 @@ class CaptureSpool:
         tag = self._record_tag(intake_bytes)
         return tag, b"\n".join((_ENTRY_HEADER, tag.encode("ascii"), intake_bytes))
 
-    def _entry_paths(self, directory_fd: int | None) -> tuple[Path, ...]:
-        paths: list[Path] = []
+    def _session_marker_name_tag(
+        self,
+        connection_id: str,
+        session_id: str,
+    ) -> str:
+        if (
+            type(connection_id) is not str
+            or _COMPONENT_IDENTIFIER.fullmatch(connection_id) is None
+            or type(session_id) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", session_id) is None
+        ):
+            raise CaptureSpoolIntegrityError()
+        identity = canonical_json(
+            {
+                "schema_version": "capture-spool-session-name/v1",
+                "connection_id": connection_id,
+                "session_id": session_id,
+            }
+        )
+        return self._key._hmac_sha256(identity, domain=_SESSION_MARKER_NAME_DOMAIN)
+
+    def _session_marker_frame(
+        self,
+        connection_id: str,
+        session_id: str,
+        state: _SpoolSessionMarkerState = "pending",
+    ) -> tuple[str, bytes]:
+        name_tag = self._session_marker_name_tag(connection_id, session_id)
+        if state not in ("acknowledged", "pending"):
+            raise CaptureSpoolIntegrityError()
+        payload = canonical_json(
+            {
+                "schema_version": "capture-spool-session/v1",
+                "connection_id": connection_id,
+                "session_id": session_id,
+                "state": state,
+            }
+        )
+        content_tag = self._key._hmac_sha256(payload, domain=_SESSION_MARKER_DOMAIN)
+        framed = b"\n".join((_SESSION_MARKER_HEADER, content_tag.encode("ascii"), payload))
+        return name_tag, framed
+
+    def _read_spool_file(
+        self,
+        path: Path,
+        directory_fd: int | None,
+        *,
+        maximum_bytes: int,
+    ) -> _SpoolFileRead:
+        if self._windows_operations is not None:  # pragma: no cover - native Windows R01
+            return self._windows_operations.read_private_file(
+                PureWindowsPath(str(path)),
+                maximum_bytes=maximum_bytes,
+            )
+        if (
+            type(directory_fd) is not int
+            or type(self._spool_identity) is not security_files._PrivateDirectoryAuthorization
+        ):
+            raise SecureFileError()
+        return security_files._read_private_file_at_descriptor(
+            self._spool_identity,
+            directory_fd,
+            path.name,
+            maximum_bytes,
+        )
+
+    def _named_spool_file_exists(self, name: str, directory_fd: int | None) -> bool:
+        path = self._locations.spool_directory / name
+        if self._windows_operations is not None:  # pragma: no cover - native Windows R01
+            return self._windows_operations.inspect_path(PureWindowsPath(str(path))) is not None
+        if type(directory_fd) is not int:
+            raise SecureFileError()
+        try:
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _read_session_marker(
+        self,
+        connection_id: str,
+        session_id: str,
+        directory_fd: int | None,
+    ) -> _SpoolSessionMarker | None:
+        tag = self._session_marker_name_tag(connection_id, session_id)
+        path = self._locations.spool_directory / f"{tag}{_SESSION_MARKER_SUFFIX}"
+        if not self._named_spool_file_exists(path.name, directory_fd):
+            return None
+        decoded = self._decode_session_marker(path, directory_fd)
+        if decoded is None:
+            raise CaptureSpoolIntegrityError()
+        key, state, stable = decoded
+        if key != (connection_id, session_id):
+            raise CaptureSpoolIntegrityError()
+        return path, state, stable
+
+    def _decode_session_marker(
+        self,
+        path: Path,
+        directory_fd: int | None,
+    ) -> tuple[_SpoolSessionKey, _SpoolSessionMarkerState, _SpoolFileRead] | None:
+        try:
+            stable = self._read_spool_file(
+                path,
+                directory_fd,
+                maximum_bytes=_MAX_SESSION_MARKER_BYTES,
+            )
+            parts = stable.data.split(b"\n", maxsplit=2)
+            if len(parts) != 3 or parts[0] != _SESSION_MARKER_HEADER:
+                return None
+            encoded_tag, payload = parts[1:]
+            if re.fullmatch(rb"[0-9a-f]{64}", encoded_tag) is None:
+                return None
+            expected = self._key._hmac_sha256(payload, domain=_SESSION_MARKER_DOMAIN)
+            if not hmac.compare_digest(encoded_tag.decode("ascii"), expected):
+                return None
+            import json
+
+            value = json.loads(payload)
+            if (
+                type(value) is not dict
+                or set(value) != {"schema_version", "connection_id", "session_id", "state"}
+                or value.get("schema_version") != "capture-spool-session/v1"
+                or type(value.get("connection_id")) is not str
+                or _COMPONENT_IDENTIFIER.fullmatch(value["connection_id"]) is None
+                or type(value.get("session_id")) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", value["session_id"]) is None
+                or value.get("state") not in ("acknowledged", "pending")
+                or canonical_json(value) != payload
+            ):
+                return None
+            name_tag = self._session_marker_name_tag(
+                value["connection_id"],
+                value["session_id"],
+            )
+            if path.name != f"{name_tag}{_SESSION_MARKER_SUFFIX}":
+                return None
+            stable.authorization.revalidate()
+            return (
+                (value["connection_id"], value["session_id"]),
+                cast(_SpoolSessionMarkerState, value["state"]),
+                stable,
+            )
+        except Exception:
+            return None
+
+    def _audit_lock_boundary(self, directory_fd: int | None) -> _SpoolFileRead | None:
+        path = self._locations.spool_directory / _LOCK_NAME
+        if self._windows_operations is not None:  # pragma: no cover - native Windows R01
+            windows_path = PureWindowsPath(str(path))
+            if self._windows_operations.inspect_path(windows_path) is None:
+                return None
+            stable: _SpoolFileRead = self._windows_operations.read_private_file(
+                windows_path,
+                maximum_bytes=_MAX_LOCK_BYTES,
+            )
+        else:
+            if (
+                type(directory_fd) is not int
+                or type(self._spool_identity) is not security_files._PrivateDirectoryAuthorization
+            ):
+                raise SecureFileError()
+            try:
+                named = os.stat(_LOCK_NAME, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            if not _safe_lock_metadata(named):
+                raise SecureFileError()
+            stable = security_files._read_private_file_at_descriptor(
+                self._spool_identity,
+                directory_fd,
+                _LOCK_NAME,
+                _MAX_LOCK_BYTES,
+            )
+            named_after = os.stat(_LOCK_NAME, dir_fd=directory_fd, follow_symlinks=False)
+            if not _safe_lock_metadata(named_after):
+                raise SecureFileError()
+        stable.authorization.revalidate()
+        return stable
+
+    def _audit_read_only(self) -> CaptureSpoolHealth:
+        directory_fd: int | None = None
+        try:
+            self._revalidate()
+            if self._windows_operations is None:
+                if type(self._spool_identity) is not security_files._PrivateDirectoryAuthorization:
+                    raise SecureFileError()
+                directory_fd = security_files._open_authorized_private_directory(
+                    self._spool_identity
+                )
+            initial_child_names = tuple(path.name for path in self._spool_child_paths(directory_fd))
+            lock = self._audit_lock_boundary(directory_fd)
+            entries = self._entries(directory_fd)
+            markers = self._session_markers(directory_fd)
+            orphan_markers = self._reconcile_session_markers(entries, markers)
+            (
+                dropped_events,
+                last_drop_reason,
+                acknowledged_marker,
+                health,
+            ) = self._drop_state_record(directory_fd)
+            for _path, _intake, stable in entries:
+                stable.authorization.revalidate()
+            if health is not None:
+                health.authorization.revalidate()
+            if lock is not None:
+                lock.authorization.revalidate()
+            for _path, _state, marker in markers.values():
+                marker.authorization.revalidate()
+            final_child_names = tuple(path.name for path in self._spool_child_paths(directory_fd))
+            if final_child_names != initial_child_names:
+                raise CaptureSpoolIntegrityError()
+            self._revalidate()
+            return self._health_from_state(
+                entries,
+                dropped_events=dropped_events,
+                last_drop_reason=last_drop_reason,
+                acknowledged_marker=acknowledged_marker,
+                markers=markers,
+                orphan_markers=orphan_markers,
+            )
+        except CaptureSpoolError:
+            raise
+        except Exception:
+            raise CaptureSpoolError() from None
+        finally:
+            if directory_fd is not None:
+                with suppress(OSError):
+                    os.close(directory_fd)
+
+    def _spool_child_paths(self, directory_fd: int | None) -> tuple[Path, ...]:
         if self._windows_operations is not None:  # pragma: no cover - native Windows R01
             candidates = tuple(sorted(self._locations.spool_directory.iterdir()))
         else:
@@ -523,9 +829,11 @@ class CaptureSpool:
                 self._locations.spool_directory / name for name in sorted(os.listdir(directory_fd))
             )
         for path in candidates:
-            if _ENTRY_NAME.fullmatch(path.name):
-                paths.append(path)
-            elif path.name not in {_HEALTH_NAME, _LOCK_NAME}:
+            if (
+                _ENTRY_NAME.fullmatch(path.name) is None
+                and _SESSION_MARKER_NAME.fullmatch(path.name) is None
+                and path.name not in {_HEALTH_NAME, _LOCK_NAME}
+            ):
                 raise CaptureSpoolIntegrityError()
         if self._windows_operations is None:
             if (
@@ -537,7 +845,21 @@ class CaptureSpool:
                 self._spool_identity,
                 directory_fd,
             )
-        return tuple(paths)
+        return candidates
+
+    def _entry_paths(self, directory_fd: int | None) -> tuple[Path, ...]:
+        return tuple(
+            path
+            for path in self._spool_child_paths(directory_fd)
+            if _ENTRY_NAME.fullmatch(path.name)
+        )
+
+    def _session_marker_paths(self, directory_fd: int | None) -> tuple[Path, ...]:
+        return tuple(
+            path
+            for path in self._spool_child_paths(directory_fd)
+            if _SESSION_MARKER_NAME.fullmatch(path.name)
+        )
 
     def _decode_entry(
         self,
@@ -587,8 +909,8 @@ class CaptureSpool:
     def _entries(
         self,
         directory_fd: int | None,
-    ) -> tuple[tuple[Path, CaptureIntake, _SpoolFileRead], ...]:
-        result: list[tuple[Path, CaptureIntake, _SpoolFileRead]] = []
+    ) -> tuple[_SpoolEntry, ...]:
+        result: list[_SpoolEntry] = []
         for path in self._entry_paths(directory_fd):
             decoded = self._decode_entry(path, directory_fd)
             if decoded is None:
@@ -597,9 +919,36 @@ class CaptureSpool:
             result.append((path, intake, stable))
         return tuple(sorted(result, key=self._drain_order_key))
 
+    def _session_markers(
+        self,
+        directory_fd: int | None,
+    ) -> dict[_SpoolSessionKey, _SpoolSessionMarker]:
+        result: dict[_SpoolSessionKey, _SpoolSessionMarker] = {}
+        for path in self._session_marker_paths(directory_fd):
+            decoded = self._decode_session_marker(path, directory_fd)
+            if decoded is None:
+                raise CaptureSpoolIntegrityError()
+            key, state, stable = decoded
+            if key in result:
+                raise CaptureSpoolIntegrityError()
+            result[key] = (path, state, stable)
+        return result
+
+    @staticmethod
+    def _reconcile_session_markers(
+        entries: tuple[_SpoolEntry, ...],
+        markers: dict[_SpoolSessionKey, _SpoolSessionMarker],
+    ) -> set[_SpoolSessionKey]:
+        queued_sessions = {
+            (intake.connection_id, intake.session_id) for _path, intake, _stable in entries
+        }
+        if not queued_sessions.issubset(markers):
+            raise CaptureSpoolIntegrityError()
+        return set(markers).difference(queued_sessions)
+
     @staticmethod
     def _drain_order_key(
-        entry: tuple[Path, CaptureIntake, _SpoolFileRead],
+        entry: _SpoolEntry,
     ) -> tuple[str, str, int, int, int, str, str]:
         path, intake, _stable = entry
         lifecycle_rank = (
@@ -630,7 +979,10 @@ class CaptureSpool:
     def _health_path(self) -> Path:
         return self._locations.spool_directory / _HEALTH_NAME
 
-    def _decode_drop_state(self, data: bytes) -> tuple[int, str | None] | None:
+    def _decode_drop_state(
+        self,
+        data: bytes,
+    ) -> tuple[int, str | None, str | None] | None:
         try:
             parts = data.split(b"\n", maxsplit=2)
             if len(parts) != 3 or parts[0] != _HEALTH_HEADER:
@@ -646,25 +998,48 @@ class CaptureSpool:
             value = json.loads(payload)
             if (
                 type(value) is not dict
+                or set(value)
+                != {
+                    "schema_version",
+                    "dropped_events",
+                    "last_drop_reason",
+                    "acknowledged_marker",
+                }
                 or value.get("schema_version") != "capture-spool-health/v1"
                 or type(value.get("dropped_events")) is not int
                 or value["dropped_events"] < 0
-                or value.get("last_drop_reason") not in (None, "spool_quota")
+                or value.get("last_drop_reason") not in (None, "spool_incomplete", "spool_quota")
+                or (
+                    value.get("acknowledged_marker") is not None
+                    and (
+                        type(value["acknowledged_marker"]) is not str
+                        or re.fullmatch(r"[0-9a-f]{64}", value["acknowledged_marker"]) is None
+                    )
+                )
+                or ((value["dropped_events"] == 0) != (value["last_drop_reason"] is None))
+                or (value["dropped_events"] == 0 and value["acknowledged_marker"] is not None)
                 or canonical_json(value) != payload
             ):
                 return None
-            return value["dropped_events"], value["last_drop_reason"]
+            return (
+                value["dropped_events"],
+                value["last_drop_reason"],
+                value["acknowledged_marker"],
+            )
         except Exception:
             return None
 
-    def _drop_state(self, directory_fd: int | None) -> tuple[int, str | None]:
+    def _drop_state_record(
+        self,
+        directory_fd: int | None,
+    ) -> tuple[int, str | None, str | None, _SpoolFileRead | None]:
         path = self._health_path()
         stable: _SpoolFileRead | None = None
         try:
             if self._windows_operations is not None:  # pragma: no cover - native Windows R01
                 windows_path = PureWindowsPath(str(path))
                 if self._windows_operations.inspect_path(windows_path) is None:
-                    return 0, None
+                    return 0, None, None, None
                 stable = self._windows_operations.read_private_file(
                     windows_path,
                     maximum_bytes=_MAX_HEALTH_BYTES,
@@ -679,7 +1054,7 @@ class CaptureSpool:
                 try:
                     os.stat(_HEALTH_NAME, dir_fd=directory_fd, follow_symlinks=False)
                 except FileNotFoundError:
-                    return 0, None
+                    return 0, None, None, None
                 stable = security_files._read_private_file_at_descriptor(
                     self._spool_identity,
                     directory_fd,
@@ -694,19 +1069,41 @@ class CaptureSpool:
         if state is None:
             raise CaptureSpoolIntegrityError()
         stable.authorization.revalidate()
-        return state
+        return state[0], state[1], state[2], stable
+
+    def _drop_state(self, directory_fd: int | None) -> tuple[int, str | None, str | None]:
+        dropped_events, last_drop_reason, acknowledged_marker, _stable = self._drop_state_record(
+            directory_fd
+        )
+        return dropped_events, last_drop_reason, acknowledged_marker
 
     def _write_drop_state(
         self,
         dropped_events: int,
         reason: str,
         directory_fd: int | None,
+        *,
+        acknowledged_marker: str | None = None,
     ) -> None:
+        if (
+            type(dropped_events) is not int
+            or dropped_events < 1
+            or reason not in ("spool_incomplete", "spool_quota")
+            or (
+                acknowledged_marker is not None
+                and (
+                    type(acknowledged_marker) is not str
+                    or re.fullmatch(r"[0-9a-f]{64}", acknowledged_marker) is None
+                )
+            )
+        ):
+            raise CaptureSpoolIntegrityError()
         payload = canonical_json(
             {
                 "schema_version": "capture-spool-health/v1",
                 "dropped_events": dropped_events,
                 "last_drop_reason": reason,
+                "acknowledged_marker": acknowledged_marker,
             }
         )
         tag = self._key._hmac_sha256(payload, domain=_HEALTH_DOMAIN)
@@ -719,7 +1116,7 @@ class CaptureSpool:
                 maximum_bytes=_MAX_HEALTH_BYTES,
                 validate_replacement=lambda value: self._decode_drop_state(value) is not None,
                 validate_published=lambda value: (
-                    self._decode_drop_state(value) == (dropped_events, reason)
+                    self._decode_drop_state(value) == (dropped_events, reason, acknowledged_marker)
                 ),
             )
         else:
@@ -736,21 +1133,247 @@ class CaptureSpool:
                 maximum_bytes=_MAX_HEALTH_BYTES,
                 validate_replacement=lambda value: self._decode_drop_state(value) is not None,
                 validate_published=lambda value: (
-                    self._decode_drop_state(value) == (dropped_events, reason)
+                    self._decode_drop_state(value) == (dropped_events, reason, acknowledged_marker)
                 ),
             )
 
     def _health_locked(self, directory_fd: int | None) -> CaptureSpoolHealth:
         entries = self._entries(directory_fd)
-        dropped_events, last_drop_reason = self._drop_state(directory_fd)
+        markers = self._session_markers(directory_fd)
+        orphan_markers = self._reconcile_session_markers(entries, markers)
+        dropped_events, last_drop_reason, acknowledged_marker = self._drop_state(directory_fd)
+        return self._health_from_state(
+            entries,
+            dropped_events=dropped_events,
+            last_drop_reason=last_drop_reason,
+            acknowledged_marker=acknowledged_marker,
+            markers=markers,
+            orphan_markers=orphan_markers,
+        )
+
+    @staticmethod
+    def _health_from_state(
+        entries: tuple[_SpoolEntry, ...],
+        *,
+        dropped_events: int,
+        last_drop_reason: str | None,
+        acknowledged_marker: str | None,
+        markers: dict[_SpoolSessionKey, _SpoolSessionMarker],
+        orphan_markers: set[_SpoolSessionKey],
+    ) -> CaptureSpoolHealth:
+        synthetic_drops = 0
+        for key, (path, state, _stable) in markers.items():
+            marker_tag = path.name.removesuffix(_SESSION_MARKER_SUFFIX)
+            if state == "acknowledged" and dropped_events == 0:
+                raise CaptureSpoolIntegrityError()
+            if (
+                state == "pending"
+                and marker_tag == acknowledged_marker
+                and key not in orphan_markers
+            ):
+                raise CaptureSpoolIntegrityError()
+            if key in orphan_markers and state == "pending" and marker_tag != acknowledged_marker:
+                synthetic_drops += 1
+        if synthetic_drops:
+            dropped_events += synthetic_drops
+            last_drop_reason = "spool_incomplete"
         queued_bytes = sum(len(stable.data) for _, _, stable in entries)
         return CaptureSpoolHealth(
             queued_events=len(entries),
             queued_bytes=int(queued_bytes),
             dropped_events=dropped_events,
             coverage_degraded=dropped_events > 0,
-            last_drop_reason=cast(Literal["spool_quota"] | None, last_drop_reason),
+            last_drop_reason=cast(
+                Literal["spool_incomplete", "spool_quota"] | None,
+                last_drop_reason,
+            ),
         )
+
+    def _delete_stable_file_locked(
+        self,
+        stable: _SpoolFileRead,
+        directory_fd: int | None,
+    ) -> None:
+        stable.authorization.revalidate()
+        if self._windows_operations is not None:  # pragma: no cover - native Windows R01
+            if type(stable) is not WindowsStableFileRead:
+                raise CaptureSpoolIntegrityError()
+            self._windows_operations.delete_authorized_file(stable.authorization)
+            self._revalidate()
+            return
+        if (
+            type(stable) is not StableFileRead
+            or type(directory_fd) is not int
+            or type(self._spool_identity) is not security_files._PrivateDirectoryAuthorization
+        ):
+            raise CaptureSpoolIntegrityError()
+        security_files._delete_authorized_private_file_at_descriptor(
+            self._spool_identity,
+            directory_fd,
+            stable.authorization,
+        )
+        security_files._require_authorized_private_directory_descriptor(
+            self._spool_identity,
+            directory_fd,
+        )
+
+    def _persist_orphan_degradation_locked(
+        self,
+        orphan_markers: set[_SpoolSessionKey],
+        markers: dict[_SpoolSessionKey, _SpoolSessionMarker],
+        directory_fd: int | None,
+        *,
+        remove: bool,
+    ) -> None:
+        if not orphan_markers:
+            return
+        dropped_events, last_drop_reason, acknowledged_marker = self._drop_state(directory_fd)
+        remaining_orphans = set(orphan_markers)
+        if acknowledged_marker is not None:
+            for key, (path, state, stable) in tuple(markers.items()):
+                marker_tag = path.name.removesuffix(_SESSION_MARKER_SUFFIX)
+                if marker_tag != acknowledged_marker or state != "pending":
+                    continue
+                if key not in orphan_markers:
+                    raise CaptureSpoolIntegrityError()
+                if remove:
+                    self._delete_stable_file_locked(stable, directory_fd)
+                    markers.pop(key)
+                    remaining_orphans.remove(key)
+                else:
+                    markers[key] = self._set_session_marker_state_locked(
+                        key,
+                        "acknowledged",
+                        directory_fd,
+                    )
+                break
+        for key in sorted(remaining_orphans):
+            path, state, stable = markers[key]
+            marker_tag = path.name.removesuffix(_SESSION_MARKER_SUFFIX)
+            if state == "acknowledged" and dropped_events == 0:
+                raise CaptureSpoolIntegrityError()
+            if state == "pending" and acknowledged_marker != marker_tag:
+                dropped_events += 1
+                last_drop_reason = "spool_incomplete"
+                acknowledged_marker = marker_tag
+                self._write_drop_state(
+                    dropped_events,
+                    last_drop_reason,
+                    directory_fd,
+                    acknowledged_marker=acknowledged_marker,
+                )
+            if remove:
+                self._delete_stable_file_locked(stable, directory_fd)
+                markers.pop(key)
+            elif state == "pending":
+                markers[key] = self._set_session_marker_state_locked(
+                    key,
+                    "acknowledged",
+                    directory_fd,
+                )
+
+    def _set_session_marker_state_locked(
+        self,
+        key: _SpoolSessionKey,
+        state: _SpoolSessionMarkerState,
+        directory_fd: int | None,
+    ) -> _SpoolSessionMarker:
+        connection_id, session_id = key
+        tag, framed = self._session_marker_frame(connection_id, session_id, state)
+        path = self._locations.spool_directory / f"{tag}{_SESSION_MARKER_SUFFIX}"
+        valid_frames = frozenset(
+            (
+                self._session_marker_frame(
+                    connection_id,
+                    session_id,
+                    "acknowledged",
+                )[1],
+                self._session_marker_frame(connection_id, session_id, "pending")[1],
+            )
+        )
+        if self._windows_operations is not None:  # pragma: no cover - native Windows R01
+            self._windows_operations.publish_private_file(
+                PureWindowsPath(str(path)),
+                framed,
+                maximum_bytes=_MAX_SESSION_MARKER_BYTES,
+                validate_replacement=lambda value: value in valid_frames,
+                validate_published=lambda value: value == framed,
+            )
+        else:
+            if (
+                type(directory_fd) is not int
+                or type(self._spool_identity) is not security_files._PrivateDirectoryAuthorization
+            ):
+                raise SecureFileError()
+            security_files._publish_private_file_at_descriptor(
+                self._spool_identity,
+                directory_fd,
+                path.name,
+                framed,
+                maximum_bytes=_MAX_SESSION_MARKER_BYTES,
+                validate_replacement=lambda value: value in valid_frames,
+                validate_published=lambda value: value == framed,
+            )
+        marker = self._read_session_marker(connection_id, session_id, directory_fd)
+        if marker is None or marker[1] != state:
+            raise CaptureSpoolIntegrityError()
+        return marker
+
+    def _ensure_session_marker_locked(
+        self,
+        connection_id: str,
+        session_id: str,
+        directory_fd: int | None,
+    ) -> _SpoolSessionMarker:
+        existing = self._read_session_marker(connection_id, session_id, directory_fd)
+        if existing is not None:
+            return existing
+        tag, framed = self._session_marker_frame(connection_id, session_id, "pending")
+        path = self._locations.spool_directory / f"{tag}{_SESSION_MARKER_SUFFIX}"
+        if self._windows_operations is not None:  # pragma: no cover - native Windows R01
+            self._windows_operations.publish_private_file(
+                PureWindowsPath(str(path)),
+                framed,
+                maximum_bytes=_MAX_SESSION_MARKER_BYTES,
+                validate_published=lambda value: value == framed,
+            )
+        else:
+            if (
+                type(directory_fd) is not int
+                or type(self._spool_identity) is not security_files._PrivateDirectoryAuthorization
+            ):
+                raise SecureFileError()
+            security_files._publish_private_file_at_descriptor(
+                self._spool_identity,
+                directory_fd,
+                path.name,
+                framed,
+                maximum_bytes=_MAX_SESSION_MARKER_BYTES,
+                validate_published=lambda value: value == framed,
+            )
+        marker = self._read_session_marker(connection_id, session_id, directory_fd)
+        if marker is None or marker[1] != "pending":
+            raise CaptureSpoolIntegrityError()
+        return marker
+
+    def _clear_drop_health_if_empty_locked(self, directory_fd: int | None) -> bool:
+        entries = self._entries(directory_fd)
+        markers = self._session_markers(directory_fd)
+        orphan_markers = self._reconcile_session_markers(entries, markers)
+        if entries:
+            return False
+        self._persist_orphan_degradation_locked(
+            orphan_markers,
+            markers,
+            directory_fd,
+            remove=True,
+        )
+        _dropped_events, _last_drop_reason, _acknowledged_marker, stable = self._drop_state_record(
+            directory_fd
+        )
+        if stable is not None:
+            self._delete_stable_file_locked(stable, directory_fd)
+        return True
 
     def health(self) -> CaptureSpoolHealth:
         failed = False
@@ -787,53 +1410,92 @@ class CaptureSpool:
         except Exception:
             raise CaptureSpoolError() from None
 
+    def _enqueue_locked(
+        self,
+        intake: CaptureIntake,
+        tag: str,
+        framed: bytes,
+        directory_fd: int | None,
+    ) -> CaptureSpoolEnqueueReceipt:
+        entries = self._entries(directory_fd)
+        markers = self._session_markers(directory_fd)
+        orphan_markers = self._reconcile_session_markers(entries, markers)
+        self._persist_orphan_degradation_locked(
+            orphan_markers,
+            markers,
+            directory_fd,
+            remove=False,
+        )
+        path = self._locations.spool_directory / f"{tag}{_ENTRY_SUFFIX}"
+        existing = next((item for item in entries if item[0] == path), None)
+        if existing is not None:
+            if existing[2].data != framed:
+                raise CaptureSpoolIntegrityError()
+            return CaptureSpoolEnqueueReceipt(disposition="already_queued")
+        queued_bytes = sum(len(stable.data) for _, _, stable in entries)
+        if (
+            len(entries) >= MAX_CAPTURE_SPOOL_EVENTS
+            or queued_bytes + len(framed) > MAX_CAPTURE_SPOOL_BYTES
+        ):
+            key = (intake.connection_id, intake.session_id)
+            marker = markers.get(key)
+            pending_quota_barrier = marker is None
+            if marker is None:
+                marker = self._ensure_session_marker_locked(
+                    intake.connection_id,
+                    intake.session_id,
+                    directory_fd,
+                )
+                markers[key] = marker
+            dropped_events, _reason, acknowledged_marker = self._drop_state(directory_fd)
+            marker_tag = marker[0].name.removesuffix(_SESSION_MARKER_SUFFIX)
+            self._write_drop_state(
+                dropped_events + 1,
+                "spool_quota",
+                directory_fd,
+                acknowledged_marker=(marker_tag if pending_quota_barrier else acknowledged_marker),
+            )
+            if pending_quota_barrier:
+                markers[key] = self._set_session_marker_state_locked(
+                    key,
+                    "acknowledged",
+                    directory_fd,
+                )
+            return CaptureSpoolEnqueueReceipt(disposition="dropped_quota")
+        self._ensure_session_marker_locked(
+            intake.connection_id,
+            intake.session_id,
+            directory_fd,
+        )
+        if self._windows_operations is not None:  # pragma: no cover - native Windows R01
+            self._windows_operations.publish_private_file(
+                PureWindowsPath(str(path)),
+                framed,
+                maximum_bytes=_MAX_ENTRY_BYTES,
+                validate_published=lambda value: value == framed,
+            )
+        else:
+            if (
+                type(directory_fd) is not int
+                or type(self._spool_identity) is not security_files._PrivateDirectoryAuthorization
+            ):
+                raise SecureFileError()
+            security_files._publish_private_file_at_descriptor(
+                self._spool_identity,
+                directory_fd,
+                path.name,
+                framed,
+                maximum_bytes=_MAX_ENTRY_BYTES,
+                validate_published=lambda value: value == framed,
+            )
+        return CaptureSpoolEnqueueReceipt(disposition="queued")
+
     def enqueue(self, intake: CaptureIntake) -> CaptureSpoolEnqueueReceipt:
         failed = False
         try:
             tag, framed = self._frame(intake)
             with self._locked() as directory_fd:
-                entries = self._entries(directory_fd)
-                path = self._locations.spool_directory / f"{tag}{_ENTRY_SUFFIX}"
-                existing = next((item for item in entries if item[0] == path), None)
-                if existing is not None:
-                    if existing[2].data != framed:
-                        raise CaptureSpoolIntegrityError()
-                    return CaptureSpoolEnqueueReceipt(disposition="already_queued")
-                queued_bytes = sum(len(stable.data) for _, _, stable in entries)
-                if (
-                    len(entries) >= MAX_CAPTURE_SPOOL_EVENTS
-                    or queued_bytes + len(framed) > MAX_CAPTURE_SPOOL_BYTES
-                ):
-                    dropped_events, _reason = self._drop_state(directory_fd)
-                    self._write_drop_state(
-                        dropped_events + 1,
-                        "spool_quota",
-                        directory_fd,
-                    )
-                    return CaptureSpoolEnqueueReceipt(disposition="dropped_quota")
-                if self._windows_operations is not None:  # pragma: no cover - native Windows R01
-                    self._windows_operations.publish_private_file(
-                        PureWindowsPath(str(path)),
-                        framed,
-                        maximum_bytes=_MAX_ENTRY_BYTES,
-                        validate_published=lambda value: value == framed,
-                    )
-                else:
-                    if (
-                        type(directory_fd) is not int
-                        or type(self._spool_identity)
-                        is not security_files._PrivateDirectoryAuthorization
-                    ):
-                        raise SecureFileError()
-                    security_files._publish_private_file_at_descriptor(
-                        self._spool_identity,
-                        directory_fd,
-                        path.name,
-                        framed,
-                        maximum_bytes=_MAX_ENTRY_BYTES,
-                        validate_published=lambda value: value == framed,
-                    )
-                return CaptureSpoolEnqueueReceipt(disposition="queued")
+                return self._enqueue_locked(intake, tag, framed, directory_fd)
         except CaptureSpoolError:
             raise
         except Exception:
@@ -841,6 +1503,78 @@ class CaptureSpool:
         if failed:
             raise CaptureSpoolError()
         raise CaptureSpoolError()
+
+    def _admit_locked(
+        self,
+        store: _AppendStore,
+        intake: CaptureIntake,
+        tag: str,
+        framed: bytes,
+        directory_fd: int | None,
+    ) -> object:
+        marker = self._read_session_marker(
+            intake.connection_id,
+            intake.session_id,
+            directory_fd,
+        )
+        if marker is not None:
+            return self._enqueue_locked(intake, tag, framed, directory_fd)
+        from saliencegate.capture.store import CaptureStoreBusyError
+
+        try:
+            return store.append(intake)
+        except Exception as error:
+            if not isinstance(error, CaptureStoreBusyError):
+                raise
+        return self._enqueue_locked(intake, tag, framed, directory_fd)
+
+    def admit(self, store: _AppendStore, intake: CaptureIntake) -> object:
+        """Admit once while preserving any same-session spool backlog."""
+
+        try:
+            tag, framed = self._frame(intake)
+        except CaptureSpoolError:
+            raise
+        except Exception:
+            raise CaptureSpoolError() from None
+        entered = False
+        try:
+            with self._locked() as directory_fd:
+                entered = True
+                return self._admit_locked(
+                    store,
+                    intake,
+                    tag,
+                    framed,
+                    directory_fd,
+                )
+        except CaptureSpoolError:
+            raise
+        except RuntimeError:
+            raise
+        except Exception:
+            if not entered:
+                raise CaptureSpoolUnavailableError() from None
+            raise CaptureSpoolError() from None
+
+    @contextmanager
+    def maintenance(self) -> Iterator[CaptureSpoolMaintenance]:
+        """Hold the spool fence across drain and a store lifecycle mutation."""
+
+        token: CaptureSpoolMaintenance | None = None
+        try:
+            with self._locked() as directory_fd:
+                token = CaptureSpoolMaintenance(self, directory_fd)
+                try:
+                    yield token
+                finally:
+                    token._close()
+        except CaptureSpoolError:
+            raise
+        except RuntimeError:
+            raise
+        except Exception:
+            raise CaptureSpoolError() from None
 
     def _append_from_spool(self, store: _AppendStore, intake: CaptureIntake) -> object:
         from saliencegate.capture.store import (
@@ -852,49 +1586,51 @@ class CaptureSpool:
             return store.append(intake, source=CaptureAdmissionSource.SPOOL_DRAIN)
         return store.append(intake)
 
+    def _drain_locked(
+        self,
+        store: _AppendStore,
+        directory_fd: int | None,
+    ) -> CaptureSpoolDrainReceipt:
+        entries = self._entries(directory_fd)
+        markers = self._session_markers(directory_fd)
+        orphan_markers = self._reconcile_session_markers(entries, markers)
+        self._persist_orphan_degradation_locked(
+            orphan_markers,
+            markers,
+            directory_fd,
+            remove=True,
+        )
+        remaining_by_session: dict[_SpoolSessionKey, int] = {}
+        for _path, intake, _stable in entries:
+            key = (intake.connection_id, intake.session_id)
+            remaining_by_session[key] = remaining_by_session.get(key, 0) + 1
+        admitted = 0
+        for _path, intake, stable in entries:
+            try:
+                self._append_from_spool(store, intake)
+            except Exception as error:
+                from saliencegate.capture.store import CaptureStoreBusyError
+
+                if isinstance(error, CaptureStoreBusyError):
+                    return CaptureSpoolDrainReceipt(
+                        admitted_events=admitted,
+                        remaining_events=len(entries) - admitted,
+                    )
+                raise
+            self._delete_stable_file_locked(stable, directory_fd)
+            key = (intake.connection_id, intake.session_id)
+            remaining_by_session[key] -= 1
+            if remaining_by_session[key] == 0:
+                _marker_path, _state, marker = markers.pop(key)
+                self._delete_stable_file_locked(marker, directory_fd)
+            admitted += 1
+        return CaptureSpoolDrainReceipt(admitted_events=admitted, remaining_events=0)
+
     def drain(self, store: _AppendStore) -> CaptureSpoolDrainReceipt:
         failed = False
         try:
             with self._locked() as directory_fd:
-                entries = self._entries(directory_fd)
-                admitted = 0
-                for _path, intake, stable in entries:
-                    try:
-                        self._append_from_spool(store, intake)
-                    except Exception as error:
-                        from saliencegate.capture.store import CaptureStoreBusyError
-
-                        if isinstance(error, CaptureStoreBusyError):
-                            return CaptureSpoolDrainReceipt(
-                                admitted_events=admitted,
-                                remaining_events=len(entries) - admitted,
-                            )
-                        raise
-                    stable.authorization.revalidate()
-                    if self._windows_operations is not None:  # pragma: no cover - Windows R01
-                        if type(stable) is not WindowsStableFileRead:
-                            raise CaptureSpoolIntegrityError()
-                        self._windows_operations.delete_authorized_file(stable.authorization)
-                        self._revalidate()
-                    else:
-                        if (
-                            type(stable) is not StableFileRead
-                            or type(directory_fd) is not int
-                            or type(self._spool_identity)
-                            is not security_files._PrivateDirectoryAuthorization
-                        ):
-                            raise CaptureSpoolIntegrityError()
-                        security_files._delete_authorized_private_file_at_descriptor(
-                            self._spool_identity,
-                            directory_fd,
-                            stable.authorization,
-                        )
-                        security_files._require_authorized_private_directory_descriptor(
-                            self._spool_identity,
-                            directory_fd,
-                        )
-                    admitted += 1
-                return CaptureSpoolDrainReceipt(admitted_events=admitted, remaining_events=0)
+                return self._drain_locked(store, directory_fd)
         except CaptureSpoolError:
             raise
         except RuntimeError:
@@ -911,14 +1647,9 @@ def admit_capture_intake(
     spool: CaptureSpool,
     intake: CaptureIntake,
 ) -> object:
-    """Append directly, falling back only for the store's primary BUSY signal."""
+    """Admit under the cross-process spool ordering fence."""
 
-    from saliencegate.capture.store import CaptureStoreBusyError
-
-    try:
-        return store.append(intake)
-    except CaptureStoreBusyError:
-        return spool.enqueue(intake)
+    return spool.admit(store, intake)
 
 
 __all__ = [
@@ -930,8 +1661,10 @@ __all__ = [
     "CaptureSpoolError",
     "CaptureSpoolHealth",
     "CaptureSpoolIntegrityError",
+    "CaptureSpoolMaintenance",
     "CaptureSpoolObservation",
     "CaptureSpoolObservationError",
+    "CaptureSpoolUnavailableError",
     "admit_capture_intake",
     "verify_capture_spool_observation",
 ]

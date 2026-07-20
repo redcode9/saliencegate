@@ -193,7 +193,7 @@ def register_connection(
 def initialized_store(
     path: Path,
     *,
-    mode: CaptureStoreMode = CaptureStoreMode.HOOK,
+    mode: CaptureStoreMode = CaptureStoreMode.MAINTENANCE,
 ) -> Iterator[CaptureStore]:
     initialize_capture_store(path)
     with CaptureStore.open(

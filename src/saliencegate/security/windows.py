@@ -1,14 +1,14 @@
 """Fail-closed owner-private Windows path authorization.
 
 The public authorization boundary is deliberately backend-injectable so its race and
-security rules can be exercised on every development host.  The native backend opens the
-named object itself (rather than following a reparse point), inspects its stable file ID,
-owner, DACL, link count, and reparse metadata, and creates new objects with a protected
-owner-only ACL.
+security rules can be exercised on every development host.  The native backend opens
+every named component itself (rather than following a final reparse point), inspects its
+stable file ID, owner, DACL, link count, and reparse metadata, and creates new objects
+with a protected owner-only ACL.
 
-Win32 does not expose a Python-standard handle-relative filesystem API.  Callers must
-therefore authorize parent directories separately; this module pins and revalidates the
-exact final path object at each observable boundary.
+Win32 does not expose a Python-standard handle-relative filesystem API.  Every
+authorization therefore captures and revalidates the complete existing ancestor chain
+as well as the exact final object at each observable boundary.
 """
 
 from __future__ import annotations
@@ -59,6 +59,11 @@ class WindowsPathKind(StrEnum):
     DIRECTORY = "directory"
 
 
+class _WindowsDaclPolicy(StrEnum):
+    PRIVATE = "private"
+    MANAGED = "managed"
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class WindowsFileIdentity:
     """The volume-scoped, 128-bit identity returned by ``FileIdInfo``."""
@@ -87,6 +92,8 @@ class WindowsPathSecurity:
     kind: WindowsPathKind
     owner_sid: str
     owner_private_dacl: bool
+    owner_write_protected_dacl: bool
+    owner_traversal_protected_dacl: bool
     hardlink_count: int
     reparse_tag: int | None
 
@@ -99,6 +106,10 @@ class WindowsPathSecurity:
             or type(self.kind) is not WindowsPathKind
             or not _is_valid_sid_text(self.owner_sid)
             or type(self.owner_private_dacl) is not bool
+            or type(self.owner_write_protected_dacl) is not bool
+            or type(self.owner_traversal_protected_dacl) is not bool
+            or (self.owner_private_dacl and not self.owner_write_protected_dacl)
+            or (self.owner_write_protected_dacl and not self.owner_traversal_protected_dacl)
             or type(self.hardlink_count) is not int
             or not 1 <= self.hardlink_count <= _UINT32_MAX
             or not valid_reparse_tag
@@ -157,6 +168,12 @@ class WindowsSecurityOperations(Protocol):
     def inspect_path(self, path: PureWindowsPath) -> WindowsPathSecurity | None:
         """Inspect the final named object without following a reparse point."""
 
+    def inspect_ancestor_directories(
+        self,
+        path: PureWindowsPath,
+    ) -> tuple[tuple[PureWindowsPath, WindowsPathSecurity], ...]:
+        """Inspect every ancestor, from the path anchor through its direct parent."""
+
     def create_private_path(self, path: PureWindowsPath, kind: WindowsPathKind) -> None:
         """Exclusively create a path with a protected owner-only DACL."""
 
@@ -171,6 +188,15 @@ class WindowsPathAuthorization:
     _owner_sid: str = field(repr=False)
     _operations: WindowsSecurityOperations = field(repr=False, compare=False)
     _token: object = field(repr=False, compare=False)
+    _ancestor_chain: tuple[tuple[PureWindowsPath, WindowsPathSecurity], ...] = field(
+        default=(),
+        repr=False,
+    )
+    _dacl_policy: _WindowsDaclPolicy = field(
+        default=_WindowsDaclPolicy.PRIVATE,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -180,8 +206,20 @@ class WindowsPathAuthorization:
             or type(self.security) is not WindowsPathSecurity
             or not _is_valid_sid_text(self._owner_sid)
             or not isinstance(self._operations, WindowsSecurityOperations)
+            or type(self._dacl_policy) is not _WindowsDaclPolicy
+            or not _is_valid_ancestor_chain(
+                self.path,
+                self._ancestor_chain,
+                owner_sid=self._owner_sid,
+            )
         ):
             raise WindowsSecurityError()
+
+    @property
+    def component_security(self) -> tuple[WindowsPathSecurity, ...]:
+        """Return the complete redaction-safe security snapshot in traversal order."""
+
+        return (*tuple(security for _path, security in self._ancestor_chain), self.security)
 
     def revalidate(self) -> None:
         """Fail if the name, identity, owner, DACL, links, or kind changed."""
@@ -192,13 +230,30 @@ class WindowsPathAuthorization:
         current_owner_sid = self._operations.current_user_sid()
         if current_owner_sid != self._owner_sid:
             raise _NativeWindowsError()
+        before = _capture_ancestor_chain(
+            self.path,
+            operations=self._operations,
+            owner_sid=self._owner_sid,
+        )
+        if before != self._ancestor_chain:
+            raise _NativeWindowsError()
         inspected = self._operations.inspect_path(self.path)
-        checked = _validate_private_security(
+        checked = _validate_authorized_security(
             inspected,
             kind=self.kind,
             owner_sid=self._owner_sid,
+            dacl_policy=self._dacl_policy,
         )
-        if checked.identity != self.security.identity:
+        after = _capture_ancestor_chain(
+            self.path,
+            operations=self._operations,
+            owner_sid=self._owner_sid,
+        )
+        if (
+            before != after
+            or after != self._ancestor_chain
+            or checked.identity != self.security.identity
+        ):
             raise _NativeWindowsError()
 
     def __repr__(self) -> str:
@@ -215,39 +270,152 @@ def authorize_windows_private_path(
     """Authorize an existing exact path, optionally creating it owner-private first."""
 
     return _content_free_call(
-        lambda: _authorize_windows_private_path(
+        lambda: _authorize_windows_path(
             path,
             kind=kind,
             operations=operations,
             create=create,
+            dacl_policy=_WindowsDaclPolicy.PRIVATE,
         )
     )
 
 
-def _authorize_windows_private_path(
+def authorize_windows_managed_path(
+    path: PureWindowsPath,
+    *,
+    kind: WindowsPathKind,
+    operations: WindowsSecurityOperations,
+) -> WindowsPathAuthorization:
+    """Authorize a current-user-owned path whose DACL denies untrusted writes."""
+
+    return _content_free_call(
+        lambda: _authorize_windows_path(
+            path,
+            kind=kind,
+            operations=operations,
+            create=False,
+            dacl_policy=_WindowsDaclPolicy.MANAGED,
+        )
+    )
+
+
+def ensure_windows_private_directory(
+    path: PureWindowsPath,
+    *,
+    operations: WindowsSecurityOperations,
+) -> WindowsPathAuthorization:
+    """Create a missing suffix with private DACLs below one safe existing ancestor."""
+
+    return _content_free_call(
+        lambda: _ensure_windows_private_directory(path, operations=operations)
+    )
+
+
+def _ensure_windows_private_directory(
+    path: PureWindowsPath,
+    *,
+    operations: WindowsSecurityOperations,
+) -> WindowsPathAuthorization:
+    if not _is_valid_windows_path(path) or not isinstance(operations, WindowsSecurityOperations):
+        raise _NativeWindowsError()
+    if operations.inspect_path(path) is not None:
+        return _authorize_windows_path(
+            path,
+            kind=WindowsPathKind.DIRECTORY,
+            operations=operations,
+            create=False,
+            dacl_policy=_WindowsDaclPolicy.PRIVATE,
+        )
+    missing: list[PureWindowsPath] = []
+    current = path
+    while operations.inspect_path(current) is None:
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            raise _NativeWindowsError()
+        current = parent
+    parent_authorization = _authorize_windows_path(
+        current,
+        kind=WindowsPathKind.DIRECTORY,
+        operations=operations,
+        create=False,
+        dacl_policy=_WindowsDaclPolicy.MANAGED,
+    )
+    result: WindowsPathAuthorization | None = None
+    for item in reversed(missing):
+        parent_authorization._checked_revalidate()
+        try:
+            operations.create_private_path(item, WindowsPathKind.DIRECTORY)
+        except Exception:
+            if operations.inspect_path(item) is None:
+                raise
+        parent_authorization._checked_revalidate()
+        result = _authorize_windows_path(
+            item,
+            kind=WindowsPathKind.DIRECTORY,
+            operations=operations,
+            create=False,
+            dacl_policy=_WindowsDaclPolicy.PRIVATE,
+        )
+        parent_authorization = result
+    if result is None:
+        raise _NativeWindowsError()
+    result._checked_revalidate()
+    return result
+
+
+def _authorize_windows_path(
     path: PureWindowsPath,
     *,
     kind: WindowsPathKind,
     operations: WindowsSecurityOperations,
     create: bool,
+    dacl_policy: _WindowsDaclPolicy,
 ) -> WindowsPathAuthorization:
     if (
         not _is_valid_windows_path(path)
         or type(kind) is not WindowsPathKind
         or not isinstance(operations, WindowsSecurityOperations)
         or type(create) is not bool
+        or type(dacl_policy) is not _WindowsDaclPolicy
     ):
         raise _NativeWindowsError()
     owner_sid = operations.current_user_sid()
     if not _is_valid_sid_text(owner_sid):
         raise _NativeWindowsError()
+    ancestors = _capture_ancestor_chain(
+        path,
+        operations=operations,
+        owner_sid=owner_sid,
+    )
     inspected = operations.inspect_path(path)
     if inspected is None:
         if not create:
             raise _NativeWindowsError()
+        if (
+            _capture_ancestor_chain(
+                path,
+                operations=operations,
+                owner_sid=owner_sid,
+            )
+            != ancestors
+        ):
+            raise _NativeWindowsError()
         operations.create_private_path(path, kind)
         inspected = operations.inspect_path(path)
-    security = _validate_private_security(inspected, kind=kind, owner_sid=owner_sid)
+    security = _validate_authorized_security(
+        inspected,
+        kind=kind,
+        owner_sid=owner_sid,
+        dacl_policy=dacl_policy,
+    )
+    after = _capture_ancestor_chain(
+        path,
+        operations=operations,
+        owner_sid=owner_sid,
+    )
+    if after != ancestors:
+        raise _NativeWindowsError()
     return WindowsPathAuthorization(
         path=path,
         kind=kind,
@@ -255,7 +423,88 @@ def _authorize_windows_private_path(
         _owner_sid=owner_sid,
         _operations=operations,
         _token=_AUTHORIZATION_TOKEN,
+        _ancestor_chain=ancestors,
+        _dacl_policy=dacl_policy,
     )
+
+
+def _capture_ancestor_chain(
+    path: PureWindowsPath,
+    *,
+    operations: WindowsSecurityOperations,
+    owner_sid: str,
+) -> tuple[tuple[PureWindowsPath, WindowsPathSecurity], ...]:
+    chain = operations.inspect_ancestor_directories(path)
+    if not _is_valid_ancestor_chain(path, chain, owner_sid=owner_sid):
+        raise _NativeWindowsError()
+    return chain
+
+
+def _is_valid_ancestor_chain(
+    path: PureWindowsPath,
+    chain: object,
+    *,
+    owner_sid: str,
+) -> bool:
+    if type(chain) is not tuple or not _is_valid_sid_text(owner_sid):
+        return False
+    expected_paths = _windows_ancestor_paths(path)
+    if len(chain) != len(expected_paths):
+        return False
+    for index, item in enumerate(chain):
+        if type(item) is not tuple or len(item) != 2:
+            return False
+        ancestor, security = item
+        if ancestor != expected_paths[index] or not _is_safe_ancestor_security(
+            security,
+            owner_sid=owner_sid,
+            is_anchor=index == 0,
+        ):
+            return False
+    return True
+
+
+def _is_safe_ancestor_security(
+    security: object,
+    *,
+    owner_sid: str,
+    is_anchor: bool,
+) -> bool:
+    return bool(
+        type(security) is WindowsPathSecurity
+        and security.kind is WindowsPathKind.DIRECTORY
+        and security.owner_sid in {owner_sid, *_TRUSTED_PRIVILEGED_SIDS}
+        and (
+            security.owner_traversal_protected_dacl
+            if is_anchor
+            else security.owner_write_protected_dacl
+        )
+        and security.hardlink_count == 1
+        and security.reparse_tag is None
+    )
+
+
+def _validate_authorized_security(
+    security: WindowsPathSecurity | None,
+    *,
+    kind: WindowsPathKind,
+    owner_sid: str,
+    dacl_policy: _WindowsDaclPolicy,
+) -> WindowsPathSecurity:
+    if type(dacl_policy) is not _WindowsDaclPolicy:
+        raise _NativeWindowsError()
+    if dacl_policy is _WindowsDaclPolicy.PRIVATE:
+        return _validate_private_security(security, kind=kind, owner_sid=owner_sid)
+    if (
+        type(security) is not WindowsPathSecurity
+        or security.kind is not kind
+        or security.owner_sid != owner_sid
+        or not security.owner_write_protected_dacl
+        or security.hardlink_count != 1
+        or security.reparse_tag is not None
+    ):
+        raise _NativeWindowsError()
+    return security
 
 
 def _validate_private_security(
@@ -311,7 +560,15 @@ def _is_valid_sid_text(value: object) -> bool:
 
 
 def _is_valid_windows_path(value: object) -> bool:
-    if not isinstance(value, PureWindowsPath) or not value.is_absolute() or not value.name:
+    return (
+        isinstance(value, PureWindowsPath)
+        and _is_valid_windows_inspection_path(value)
+        and bool(value.name)
+    )
+
+
+def _is_valid_windows_inspection_path(value: object) -> bool:
+    if not isinstance(value, PureWindowsPath) or not value.is_absolute():
         return False
     rendered = str(value)
     if "\x00" in rendered or value.drive.casefold().startswith(("\\\\.\\", "\\\\?\\")):
@@ -327,6 +584,12 @@ def _is_valid_windows_path(value: object) -> bool:
         ):
             return False
     return True
+
+
+def _windows_ancestor_paths(path: PureWindowsPath) -> tuple[PureWindowsPath, ...]:
+    if not _is_valid_windows_path(path):
+        return ()
+    return tuple(reversed(path.parents))
 
 
 # Win32 constants and structures are declared explicitly instead of relying on pywin32 so
@@ -353,7 +616,9 @@ _FILE_SHARE_DELETE = 0x00000004
 _CREATE_NEW = 1
 _OPEN_EXISTING = 3
 _MOVEFILE_WRITE_THROUGH = 0x00000008
-_REPLACEFILE_WRITE_THROUGH = 0x00000001
+# ReplaceFileW exposes historical write-through constants, but Microsoft documents
+# them as unsupported.  The replacement payload is flushed before this atomic swap.
+_REPLACEFILE_FLAGS = 0
 _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 _FILE_ATTRIBUTE_NORMAL = 0x00000080
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
@@ -372,8 +637,42 @@ _SE_DACL_PRESENT = 0x0004
 _SE_DACL_PROTECTED = 0x1000
 _ACL_SIZE_INFORMATION_CLASS = 2
 _ACCESS_ALLOWED_ACE_TYPE = 0
+_ACCESS_DENIED_ACE_TYPE = 1
+_INHERIT_ONLY_ACE = 0x08
 _INHERITED_ACE = 0x10
 _FILE_ALL_ACCESS = 0x001F01FF
+_UNTRUSTED_WRITE_ACCESS = (
+    0x00000002  # FILE_WRITE_DATA / FILE_ADD_FILE
+    | 0x00000004  # FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+    | 0x00000010  # FILE_WRITE_EA
+    | 0x00000040  # FILE_DELETE_CHILD
+    | 0x00000100  # FILE_WRITE_ATTRIBUTES
+    | 0x00010000  # DELETE
+    | 0x00040000  # WRITE_DAC
+    | 0x00080000  # WRITE_OWNER
+    | 0x01000000  # ACCESS_SYSTEM_SECURITY
+    | 0x02000000  # MAXIMUM_ALLOWED
+    | 0x10000000  # GENERIC_ALL
+    | 0x40000000  # GENERIC_WRITE
+)
+_UNTRUSTED_TRAVERSAL_ACCESS = (
+    0x00000040  # FILE_DELETE_CHILD
+    | 0x00010000  # DELETE
+    | 0x00040000  # WRITE_DAC
+    | 0x00080000  # WRITE_OWNER
+    | 0x01000000  # ACCESS_SYSTEM_SECURITY
+    | 0x02000000  # MAXIMUM_ALLOWED
+    | 0x10000000  # GENERIC_ALL
+    | 0x40000000  # GENERIC_WRITE
+)
+_TRUSTED_PRIVILEGED_SIDS = frozenset(
+    {
+        "S-1-5-18",  # LocalSystem, analogous to POSIX root for this boundary.
+        "S-1-5-32-544",  # Builtin Administrators.
+        # NT SERVICE\TrustedInstaller, the normal owner for protected Windows roots.
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+    }
+)
 _SDDL_REVISION_1 = 1
 _LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
 _LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
@@ -663,6 +962,14 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
 
         return _content_free_call(lambda: self._inspect_path(path))
 
+    def inspect_ancestor_directories(
+        self,
+        path: PureWindowsPath,
+    ) -> tuple[tuple[PureWindowsPath, WindowsPathSecurity], ...]:
+        """Inspect every existing traversal component through no-follow handles."""
+
+        return _content_free_call(lambda: self._inspect_ancestor_directories(path))
+
     def create_private_path(self, path: PureWindowsPath, kind: WindowsPathKind) -> None:
         """Exclusively create a file or directory with an owner-only protected DACL."""
 
@@ -677,7 +984,27 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
         """Read exact bounded bytes while denying writers and path replacement."""
 
         return _content_free_call(
-            lambda: self._read_private_file(path, maximum_bytes=maximum_bytes)
+            lambda: self._read_file(
+                path,
+                maximum_bytes=maximum_bytes,
+                dacl_policy=_WindowsDaclPolicy.PRIVATE,
+            )
+        )
+
+    def read_managed_file(
+        self,
+        path: PureWindowsPath,
+        *,
+        maximum_bytes: int,
+    ) -> WindowsStableFileRead:
+        """Read bytes whose DACL prevents writes by untrusted principals."""
+
+        return _content_free_call(
+            lambda: self._read_file(
+                path,
+                maximum_bytes=maximum_bytes,
+                dacl_policy=_WindowsDaclPolicy.MANAGED,
+            )
         )
 
     def publish_private_file(
@@ -698,6 +1025,54 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
                 maximum_bytes=maximum_bytes,
                 validate_replacement=validate_replacement,
                 validate_published=validate_published,
+                parent_dacl_policy=_WindowsDaclPolicy.PRIVATE,
+                target_dacl_policy=_WindowsDaclPolicy.PRIVATE,
+            )
+        )
+
+    def publish_private_file_in_managed_directory(
+        self,
+        path: PureWindowsPath,
+        data: bytes,
+        *,
+        maximum_bytes: int,
+        validate_replacement: Callable[[bytes], bool] | None = None,
+        validate_published: Callable[[bytes], bool] | None = None,
+    ) -> WindowsStableFileRead:
+        """Publish a private file without rewriting one safe provider-owned parent."""
+
+        return _content_free_call(
+            lambda: self._publish_private_file(
+                path,
+                data,
+                maximum_bytes=maximum_bytes,
+                validate_replacement=validate_replacement,
+                validate_published=validate_published,
+                parent_dacl_policy=_WindowsDaclPolicy.MANAGED,
+                target_dacl_policy=_WindowsDaclPolicy.PRIVATE,
+            )
+        )
+
+    def publish_managed_file(
+        self,
+        path: PureWindowsPath,
+        data: bytes,
+        *,
+        maximum_bytes: int,
+        validate_replacement: Callable[[bytes], bool] | None = None,
+        validate_published: Callable[[bytes], bool] | None = None,
+    ) -> WindowsStableFileRead:
+        """Publish into a safe shared directory and permit a safe existing target."""
+
+        return _content_free_call(
+            lambda: self._publish_private_file(
+                path,
+                data,
+                maximum_bytes=maximum_bytes,
+                validate_replacement=validate_replacement,
+                validate_published=validate_published,
+                parent_dacl_policy=_WindowsDaclPolicy.MANAGED,
+                target_dacl_policy=_WindowsDaclPolicy.MANAGED,
             )
         )
 
@@ -760,7 +1135,7 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
             self._close_handle(token.value)
 
     def _inspect_path(self, path: PureWindowsPath) -> WindowsPathSecurity | None:
-        if not _is_valid_windows_path(path):
+        if not _is_valid_windows_inspection_path(path):
             raise _NativeWindowsError()
         handle = self._open_path_no_follow(path)
         if handle is None:
@@ -769,6 +1144,20 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
             return self._snapshot_from_handle(handle).security
         finally:
             self._close_handle(handle)
+
+    def _inspect_ancestor_directories(
+        self,
+        path: PureWindowsPath,
+    ) -> tuple[tuple[PureWindowsPath, WindowsPathSecurity], ...]:
+        if not _is_valid_windows_path(path):
+            raise _NativeWindowsError()
+        result: list[tuple[PureWindowsPath, WindowsPathSecurity]] = []
+        for ancestor in _windows_ancestor_paths(path):
+            security = self._inspect_path(ancestor)
+            if security is None:
+                raise _NativeWindowsError()
+            result.append((ancestor, security))
+        return tuple(result)
 
     def _snapshot_from_handle(self, handle: int) -> _WindowsFileSnapshot:
         legacy = _ByHandleFileInformation()
@@ -800,13 +1189,20 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
         reparse_tag = (
             self._read_reparse_tag(handle) if attributes & _FILE_ATTRIBUTE_REPARSE_POINT else None
         )
-        owner_sid, owner_private_dacl = self._read_owner_and_dacl(handle)
+        (
+            owner_sid,
+            owner_private_dacl,
+            owner_write_protected_dacl,
+            owner_traversal_protected_dacl,
+        ) = self._read_owner_and_dacl(handle)
         return _WindowsFileSnapshot(
             security=WindowsPathSecurity(
                 identity=self._read_file_identity(handle, legacy),
                 kind=kind,
                 owner_sid=owner_sid,
                 owner_private_dacl=owner_private_dacl,
+                owner_write_protected_dacl=owner_write_protected_dacl,
+                owner_traversal_protected_dacl=owner_traversal_protected_dacl,
                 hardlink_count=int(standard.NumberOfLinks),
                 reparse_tag=reparse_tag,
             ),
@@ -881,11 +1277,18 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
         snapshot: _WindowsFileSnapshot,
         *,
         kind: WindowsPathKind,
+        dacl_policy: _WindowsDaclPolicy = _WindowsDaclPolicy.PRIVATE,
     ) -> WindowsPathAuthorization:
         owner_sid = self._current_user_sid()
-        security = _validate_private_security(
+        security = _validate_authorized_security(
             snapshot.security,
             kind=kind,
+            owner_sid=owner_sid,
+            dacl_policy=dacl_policy,
+        )
+        ancestors = _capture_ancestor_chain(
+            path,
+            operations=self,
             owner_sid=owner_sid,
         )
         authorization = WindowsPathAuthorization(
@@ -895,20 +1298,24 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
             _owner_sid=owner_sid,
             _operations=self,
             _token=_AUTHORIZATION_TOKEN,
+            _ancestor_chain=ancestors,
+            _dacl_policy=dacl_policy,
         )
         authorization._checked_revalidate()
         return authorization
 
-    def _read_private_file(
+    def _read_file(
         self,
         path: PureWindowsPath,
         *,
         maximum_bytes: int,
+        dacl_policy: _WindowsDaclPolicy,
     ) -> WindowsStableFileRead:
         if (
             not _is_valid_windows_path(path)
             or type(maximum_bytes) is not int
             or not 1 <= maximum_bytes < (1 << 63)
+            or type(dacl_policy) is not _WindowsDaclPolicy
         ):
             raise _NativeWindowsError()
         handle = self._bindings.kernel32.CreateFileW(
@@ -931,6 +1338,7 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
                 path,
                 before,
                 kind=WindowsPathKind.FILE,
+                dacl_policy=dacl_policy,
             )
             result = bytearray()
             while len(result) < before.size:
@@ -1049,6 +1457,8 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
         maximum_bytes: int,
         validate_replacement: Callable[[bytes], bool] | None,
         validate_published: Callable[[bytes], bool] | None,
+        parent_dacl_policy: _WindowsDaclPolicy,
+        target_dacl_policy: _WindowsDaclPolicy,
     ) -> WindowsStableFileRead:
         if (
             not _is_valid_windows_path(path)
@@ -1058,19 +1468,27 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
             or len(data) > maximum_bytes
             or (validate_replacement is not None and not callable(validate_replacement))
             or (validate_published is not None and not callable(validate_published))
+            or type(parent_dacl_policy) is not _WindowsDaclPolicy
+            or type(target_dacl_policy) is not _WindowsDaclPolicy
         ):
             raise _NativeWindowsError()
-        parent = authorize_windows_private_path(
+        parent = _authorize_windows_path(
             path.parent,
             kind=WindowsPathKind.DIRECTORY,
             operations=self,
+            create=False,
+            dacl_policy=parent_dacl_policy,
         )
         existing_security = self._inspect_path(path)
         existing_read: WindowsStableFileRead | None = None
         if existing_security is not None:
             if validate_replacement is None:
                 raise _NativeWindowsError()
-            existing_read = self._read_private_file(path, maximum_bytes=maximum_bytes)
+            existing_read = self._read_file(
+                path,
+                maximum_bytes=maximum_bytes,
+                dacl_policy=target_dacl_policy,
+            )
             if validate_replacement(existing_read.data) is not True:
                 raise _NativeWindowsError()
         temporary_path = self._temporary_path(path.parent, "saliencegate-private")
@@ -1096,14 +1514,18 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
                     str(path),
                     str(temporary_path),
                     str(backup_path),
-                    _REPLACEFILE_WRITE_THROUGH,
+                    _REPLACEFILE_FLAGS,
                     None,
                     None,
                 ):
                     raise _NativeWindowsError()
             published = True
             parent._checked_revalidate()
-            published_read = self._read_private_file(path, maximum_bytes=maximum_bytes)
+            published_read = self._read_file(
+                path,
+                maximum_bytes=maximum_bytes,
+                dacl_policy=target_dacl_policy,
+            )
             if (
                 published_read.data != data
                 or published_read.authorization.security.identity
@@ -1115,9 +1537,10 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
             ):
                 raise _NativeWindowsError()
             if backup_path is not None and existing_read is not None:
-                backup_read = self._read_private_file(
+                backup_read = self._read_file(
                     backup_path,
                     maximum_bytes=maximum_bytes,
+                    dacl_policy=target_dacl_policy,
                 )
                 if (
                     backup_read.data != existing_read.data
@@ -1140,10 +1563,12 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
                         and current.identity == temporary_snapshot.security.identity
                     ):
                         with suppress(Exception):
-                            authorization = authorize_windows_private_path(
+                            authorization = _authorize_windows_path(
                                 path,
                                 kind=WindowsPathKind.FILE,
                                 operations=self,
+                                create=False,
+                                dacl_policy=target_dacl_policy,
                             )
                             self._delete_authorized_file(authorization)
                 else:
@@ -1152,7 +1577,7 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
                             str(path),
                             str(backup_path),
                             None,
-                            _REPLACEFILE_WRITE_THROUGH,
+                            _REPLACEFILE_FLAGS,
                             None,
                             None,
                         )
@@ -1189,10 +1614,11 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
         checked_handle = cast(int, handle)
         try:
             snapshot = self._snapshot_from_handle(checked_handle)
-            _validate_private_security(
+            _validate_authorized_security(
                 snapshot.security,
                 kind=WindowsPathKind.FILE,
                 owner_sid=authorization._owner_sid,
+                dacl_policy=authorization._dacl_policy,
             )
             if snapshot.security.identity != authorization.security.identity or (
                 expected_snapshot is not None and snapshot != expected_snapshot
@@ -1241,7 +1667,15 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
     ) -> _WindowsPrivateFileLock:
         if not _is_valid_windows_path(path) or type(blocking) is not bool:
             raise _NativeWindowsError()
+        parent = _authorize_windows_path(
+            path.parent,
+            kind=WindowsPathKind.DIRECTORY,
+            operations=self,
+            create=False,
+            dacl_policy=_WindowsDaclPolicy.PRIVATE,
+        )
         if self._inspect_path(path) is None:
+            parent._checked_revalidate()
             try:
                 self._new_private_file(path, b"")
             except Exception:
@@ -1250,6 +1684,9 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
                 # enforces owner/DACL/link/reparse/kind and exact identity.
                 if self._inspect_path(path) is None:
                     raise
+            parent._checked_revalidate()
+        else:
+            parent._checked_revalidate()
         checked_handle: int | None = None
         for attempt in range(16):
             handle = self._bindings.kernel32.CreateFileW(
@@ -1280,6 +1717,7 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
                 snapshot,
                 kind=WindowsPathKind.FILE,
             )
+            parent._checked_revalidate()
             overlapped = _Overlapped()
             if not self._bindings.kernel32.LockFileEx(
                 checked_handle,
@@ -1375,7 +1813,7 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
             return _UINT32_MAX
         return int.from_bytes(buffer.raw[:4], "little")
 
-    def _read_owner_and_dacl(self, handle: int) -> tuple[str, bool]:
+    def _read_owner_and_dacl(self, handle: int) -> tuple[str, bool, bool, bool]:
         owner = ctypes.c_void_p()
         dacl = ctypes.c_void_p()
         descriptor = ctypes.c_void_p()
@@ -1393,23 +1831,24 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
             if result != 0 or owner.value is None or descriptor.value is None:
                 raise _NativeWindowsError()
             owner_sid = self._sid_to_text(owner.value)
-            return owner_sid, self._is_owner_private_dacl(
+            private, write_protected, traversal_protected = self._dacl_properties(
                 descriptor.value,
                 dacl.value,
                 owner.value,
             )
+            return owner_sid, private, write_protected, traversal_protected
         finally:
             if descriptor.value is not None:
                 self._bindings.kernel32.LocalFree(descriptor)
 
-    def _is_owner_private_dacl(
+    def _dacl_properties(
         self,
         descriptor: int,
         dacl: int | None,
         owner_sid: int,
-    ) -> bool:
+    ) -> tuple[bool, bool, bool]:
         if dacl is None:
-            return False
+            return False, False, False
         control = wintypes.WORD()
         revision = wintypes.DWORD()
         if not self._bindings.advapi32.GetSecurityDescriptorControl(
@@ -1418,8 +1857,8 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
             ctypes.byref(revision),
         ):
             raise _NativeWindowsError()
-        if not control.value & _SE_DACL_PRESENT or not control.value & _SE_DACL_PROTECTED:
-            return False
+        if not control.value & _SE_DACL_PRESENT:
+            return False, False, False
         information = _AclSizeInformation()
         if not self._bindings.advapi32.GetAclInformation(
             dacl,
@@ -1428,26 +1867,47 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
             _ACL_SIZE_INFORMATION_CLASS,
         ):
             raise _NativeWindowsError()
-        if information.AceCount != 1:
-            return False
-        ace = ctypes.c_void_p()
-        if not self._bindings.advapi32.GetAce(dacl, 0, ctypes.byref(ace)):
-            raise _NativeWindowsError()
-        if ace.value is None:
-            raise _NativeWindowsError()
-        header = ctypes.cast(ace, ctypes.POINTER(_AceHeader)).contents
-        if (
-            header.AceType != _ACCESS_ALLOWED_ACE_TYPE
-            or header.AceFlags & _INHERITED_ACE
-            or header.AceSize < 12
-        ):
-            return False
-        mask = ctypes.c_uint32.from_address(ace.value + 4).value
-        ace_sid = ace.value + 8
-        return bool(
-            mask & _FILE_ALL_ACCESS == _FILE_ALL_ACCESS
-            and self._bindings.advapi32.EqualSid(ace_sid, owner_sid)
-        )
+        private = bool(control.value & _SE_DACL_PROTECTED and information.AceCount == 1)
+        write_protected = True
+        traversal_protected = True
+        for index in range(information.AceCount):
+            ace = ctypes.c_void_p()
+            if not self._bindings.advapi32.GetAce(dacl, index, ctypes.byref(ace)):
+                raise _NativeWindowsError()
+            if ace.value is None:
+                raise _NativeWindowsError()
+            header = ctypes.cast(ace, ctypes.POINTER(_AceHeader)).contents
+            if header.AceSize < 12 or header.AceType not in {
+                _ACCESS_ALLOWED_ACE_TYPE,
+                _ACCESS_DENIED_ACE_TYPE,
+            }:
+                private = False
+                write_protected = False
+                traversal_protected = False
+                continue
+            mask = ctypes.c_uint32.from_address(ace.value + 4).value
+            ace_sid = ace.value + 8
+            owner_ace = bool(self._bindings.advapi32.EqualSid(ace_sid, owner_sid))
+            if index == 0:
+                private = bool(
+                    private
+                    and header.AceType == _ACCESS_ALLOWED_ACE_TYPE
+                    and not header.AceFlags & _INHERITED_ACE
+                    and owner_ace
+                    and mask & _FILE_ALL_ACCESS == _FILE_ALL_ACCESS
+                )
+            if (
+                header.AceType == _ACCESS_ALLOWED_ACE_TYPE
+                and not header.AceFlags & _INHERIT_ONLY_ACE
+                and mask & _UNTRUSTED_WRITE_ACCESS
+                and not owner_ace
+            ):
+                ace_sid_text = self._sid_to_text(ace_sid)
+                if ace_sid_text not in _TRUSTED_PRIVILEGED_SIDS:
+                    write_protected = False
+                    if mask & _UNTRUSTED_TRAVERSAL_ACCESS:
+                        traversal_protected = False
+        return private, write_protected, traversal_protected
 
     def _sid_to_text(self, sid: int) -> str:
         rendered = wintypes.LPWSTR()
@@ -1745,6 +2205,8 @@ __all__ = [
     "WindowsSecurityError",
     "WindowsSecurityOperations",
     "WindowsStableFileRead",
+    "authorize_windows_managed_path",
     "authorize_windows_private_path",
     "authorize_windows_sqlite_path",
+    "ensure_windows_private_directory",
 ]

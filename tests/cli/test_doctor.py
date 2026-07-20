@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import stat
 from pathlib import Path
@@ -9,10 +10,21 @@ from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
+from tests.capture.store_support import INSTALLATION_KEY, authenticated_intake, register_connection
 from tests.cli.conftest import RunCli
 
+import saliencegate.capture.spool as spool_module
 import saliencegate.commands.doctor as doctor_module
+from saliencegate.capture import (
+    CaptureSpool,
+    CaptureStore,
+    CaptureStoreMode,
+    initialize_capture_store,
+    resolve_capture_store_locations,
+)
 from saliencegate.commands.doctor import (
+    CaptureDoctorReport,
+    CaptureDoctorState,
     DoctorCheck,
     DoctorCheckName,
     DoctorCheckStatus,
@@ -20,15 +32,47 @@ from saliencegate.commands.doctor import (
     DoctorReportStatus,
     DoctorSeverity,
     PilotEndpointError,
+    render_capture_doctor_human,
+    render_capture_doctor_json,
     render_doctor_human,
     render_doctor_json,
+    run_capture_doctor,
     run_doctor,
     validated_pilot_endpoint,
 )
+from saliencegate.security import default_installation_key_path
 
 
 def _check(report: DoctorReport, name: DoctorCheckName) -> DoctorCheck:
     return next(check for check in report.checks if check.name is name)
+
+
+def _configured_capture(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
+    project = tmp_path / "capture-project"
+    project.mkdir()
+    environment = {
+        "HOME": str(tmp_path / "home"),
+        "XDG_CONFIG_HOME": str(tmp_path / "configuration"),
+        "XDG_STATE_HOME": str(tmp_path / "state"),
+    }
+    key_path = default_installation_key_path(environ=environment)
+    key_path.parent.mkdir(mode=0o700, parents=True)
+    key_path.write_bytes(INSTALLATION_KEY._serialized())
+    key_path.chmod(0o600)
+    locations = resolve_capture_store_locations(
+        environ=environment,
+        home=Path(environment["HOME"]),
+    )
+    locations.state_directory.mkdir(mode=0o700, parents=True)
+    initialize_capture_store(locations.database_path)
+    CaptureSpool.open(locations, INSTALLATION_KEY)
+    with CaptureStore.open(
+        locations.database_path,
+        installation_key=INSTALLATION_KEY,
+        mode=CaptureStoreMode.MAINTENANCE,
+    ) as store:
+        register_connection(store)
+    return project, environment, locations.database_path
 
 
 def test_doctor_succeeds_without_creating_a_key_or_contacting_a_model(
@@ -59,6 +103,156 @@ def test_doctor_succeeds_without_creating_a_key_or_contacting_a_model(
     assert not repository_path.exists()
     assert not key_path.exists()
     assert capsys.readouterr() == ("", "")
+
+
+def test_capture_doctor_is_read_only_when_capture_is_not_configured(tmp_path: Path) -> None:
+    environment = {
+        "HOME": str(tmp_path / "home"),
+        "XDG_CONFIG_HOME": str(tmp_path / "configuration"),
+        "XDG_STATE_HOME": str(tmp_path / "state"),
+    }
+
+    report = run_capture_doctor(
+        repository_path=tmp_path / "runs.sqlite3",
+        environ=environment,
+    )
+
+    assert type(report) is CaptureDoctorReport
+    assert report.capture.state is CaptureDoctorState.NOT_CONFIGURED
+    assert report.status is DoctorReportStatus.HEALTHY
+    assert tuple(tmp_path.rglob("*")) == ()
+    assert json.loads(render_capture_doctor_json(report)) == report.model_dump(mode="json")
+    assert "Passive capture (optional): Capture is not configured." in render_capture_doctor_human(
+        report
+    )
+
+
+def test_capture_doctor_authenticates_store_rows_without_writing(tmp_path: Path) -> None:
+    project, environment, database_path = _configured_capture(tmp_path)
+    before = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    ready = run_capture_doctor(
+        repository_path=tmp_path / "runs.sqlite3",
+        environ=environment,
+        capture_project=project,
+    )
+
+    assert ready.capture.state is CaptureDoctorState.READY
+    assert before == {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    connection = sqlite3.connect(database_path)
+    connection.execute("UPDATE connections SET row_tag = ?", ("0" * 64,))
+    connection.commit()
+    connection.close()
+
+    degraded = run_capture_doctor(
+        repository_path=tmp_path / "runs.sqlite3",
+        environ=environment,
+        capture_project=project,
+    )
+    assert degraded.capture.state is CaptureDoctorState.DEGRADED
+
+
+def test_capture_doctor_requires_the_configured_spool_boundary(tmp_path: Path) -> None:
+    project, environment, _database_path = _configured_capture(tmp_path)
+    locations = resolve_capture_store_locations(
+        environ=environment,
+        home=Path(environment["HOME"]),
+    )
+    shutil.rmtree(locations.spool_directory)
+
+    report = run_capture_doctor(
+        repository_path=tmp_path / "runs.sqlite3",
+        environ=environment,
+        capture_project=project,
+    )
+
+    assert report.capture.state is CaptureDoctorState.DEGRADED
+
+
+def test_capture_doctor_treats_dangling_runtime_symlinks_as_degraded(tmp_path: Path) -> None:
+    project = tmp_path / "capture-project"
+    project.mkdir()
+    environment = {
+        "HOME": str(tmp_path / "home"),
+        "XDG_CONFIG_HOME": str(tmp_path / "configuration"),
+        "XDG_STATE_HOME": str(tmp_path / "state"),
+    }
+    locations = resolve_capture_store_locations(
+        environ=environment,
+        home=Path(environment["HOME"]),
+    )
+    locations.state_directory.mkdir(mode=0o700, parents=True)
+    locations.database_path.symlink_to(tmp_path / "missing-database")
+
+    report = run_capture_doctor(
+        repository_path=tmp_path / "runs.sqlite3",
+        environ=environment,
+        capture_project=project,
+    )
+
+    assert report.capture.state is CaptureDoctorState.DEGRADED
+
+
+def test_capture_doctor_authenticates_spooled_intakes_without_writing(tmp_path: Path) -> None:
+    project, environment, _database_path = _configured_capture(tmp_path)
+    locations = resolve_capture_store_locations(
+        environ=environment,
+        home=Path(environment["HOME"]),
+    )
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    spool.enqueue(authenticated_intake("session_started", producer_index=1))
+    entry = next(locations.spool_directory.glob("*.capture-intake"))
+    entry.write_bytes(entry.read_bytes()[:-1] + b"x")
+    before = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in locations.spool_directory.iterdir()
+        if path.is_file()
+    }
+
+    report = run_capture_doctor(
+        repository_path=tmp_path / "runs.sqlite3",
+        environ=environment,
+        capture_project=project,
+    )
+
+    assert report.capture.state is CaptureDoctorState.DEGRADED
+    assert before == {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in locations.spool_directory.iterdir()
+        if path.is_file()
+    }
+
+
+def test_capture_doctor_reports_authenticated_drop_health_as_degraded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, environment, _database_path = _configured_capture(tmp_path)
+    locations = resolve_capture_store_locations(
+        environ=environment,
+        home=Path(environment["HOME"]),
+    )
+    monkeypatch.setattr(spool_module, "MAX_CAPTURE_SPOOL_EVENTS", 0)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    dropped = spool.enqueue(authenticated_intake("session_started", producer_index=1))
+    assert dropped.disposition == "dropped_quota"
+
+    report = run_capture_doctor(
+        repository_path=tmp_path / "runs.sqlite3",
+        environ=environment,
+        capture_project=project,
+    )
+
+    assert report.capture.state is CaptureDoctorState.DEGRADED
 
 
 def test_doctor_renderers_are_deterministic_and_do_not_write_streams(

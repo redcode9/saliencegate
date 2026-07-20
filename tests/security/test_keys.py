@@ -5,7 +5,7 @@ import stat
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from threading import Event
 
 import pytest
@@ -18,8 +18,33 @@ from saliencegate.security import (
     InvalidInstallationKeyError,
     default_installation_key_path,
     generate_installation_key,
+    load_installation_key,
     load_or_create_installation_key,
 )
+from saliencegate.security.windows import (
+    NativeWindowsSecurityOperations,
+    WindowsPathKind,
+    ensure_windows_private_directory,
+)
+
+
+def _write_private_key_fixture(path: Path, data: bytes) -> None:
+    if os.name == "nt":  # pragma: no cover - exercised by native Windows R01
+        operations = NativeWindowsSecurityOperations()
+        ensure_windows_private_directory(
+            PureWindowsPath(os.fspath(path.parent)),
+            operations=operations,
+        )
+        operations.publish_private_file(
+            PureWindowsPath(os.fspath(path)),
+            data,
+            maximum_bytes=max(1, len(data)),
+            validate_published=lambda current: current == data,
+        )
+        return
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_bytes(data)
+    path.chmod(0o600)
 
 
 @pytest.mark.parametrize("size", [0, 1, 31, 33, 64])
@@ -85,6 +110,22 @@ def test_key_file_is_created_once_and_reloaded(tmp_path: Path) -> None:
         assert stat.S_IMODE(path.with_name(f".{path.name}.lock").stat().st_mode) == 0o600
 
 
+def test_existing_key_loader_is_read_only_and_never_creates_parent_or_lock(tmp_path: Path) -> None:
+    missing = tmp_path / "missing" / "installation.key"
+
+    with pytest.raises(FileNotFoundError):
+        load_installation_key(missing)
+    assert not missing.parent.exists()
+
+    path = tmp_path / "private" / "installation.key"
+    _write_private_key_fixture(path, b"k" * 32)
+    before = path.stat()
+
+    assert load_installation_key(path) == InstallationKey(b"k" * 32)
+    assert path.stat().st_mtime_ns == before.st_mtime_ns
+    assert not path.with_name(f".{path.name}.lock").exists()
+
+
 def test_key_is_published_only_after_its_contents_are_synced(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -109,6 +150,8 @@ def test_concurrent_reader_waits_until_the_key_directory_is_synced(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if os.name != "posix":
+        pytest.skip("directory fsync scheduling is POSIX-specific")
     path = tmp_path / "keys" / "installation.key"
     sync_started = Event()
     release_sync = Event()
@@ -183,17 +226,29 @@ def test_symlink_key_lock_is_rejected(tmp_path: Path) -> None:
 
 
 def test_corrupt_key_file_is_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "installation.key"
-    path.write_bytes(b"too short")
-    path.chmod(0o600)
+    path = tmp_path / "private" / "installation.key"
+    _write_private_key_fixture(path, b"too short")
 
     with pytest.raises(InvalidInstallationKeyError, match="32 bytes"):
         load_or_create_installation_key(path)
 
 
 def test_non_regular_key_path_is_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "installation.key"
-    path.mkdir()
+    path = tmp_path / "private" / "installation.key"
+    if os.name == "nt":  # pragma: no cover - exercised by native Windows R01
+        operations = NativeWindowsSecurityOperations()
+        ensure_windows_private_directory(
+            PureWindowsPath(os.fspath(path.parent)),
+            operations=operations,
+        )
+        operations.create_private_path(
+            PureWindowsPath(os.fspath(path)),
+            WindowsPathKind.DIRECTORY,
+        )
+    else:
+        path.parent.mkdir(mode=0o700, parents=True)
+        path.parent.chmod(0o700)
+        path.mkdir()
 
     with pytest.raises(InsecureKeyFileError, match="regular file"):
         load_or_create_installation_key(path)
@@ -235,6 +290,8 @@ def test_failed_key_write_removes_the_partial_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if os.name != "posix":
+        pytest.skip("descriptor write failure injection is POSIX-specific")
     path = tmp_path / "keys" / "installation.key"
 
     def fail_write(_descriptor: int, _material: bytes) -> int:
@@ -245,3 +302,27 @@ def test_failed_key_write_removes_the_partial_file(
         load_or_create_installation_key(path)
     assert not path.exists()
     assert tuple(path.parent.glob("*.tmp")) == ()
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="native Win32 key security is the remote R01 gate",
+)
+def test_native_windows_key_directory_file_and_lock_are_owner_private(tmp_path: Path) -> None:
+    path = tmp_path / "keys" / "installation.key"
+
+    first = load_or_create_installation_key(path)
+    second = load_installation_key(path)
+
+    assert first == second
+    operations = NativeWindowsSecurityOperations()
+    for checked in (
+        path.parent,
+        path,
+        path.with_name(f".{path.name}.lock"),
+    ):
+        security = operations.inspect_path(PureWindowsPath(os.fspath(checked)))
+        assert security is not None
+        assert security.owner_private_dacl is True
+        assert security.hardlink_count == 1
+        assert security.reparse_tag is None

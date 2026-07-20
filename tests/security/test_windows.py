@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from pathlib import PureWindowsPath
+import os
+import subprocess
+from collections.abc import Callable
+from pathlib import Path, PureWindowsPath
 from typing import cast
 
 import pytest
 
 import saliencegate.security.windows as windows_module
 from saliencegate.security.windows import (
+    NativeWindowsSecurityOperations,
     WindowsFileIdentity,
     WindowsPathAuthorization,
     WindowsPathKind,
@@ -14,7 +18,9 @@ from saliencegate.security.windows import (
     WindowsSecurityError,
     WindowsSecurityOperations,
     WindowsStableFileRead,
+    authorize_windows_managed_path,
     authorize_windows_private_path,
+    ensure_windows_private_directory,
 )
 
 _OWNER_SID = "S-1-5-21-1000"
@@ -33,6 +39,8 @@ class _FakeWindowsOperations:
         self.owner_sid = owner_sid
         self.owner_calls = 0
         self.inspected: list[PureWindowsPath] = []
+        self.ancestor_inspected: list[PureWindowsPath] = []
+        self.ancestor_security: dict[PureWindowsPath, WindowsPathSecurity] = {}
         self.created: list[tuple[PureWindowsPath, WindowsPathKind]] = []
 
     def current_user_sid(self) -> str:
@@ -42,6 +50,26 @@ class _FakeWindowsOperations:
     def inspect_path(self, path: PureWindowsPath) -> WindowsPathSecurity | None:
         self.inspected.append(path)
         return self.security
+
+    def inspect_ancestor_directories(
+        self,
+        path: PureWindowsPath,
+    ) -> tuple[tuple[PureWindowsPath, WindowsPathSecurity], ...]:
+        self.ancestor_inspected.append(path)
+        return tuple(
+            (
+                ancestor,
+                self.ancestor_security.get(
+                    ancestor,
+                    _security(
+                        identity=_identity((index + 1).to_bytes(16, "little")),
+                        kind=WindowsPathKind.DIRECTORY,
+                        owner_private_dacl=False,
+                    ),
+                ),
+            )
+            for index, ancestor in enumerate(reversed(path.parents))
+        )
 
     def create_private_path(self, path: PureWindowsPath, kind: WindowsPathKind) -> None:
         self.created.append((path, kind))
@@ -56,14 +84,20 @@ def _security(
     identity: WindowsFileIdentity | None = None,
     kind: WindowsPathKind = WindowsPathKind.FILE,
     owner_sid: str = _OWNER_SID,
+    owner_private_dacl: bool = True,
+    owner_write_protected_dacl: bool = True,
+    owner_traversal_protected_dacl: bool = True,
+    reparse_tag: int | None = None,
 ) -> WindowsPathSecurity:
     return WindowsPathSecurity(
         identity=_identity() if identity is None else identity,
         kind=kind,
         owner_sid=owner_sid,
-        owner_private_dacl=True,
+        owner_private_dacl=owner_private_dacl,
+        owner_write_protected_dacl=owner_write_protected_dacl,
+        owner_traversal_protected_dacl=owner_traversal_protected_dacl,
         hardlink_count=1,
-        reparse_tag=None,
+        reparse_tag=reparse_tag,
     )
 
 
@@ -158,6 +192,8 @@ def test_windows_file_identity_rejects_invalid_types_and_bounds(
         ("kind", "file"),
         ("owner_sid", "not-a-sid"),
         ("owner_private_dacl", 1),
+        ("owner_write_protected_dacl", 1),
+        ("owner_traversal_protected_dacl", 1),
         ("hardlink_count", True),
         ("hardlink_count", 0),
         ("hardlink_count", 1 << 32),
@@ -175,6 +211,8 @@ def test_windows_path_security_rejects_invalid_types_and_bounds(
         "kind": WindowsPathKind.FILE,
         "owner_sid": _OWNER_SID,
         "owner_private_dacl": True,
+        "owner_write_protected_dacl": True,
+        "owner_traversal_protected_dacl": True,
         "hardlink_count": 1,
         "reparse_tag": None,
     }
@@ -186,6 +224,14 @@ def test_windows_path_security_rejects_invalid_types_and_bounds(
             kind=cast(WindowsPathKind, values["kind"]),
             owner_sid=cast(str, values["owner_sid"]),
             owner_private_dacl=cast(bool, values["owner_private_dacl"]),
+            owner_write_protected_dacl=cast(
+                bool,
+                values["owner_write_protected_dacl"],
+            ),
+            owner_traversal_protected_dacl=cast(
+                bool,
+                values["owner_traversal_protected_dacl"],
+            ),
             hardlink_count=cast(int, values["hardlink_count"]),
             reparse_tag=cast(int | None, values["reparse_tag"]),
         )
@@ -277,7 +323,7 @@ def test_windows_authorizer_rejects_relative_device_and_reserved_paths(
 
 def test_windows_authorizer_rejects_wrong_argument_types_before_operations() -> None:
     operations = _FakeWindowsOperations(_security())
-    invocations = (
+    invocations: tuple[Callable[[], object], ...] = (
         lambda: authorize_windows_private_path(
             cast(PureWindowsPath, r"C:\provider-native-secret\capture.bin"),
             kind=WindowsPathKind.FILE,
@@ -345,6 +391,85 @@ def test_windows_authorizer_requires_create_for_a_missing_path() -> None:
     _assert_content_free(captured.value, "synthetic")
 
 
+def test_windows_private_directory_creation_rejects_an_intermediate_reparse_before_write() -> None:
+    existing = PureWindowsPath(r"C:\Users\synthetic")
+    target = existing / "capture" / "provider"
+    managed = _security(
+        kind=WindowsPathKind.DIRECTORY,
+        owner_private_dacl=False,
+        owner_write_protected_dacl=True,
+    )
+
+    class MissingSuffixOperations(_FakeWindowsOperations):
+        def inspect_path(self, path: PureWindowsPath) -> WindowsPathSecurity | None:
+            self.inspected.append(path)
+            return managed if path == existing else None
+
+    operations = MissingSuffixOperations(None)
+    operations.ancestor_security[PureWindowsPath(r"C:\Users")] = _security(
+        kind=WindowsPathKind.DIRECTORY,
+        reparse_tag=0xA000000C,
+    )
+
+    with pytest.raises(WindowsSecurityError):
+        ensure_windows_private_directory(target, operations=operations)
+
+    assert operations.created == []
+
+
+def test_windows_managed_authorizer_accepts_readable_but_write_protected_dacl() -> None:
+    managed = _security(
+        owner_private_dacl=False,
+        owner_write_protected_dacl=True,
+    )
+    operations = _FakeWindowsOperations(managed)
+
+    authorization = authorize_windows_managed_path(
+        _PATH,
+        kind=WindowsPathKind.FILE,
+        operations=operations,
+    )
+    authorization.revalidate()
+
+    with pytest.raises(WindowsSecurityError):
+        authorize_windows_private_path(
+            _PATH,
+            kind=WindowsPathKind.FILE,
+            operations=operations,
+        )
+
+
+def test_windows_managed_authorizer_rejects_an_untrusted_writable_dacl() -> None:
+    operations = _FakeWindowsOperations(
+        _security(
+            owner_private_dacl=False,
+            owner_write_protected_dacl=False,
+        )
+    )
+
+    with pytest.raises(WindowsSecurityError) as captured:
+        authorize_windows_managed_path(
+            _PATH,
+            kind=WindowsPathKind.FILE,
+            operations=operations,
+        )
+
+    _assert_content_free(captured.value, "synthetic")
+
+
+def test_windows_private_dacl_cannot_claim_an_unprotected_write_policy() -> None:
+    with pytest.raises(WindowsSecurityError):
+        _security(
+            owner_private_dacl=True,
+            owner_write_protected_dacl=False,
+        )
+
+
+def test_windows_write_protected_dacl_cannot_claim_unsafe_traversal() -> None:
+    with pytest.raises(WindowsSecurityError):
+        _security(owner_traversal_protected_dacl=False)
+
+
 def test_windows_path_authorization_rejects_a_forged_capability() -> None:
     security = _security()
     operations = _FakeWindowsOperations(security)
@@ -378,3 +503,116 @@ def test_windows_authorization_rejects_owner_sid_changes(mutation: str) -> None:
     assert authorization.security.owner_sid == _OWNER_SID
     assert operations.created == []
     _assert_content_free(captured.value, "synthetic")
+
+
+def test_windows_authorization_rejects_intermediate_ancestor_substitution() -> None:
+    authorization, operations = _authorization()
+    intermediate = PureWindowsPath(r"C:\Users\synthetic")
+    original_target_identity = authorization.security.identity
+    operations.ancestor_security[intermediate] = _security(
+        identity=_identity(b"substituted-path"),
+        kind=WindowsPathKind.DIRECTORY,
+        owner_private_dacl=False,
+    )
+
+    with pytest.raises(WindowsSecurityError) as captured:
+        authorization.revalidate()
+
+    assert operations.security is not None
+    assert operations.security.identity == original_target_identity
+    _assert_content_free(captured.value, "synthetic")
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="native Win32 atomic publication is the remote R01 gate",
+)
+def test_native_windows_private_file_publication_read_lock_and_delete(
+    tmp_path: Path,
+) -> None:
+    operations = NativeWindowsSecurityOperations()
+    directory = PureWindowsPath(str(tmp_path / "native-private-publication"))
+    authorize_windows_private_path(
+        directory,
+        kind=WindowsPathKind.DIRECTORY,
+        operations=operations,
+        create=True,
+    ).revalidate()
+    target = directory / "owned.bin"
+
+    first = operations.publish_private_file(
+        target,
+        b"first",
+        maximum_bytes=64,
+        validate_published=lambda current: current == b"first",
+    )
+    assert first.data == b"first"
+    first.authorization.revalidate()
+
+    with pytest.raises(WindowsSecurityError):
+        operations.publish_private_file(
+            target,
+            b"forged",
+            maximum_bytes=64,
+            validate_replacement=lambda current: current == b"other",
+        )
+    assert operations.read_private_file(target, maximum_bytes=64).data == b"first"
+
+    replaced = operations.publish_private_file(
+        target,
+        b"second",
+        maximum_bytes=64,
+        validate_replacement=lambda current: current == b"first",
+        validate_published=lambda current: current == b"second",
+    )
+    assert replaced.data == b"second"
+    with operations.private_file_lock(directory / "owned.lock"):
+        assert operations.read_private_file(target, maximum_bytes=64).data == b"second"
+
+    current = operations.read_private_file(target, maximum_bytes=64)
+    operations.delete_authorized_file(current.authorization)
+    assert operations.inspect_path(target) is None
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="native intermediate-junction substitution is the remote R01 gate",
+)
+def test_native_windows_authorization_rejects_intermediate_junction_substitution(
+    tmp_path: Path,
+) -> None:
+    operations = NativeWindowsSecurityOperations()
+    root = PureWindowsPath(str(tmp_path / "native-ancestor-chain"))
+    first = root / "first"
+    second = first / "second"
+    for directory in (root, first, second):
+        authorize_windows_private_path(
+            directory,
+            kind=WindowsPathKind.DIRECTORY,
+            operations=operations,
+            create=True,
+        ).revalidate()
+    target = second / "owned.bin"
+    stable = operations.publish_private_file(
+        target,
+        b"stable",
+        maximum_bytes=64,
+        validate_published=lambda current: current == b"stable",
+    )
+    moved = PureWindowsPath(str(tmp_path / "moved-native-ancestor"))
+    os.rename(first, moved)
+    subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(first), str(moved)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        current = operations.inspect_path(target)
+        assert current is not None
+        assert current.identity == stable.authorization.security.identity
+        with pytest.raises(WindowsSecurityError):
+            stable.authorization.revalidate()
+    finally:
+        os.rmdir(first)
+        os.rename(moved, first)

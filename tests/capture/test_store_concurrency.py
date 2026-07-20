@@ -282,7 +282,7 @@ def _initialize_enabled_fault_store(path: Path) -> None:
         path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=5_000,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as store:
         register_connection(store)
 
@@ -300,7 +300,7 @@ def test_sixteen_processes_append_1600_events_with_contiguous_authenticated_chai
         path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=60_000,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as coordinator:
         register_connection(coordinator)
         results = _run_workers(path)
@@ -398,10 +398,17 @@ def test_primary_sqlite_busy_is_bounded_classified_and_leaves_no_partial_event(
     with CaptureStore.open(
         path,
         installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.MAINTENANCE,
+    ) as maintenance:
+        register_connection(maintenance)
+
+    with CaptureStore.open(
+        path,
+        installation_key=INSTALLATION_KEY,
         busy_timeout_ms=25,
         mode=CaptureStoreMode.HOOK,
     ) as store:
-        register_connection(store)
         blocker = sqlite3.connect(path, isolation_level=None)
         try:
             blocker.execute("BEGIN IMMEDIATE")

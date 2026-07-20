@@ -9,13 +9,21 @@ from contextlib import suppress
 from enum import StrEnum
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Literal, Self
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from saliencegate.capture import CaptureSpool, CaptureStore, resolve_capture_store_locations
 from saliencegate.domain import canonical_json
-from saliencegate.security import default_installation_key_path
+from saliencegate.security import (
+    InstallationKey,
+    default_installation_key_path,
+    load_installation_key,
+)
+
+if TYPE_CHECKING:
+    from saliencegate.commands.capture.connect import ProviderSpecResolver
 
 DOCTOR_SCHEMA_VERSION: Literal["doctor/v1"] = "doctor/v1"
 MINIMUM_PYTHON_VERSION = (3, 11, 0)
@@ -143,6 +151,56 @@ class DoctorReport(_DoctorModel):
         expected_ok = expected_status is not DoctorReportStatus.UNHEALTHY
         if self.status is not expected_status or self.ok is not expected_ok:
             raise ValueError("doctor report summary does not match its checks")
+        return self
+
+
+class CaptureDoctorState(StrEnum):
+    NOT_CONFIGURED = "not_configured"
+    READY = "ready"
+    DEGRADED = "degraded"
+
+
+class CaptureDoctorCheck(_DoctorModel):
+    schema_version: Literal["capture-doctor-check/v1"] = "capture-doctor-check/v1"
+    state: CaptureDoctorState
+    status: DoctorCheckStatus
+    required: bool
+    message: Annotated[str, Field(min_length=1, max_length=256)]
+
+    @model_validator(mode="after")
+    def state_matches_status(self) -> Self:
+        expected = {
+            CaptureDoctorState.NOT_CONFIGURED: (DoctorCheckStatus.SKIP, False),
+            CaptureDoctorState.READY: (DoctorCheckStatus.PASS, True),
+            CaptureDoctorState.DEGRADED: (DoctorCheckStatus.FAIL, True),
+        }[self.state]
+        if (self.status, self.required) != expected:
+            raise ValueError("capture doctor state is inconsistent")
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in self.message):
+            raise ValueError("capture doctor message cannot contain control characters")
+        return self
+
+
+class CaptureDoctorReport(_DoctorModel):
+    schema_version: Literal["capture-doctor/v1"] = "capture-doctor/v1"
+    status: DoctorReportStatus
+    ok: bool
+    environment: DoctorReport
+    capture: CaptureDoctorCheck
+
+    @model_validator(mode="after")
+    def summary_matches_environment_and_capture(self) -> Self:
+        if (
+            self.environment.status is DoctorReportStatus.UNHEALTHY
+            or self.capture.status is DoctorCheckStatus.FAIL
+        ):
+            expected = DoctorReportStatus.UNHEALTHY
+        elif self.environment.status is DoctorReportStatus.DEGRADED:
+            expected = DoctorReportStatus.DEGRADED
+        else:
+            expected = DoctorReportStatus.HEALTHY
+        if self.status is not expected or self.ok != (expected is not DoctorReportStatus.UNHEALTHY):
+            raise ValueError("capture doctor report summary is inconsistent")
         return self
 
 
@@ -565,6 +623,219 @@ def run_doctor(
     )
 
 
+def _capture_not_configured() -> CaptureDoctorCheck:
+    return CaptureDoctorCheck(
+        state=CaptureDoctorState.NOT_CONFIGURED,
+        status=DoctorCheckStatus.SKIP,
+        required=False,
+        message="Capture is not configured.",
+    )
+
+
+def _capture_degraded() -> CaptureDoctorCheck:
+    return CaptureDoctorCheck(
+        state=CaptureDoctorState.DEGRADED,
+        status=DoctorCheckStatus.FAIL,
+        required=True,
+        message="Capture state failed a read-only integrity check.",
+    )
+
+
+def _capture_installation_observation(
+    *,
+    project: str | os.PathLike[str] | Path | None,
+    installation_key: InstallationKey,
+    spec_resolver: ProviderSpecResolver | None,
+    capture_executable: str | os.PathLike[str] | Path | None,
+) -> tuple[bool, bool]:
+    from saliencegate.commands.capture.common import (
+        CaptureCommandUnavailableError,
+        resolve_capture_project,
+    )
+    from saliencegate.commands.capture.connect import (
+        inspect_project_provider_installation,
+    )
+    from saliencegate.integrations.installation import InstallationState
+    from saliencegate.integrations.registry import ProviderAlias
+
+    if type(installation_key) is not InstallationKey:
+        raise TypeError
+    capture_project = resolve_capture_project(project)
+    configured = False
+    drifted = False
+    for alias in ProviderAlias:
+        try:
+            installation = inspect_project_provider_installation(
+                alias,
+                capture_project,
+                installation_key,
+                resolver=spec_resolver,
+                capture_executable=capture_executable,
+            )
+        except CaptureCommandUnavailableError:
+            continue
+        configured = configured or installation.state is InstallationState.ENABLED
+        configured = configured or bool(installation.drift)
+        drifted = drifted or bool(installation.drift)
+    return configured, drifted
+
+
+def _capture_artifacts_present(
+    *,
+    project: str | os.PathLike[str] | Path | None,
+    spec_resolver: ProviderSpecResolver | None,
+) -> bool:
+    from saliencegate.commands.capture.common import (
+        CaptureCommandUnavailableError,
+        resolve_capture_project,
+    )
+    from saliencegate.commands.capture.connect import project_provider_artifacts_present
+    from saliencegate.integrations.registry import ProviderAlias
+
+    capture_project = resolve_capture_project(project)
+    for alias in ProviderAlias:
+        try:
+            if project_provider_artifacts_present(
+                alias,
+                capture_project,
+                resolver=spec_resolver,
+            ):
+                return True
+        except CaptureCommandUnavailableError:
+            continue
+    return False
+
+
+def _check_capture_state(
+    *,
+    installation_key_path: Path | None,
+    environ: Mapping[str, str] | None,
+    project: str | os.PathLike[str] | Path | None,
+    spec_resolver: ProviderSpecResolver | None,
+    capture_executable: str | os.PathLike[str] | Path | None,
+) -> CaptureDoctorCheck:
+    """Inspect capture locations without opening mutable SQLite or spool handles."""
+
+    try:
+        environment = os.environ if environ is None else environ
+        if not isinstance(environment, Mapping):
+            raise TypeError
+        configured_home = environment.get("HOME")
+        home = Path.home() if configured_home is None else Path(configured_home).expanduser()
+        locations = resolve_capture_store_locations(environ=environment, home=home)
+        key_path = (
+            default_installation_key_path(environ=environment)
+            if installation_key_path is None
+            else Path(installation_key_path).expanduser()
+        )
+        try:
+            locations.database_path.lstat()
+            database_exists = True
+        except FileNotFoundError:
+            database_exists = False
+        try:
+            locations.spool_directory.lstat()
+            spool_exists = True
+        except FileNotFoundError:
+            spool_exists = False
+        try:
+            key_path.lstat()
+            key_exists = True
+        except FileNotFoundError:
+            key_exists = False
+        if not database_exists and not spool_exists:
+            if not key_exists:
+                return (
+                    _capture_degraded()
+                    if _capture_artifacts_present(
+                        project=project,
+                        spec_resolver=spec_resolver,
+                    )
+                    else _capture_not_configured()
+                )
+            installation_key = load_installation_key(key_path)
+            configured, _drifted = _capture_installation_observation(
+                project=project,
+                installation_key=installation_key,
+                spec_resolver=spec_resolver,
+                capture_executable=capture_executable,
+            )
+            return _capture_degraded() if configured else _capture_not_configured()
+        if not database_exists or not spool_exists or not key_exists:
+            return _capture_degraded()
+        installation_key = load_installation_key(key_path)
+        CaptureStore.audit_read_only(
+            locations.database_path,
+            installation_key=installation_key,
+        )
+        spool_health = CaptureSpool.audit_read_only(
+            locations,
+            installation_key=installation_key,
+        )
+        if spool_health.coverage_degraded:
+            return _capture_degraded()
+        _configured, drifted = _capture_installation_observation(
+            project=project,
+            installation_key=installation_key,
+            spec_resolver=spec_resolver,
+            capture_executable=capture_executable,
+        )
+        if drifted:
+            return _capture_degraded()
+        return CaptureDoctorCheck(
+            state=CaptureDoctorState.READY,
+            status=DoctorCheckStatus.PASS,
+            required=True,
+            message="Capture store and local boundaries passed read-only checks.",
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return _capture_degraded()
+
+
+def run_capture_doctor(
+    *,
+    repository_path: str | Path = Path("saliencegate.sqlite3"),
+    installation_key_path: Path | None = None,
+    endpoint: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    capture_project: str | os.PathLike[str] | Path | None = None,
+    capture_spec_resolver: ProviderSpecResolver | None = None,
+    capture_executable: str | os.PathLike[str] | Path | None = None,
+) -> CaptureDoctorReport:
+    """Run the existing checks plus a strictly read-only passive capture probe."""
+
+    environment = run_doctor(
+        repository_path=repository_path,
+        installation_key_path=installation_key_path,
+        endpoint=endpoint,
+        environ=environ,
+    )
+    capture = _check_capture_state(
+        installation_key_path=installation_key_path,
+        environ=environ,
+        project=capture_project,
+        spec_resolver=capture_spec_resolver,
+        capture_executable=capture_executable,
+    )
+    if (
+        environment.status is DoctorReportStatus.UNHEALTHY
+        or capture.status is DoctorCheckStatus.FAIL
+    ):
+        status = DoctorReportStatus.UNHEALTHY
+    elif environment.status is DoctorReportStatus.DEGRADED:
+        status = DoctorReportStatus.DEGRADED
+    else:
+        status = DoctorReportStatus.HEALTHY
+    return CaptureDoctorReport(
+        status=status,
+        ok=status is not DoctorReportStatus.UNHEALTHY,
+        environment=environment,
+        capture=capture,
+    )
+
+
 def render_doctor_json(report: DoctorReport) -> str:
     """Render one canonical machine record; the caller owns stdout."""
 
@@ -586,8 +857,33 @@ def render_doctor_human(report: DoctorReport) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_capture_doctor_json(report: CaptureDoctorReport) -> str:
+    checked = CaptureDoctorReport.model_validate(report)
+    return canonical_json(checked.model_dump(mode="json", warnings=False)).decode("utf-8") + "\n"
+
+
+def render_capture_doctor_human(report: CaptureDoctorReport) -> str:
+    checked = CaptureDoctorReport.model_validate(report)
+    lines = [f"SalienceGate doctor: {checked.status.value}"]
+    for check in checked.environment.checks:
+        requirement = "required" if check.required else "optional"
+        lines.append(
+            f"[{check.status.value.upper()}] {_DISPLAY_NAMES[check.name]} "
+            f"({requirement}): {check.message}"
+        )
+    requirement = "required" if checked.capture.required else "optional"
+    lines.append(
+        f"[{checked.capture.status.value.upper()}] Passive capture "
+        f"({requirement}): {checked.capture.message}"
+    )
+    return "\n".join(lines) + "\n"
+
+
 __all__ = [
     "DOCTOR_SCHEMA_VERSION",
+    "CaptureDoctorCheck",
+    "CaptureDoctorReport",
+    "CaptureDoctorState",
     "DoctorCheck",
     "DoctorCheckName",
     "DoctorCheckStatus",
@@ -595,8 +891,11 @@ __all__ = [
     "DoctorReportStatus",
     "DoctorSeverity",
     "PilotEndpointError",
+    "render_capture_doctor_human",
+    "render_capture_doctor_json",
     "render_doctor_human",
     "render_doctor_json",
+    "run_capture_doctor",
     "run_doctor",
     "validated_pilot_endpoint",
 ]

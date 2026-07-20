@@ -246,11 +246,23 @@ def test_store_public_guards_fail_closed_without_partial_state(tmp_path: Path) -
         with pytest.raises(CaptureStoreError):
             invalid_open()
 
+    with (
+        CaptureStore.open(
+            path,
+            installation_key=INSTALLATION_KEY,
+            busy_timeout_ms=250,
+            mode=CaptureStoreMode.HOOK,
+        ) as store,
+        pytest.raises(CaptureStoreStateError),
+    ):
+        _registration(store)
+    assert _row_count(path, "connections") == 0
+
     with CaptureStore.open(
         path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as store:
         with pytest.raises(CaptureStoreStateError):
             store.register_connection(
@@ -277,7 +289,92 @@ def test_store_public_guards_fail_closed_without_partial_state(tmp_path: Path) -
         with pytest.raises(CaptureStoreStateError):
             store.verify_session(CONNECTION_ID, "f" * 64)
 
+    with (
+        CaptureStore.open(
+            path,
+            installation_key=INSTALLATION_KEY,
+            busy_timeout_ms=250,
+            mode=CaptureStoreMode.HOOK,
+        ) as hook,
+        pytest.raises(CaptureStoreStateError),
+    ):
+        hook.transition_connection(
+            CONNECTION_ID,
+            expected_state=CaptureConnectionState.ENABLED,
+            target_state=CaptureConnectionState.DRAINING,
+        )
+
     assert _row_count(path, "capture_sessions") == 0
+
+
+def test_hook_open_defers_the_full_audit_but_maintenance_open_performs_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "mode-audit.sqlite3"
+    initialize_capture_store(path)
+    calls: list[bool] = []
+    original = CaptureStore._verify_all_state
+
+    def recording_verify_all_state(
+        self: CaptureStore,
+        *,
+        immutable: bool = False,
+    ) -> None:
+        calls.append(immutable)
+        original(self, immutable=immutable)
+
+    monkeypatch.setattr(CaptureStore, "_verify_all_state", recording_verify_all_state)
+    with CaptureStore.open(
+        path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.HOOK,
+    ):
+        pass
+    assert calls == []
+
+    with CaptureStore.open(
+        path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.MAINTENANCE,
+    ):
+        pass
+    assert calls == [False]
+
+
+def test_hook_append_verifies_only_the_authenticated_session_tip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "append-tip.sqlite3"
+    initialize_capture_store(path)
+    with CaptureStore.open(
+        path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.MAINTENANCE,
+    ) as maintenance:
+        register_connection(maintenance)
+    with CaptureStore.open(
+        path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.HOOK,
+    ) as store:
+        first = authenticated_intake("session_started", producer_index=1)
+        assert store.append(first).receipt_ordinal == 1
+
+        def reject_full_chain(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("the hook append path performed a full-chain audit")
+
+        monkeypatch.setattr(CaptureStore, "_verify_chain", reject_full_chain)
+        second = authenticated_intake("turn_finished", producer_index=2)
+        receipt = store.append(second)
+
+    assert receipt.receipt_ordinal == 2
+    assert receipt.previous_event_tag is not None
 
 
 def test_append_rejects_an_intake_bound_to_a_different_profile_without_mutation(
@@ -629,7 +726,7 @@ def test_health_counters_are_idempotently_identified_authenticated_and_never_rep
             path,
             installation_key=INSTALLATION_KEY,
             busy_timeout_ms=250,
-            mode=CaptureStoreMode.HOOK,
+            mode=CaptureStoreMode.MAINTENANCE,
         )
     connection = sqlite3.connect(path)
     try:
@@ -657,7 +754,7 @@ def test_valid_health_reopens_and_live_tampering_rolls_back_repeated_collision(
         path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as store:
         assert store.verify_session(CONNECTION_ID, original.session_id).event_count == 1
         connection = sqlite3.connect(path)
@@ -782,7 +879,7 @@ def test_repeated_health_updates_keep_set_count_stable_and_change_authenticated_
         path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as reopened:
         assert reopened.verify_session(CONNECTION_ID, original.session_id).event_count == 1
 
@@ -878,7 +975,7 @@ def test_pending_draining_closed_and_missing_sessions_fail_without_partial_rows(
         path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as store:
         _registration(store)
         start = authenticated_intake("session_started")
@@ -914,7 +1011,7 @@ def test_wrong_authentication_key_and_database_tampering_fail_without_repair(
         path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as store:
         register_connection(store)
         unsigned = unauthenticated_intake("session_started")
@@ -943,7 +1040,7 @@ def test_wrong_authentication_key_and_database_tampering_fail_without_repair(
             path,
             installation_key=WRONG_INSTALLATION_KEY,
             busy_timeout_ms=250,
-            mode=CaptureStoreMode.HOOK,
+            mode=CaptureStoreMode.MAINTENANCE,
         )
     connection = sqlite3.connect(path)
     try:
@@ -969,7 +1066,7 @@ def test_wrong_authentication_key_and_database_tampering_fail_without_repair(
             path,
             installation_key=INSTALLATION_KEY,
             busy_timeout_ms=250,
-            mode=CaptureStoreMode.HOOK,
+            mode=CaptureStoreMode.MAINTENANCE,
         )
     connection = sqlite3.connect(path)
     try:
@@ -1072,7 +1169,7 @@ def test_concurrent_close_and_verify_session_never_exposes_raw_sqlite(
         path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     )
     register_connection(store)
     store.append(intake)

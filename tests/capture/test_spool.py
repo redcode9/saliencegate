@@ -19,7 +19,9 @@ from tests.capture.store_support import (
 )
 
 import saliencegate.capture.spool as spool_module
+from saliencegate.capture.delete import delete_capture_session
 from saliencegate.capture.locations import resolve_capture_store_locations
+from saliencegate.capture.migrations import initialize_capture_store
 from saliencegate.capture.schema import (
     CaptureIntake,
     canonical_capture_intake,
@@ -37,8 +39,12 @@ from saliencegate.capture.spool import (
     verify_capture_spool_observation,
 )
 from saliencegate.capture.store import (
+    CaptureAppendDisposition,
+    CaptureSessionState,
+    CaptureStore,
     CaptureStoreBusyError,
     CaptureStoreIntegrityError,
+    CaptureStoreMode,
     CaptureStoreStateError,
 )
 from saliencegate.domain import canonical_json
@@ -58,6 +64,10 @@ def _locations(tmp_path: Path, name: str = "state"):
 
 def _entries(spool_directory: Path) -> tuple[Path, ...]:
     return tuple(sorted(spool_directory.glob("*.capture-intake")))
+
+
+def _markers(spool_directory: Path) -> tuple[Path, ...]:
+    return tuple(sorted(spool_directory.glob("*.capture-session")))
 
 
 def _framed_intake(path: Path) -> bytes:
@@ -90,6 +100,18 @@ class _AppendOutcomeStore:
         return self.outcome
 
 
+class _BusyThenSuccessStore:
+    def __init__(self, receipt: object) -> None:
+        self.receipt = receipt
+        self.calls = 0
+
+    def append(self, _intake: CaptureIntake) -> object:
+        self.calls += 1
+        if self.calls == 1:
+            raise CaptureStoreBusyError()
+        return self.receipt
+
+
 class _DelayedFailureStore:
     def __init__(self, error: BaseException, *, fail_on_call: int) -> None:
         self.error = error
@@ -102,6 +124,33 @@ class _DelayedFailureStore:
         if self.calls == self.fail_on_call:
             raise self.error
         self.received.append(intake)
+        return object()
+
+
+class _BlockingBusyStore:
+    def __init__(self, entered: Event, release: Event) -> None:
+        self.entered = entered
+        self.release = release
+        self.calls = 0
+
+    def append(self, _intake: CaptureIntake) -> object:
+        self.calls += 1
+        if self.calls == 1:
+            self.entered.set()
+            assert self.release.wait(timeout=2)
+        raise CaptureStoreBusyError()
+
+
+class _BlockingSuccessStore:
+    def __init__(self, entered: Event, release: Event) -> None:
+        self.entered = entered
+        self.release = release
+        self.calls = 0
+
+    def append(self, _intake: CaptureIntake) -> object:
+        self.calls += 1
+        self.entered.set()
+        assert self.release.wait(timeout=2)
         return object()
 
 
@@ -142,6 +191,267 @@ def _assert_content_free_observation_error(
 def test_spool_v1_limits_are_fixed_per_installation() -> None:
     assert MAX_CAPTURE_SPOOL_BYTES == 32 * 1_024 * 1_024
     assert MAX_CAPTURE_SPOOL_EVENTS == 10_000
+
+
+def test_read_only_audit_never_creates_a_missing_spool_boundary(tmp_path: Path) -> None:
+    locations = _locations(tmp_path)
+
+    with pytest.raises(CaptureSpoolError):
+        CaptureSpool.audit_read_only(locations, installation_key=INSTALLATION_KEY)
+
+    assert not locations.state_directory.exists()
+    assert not locations.spool_directory.exists()
+
+
+def test_read_only_audit_authenticates_an_empty_spool_without_creating_a_lock(
+    tmp_path: Path,
+) -> None:
+    locations = _locations(tmp_path)
+    CaptureSpool.open(locations, INSTALLATION_KEY)
+    before = tuple(sorted(path.name for path in locations.spool_directory.iterdir()))
+
+    health = CaptureSpool.audit_read_only(locations, installation_key=INSTALLATION_KEY)
+
+    assert health == spool_module.CaptureSpoolHealth(
+        queued_events=0,
+        queued_bytes=0,
+        dropped_events=0,
+        coverage_degraded=False,
+        last_drop_reason=None,
+    )
+    assert tuple(sorted(path.name for path in locations.spool_directory.iterdir())) == before
+    assert not (locations.spool_directory / ".capture-spool-lock").exists()
+
+
+def test_read_only_audit_authenticates_queued_intakes_and_drop_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(spool_module, "MAX_CAPTURE_SPOOL_EVENTS", 1)
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    assert spool.enqueue(authenticated_intake("session_started", producer_index=1)).disposition == (
+        "queued"
+    )
+    finished = authenticated_intake("session_finished", producer_index=2)
+    assert spool.enqueue(finished).disposition == "dropped_quota"
+
+    health = CaptureSpool.audit_read_only(locations, installation_key=INSTALLATION_KEY)
+
+    assert health.queued_events == 1
+    assert health.queued_bytes > 0
+    assert health.dropped_events == 1
+    assert health.coverage_degraded is True
+    assert health.last_drop_reason == "spool_quota"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private spool boundaries require POSIX")
+@pytest.mark.parametrize("mutation", ("entry", "marker", "health", "unexpected", "lock"))
+def test_read_only_audit_rejects_tampered_or_unexpected_spool_state_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    if mutation == "entry":
+        spool.enqueue(authenticated_intake("session_started", producer_index=1))
+        target = _entries(locations.spool_directory)[0]
+        target.write_bytes(target.read_bytes()[:-1] + b"x")
+    elif mutation == "marker":
+        spool.enqueue(authenticated_intake("session_started", producer_index=1))
+        target = _markers(locations.spool_directory)[0]
+        target.write_bytes(target.read_bytes()[:-1] + b"x")
+    elif mutation == "health":
+        monkeypatch.setattr(spool_module, "MAX_CAPTURE_SPOOL_EVENTS", 0)
+        spool.enqueue(authenticated_intake("session_started", producer_index=1))
+        target = locations.spool_directory / ".capture-spool-health"
+        target.write_bytes(target.read_bytes()[:-1] + b"x")
+    elif mutation == "unexpected":
+        target = locations.spool_directory / "unexpected-private-child"
+        target.write_bytes(b"unexpected")
+        target.chmod(0o600)
+    else:
+        spool.health()
+        target = locations.spool_directory / ".capture-spool-lock"
+        target.chmod(0o644)
+    preserved = target.read_bytes()
+
+    with pytest.raises(CaptureSpoolError):
+        CaptureSpool.audit_read_only(locations, installation_key=INSTALLATION_KEY)
+
+    assert target.read_bytes() == preserved
+
+
+def test_read_only_audit_detects_a_health_marker_created_during_its_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locations = _locations(tmp_path)
+    CaptureSpool.open(locations, INSTALLATION_KEY)
+    real_drop_state = CaptureSpool._drop_state_record
+
+    def create_health_after_absent_read(
+        spool: CaptureSpool,
+        directory_fd: int | None,
+    ) -> tuple[int, str | None, str | None, object | None]:
+        state = real_drop_state(spool, directory_fd)
+        spool._write_drop_state(1, "spool_quota", directory_fd)
+        return state
+
+    monkeypatch.setattr(CaptureSpool, "_drop_state_record", create_health_after_absent_read)
+
+    with pytest.raises(CaptureSpoolIntegrityError):
+        CaptureSpool.audit_read_only(locations, installation_key=INSTALLATION_KEY)
+
+    assert (locations.spool_directory / ".capture-spool-health").exists()
+
+
+def test_health_drain_and_audit_reject_a_queued_entry_without_its_marker(
+    tmp_path: Path,
+) -> None:
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    spool.enqueue(authenticated_intake("session_started", producer_index=1))
+    _markers(locations.spool_directory)[0].unlink()
+
+    with pytest.raises(CaptureSpoolIntegrityError):
+        spool.health()
+    with pytest.raises(CaptureSpoolIntegrityError):
+        spool.drain(_RecordingStore())
+    with pytest.raises(CaptureSpoolIntegrityError):
+        CaptureSpool.audit_read_only(locations, installation_key=INSTALLATION_KEY)
+
+
+def test_authenticated_orphan_marker_is_degraded_then_cleaned_by_drain(
+    tmp_path: Path,
+) -> None:
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    spool.enqueue(authenticated_intake("session_started", producer_index=1))
+    _entries(locations.spool_directory)[0].unlink()
+
+    health = spool.health()
+    audited = CaptureSpool.audit_read_only(locations, installation_key=INSTALLATION_KEY)
+
+    assert health == audited
+    assert health.queued_events == 0
+    assert health.dropped_events == 1
+    assert health.coverage_degraded is True
+    assert health.last_drop_reason == "spool_incomplete"
+    assert len(_markers(locations.spool_directory)) == 1
+    assert not (locations.spool_directory / ".capture-spool-health").exists()
+
+    store = _RecordingStore()
+    drained = spool.drain(store)
+
+    assert drained.admitted_events == drained.remaining_events == 0
+    assert store.received == []
+    assert _markers(locations.spool_directory) == ()
+    assert (locations.spool_directory / ".capture-spool-health").exists()
+    persisted = spool.health()
+    assert persisted.dropped_events == 1
+    assert persisted.coverage_degraded is True
+    assert persisted.last_drop_reason == "spool_incomplete"
+
+
+def test_authenticated_orphan_marker_blocks_direct_same_session_admission(
+    tmp_path: Path,
+) -> None:
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    spool.enqueue(authenticated_intake("action_started", producer_index=2))
+    _entries(locations.spool_directory)[0].unlink()
+    store = _AppendOutcomeStore(object())
+    finished = authenticated_intake("session_finished", producer_index=3)
+
+    receipt = spool.admit(store, finished)
+
+    assert getattr(receipt, "disposition", None) == "queued"
+    assert store.calls == 0
+    assert _queued_intakes(locations.spool_directory) == (finished,)
+    assert len(_markers(locations.spool_directory)) == 1
+    assert spool.health().last_drop_reason == "spool_incomplete"
+
+
+def test_repeated_orphan_markers_are_counted_once_each_across_cleanup(
+    tmp_path: Path,
+) -> None:
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    first = authenticated_intake(
+        "session_started",
+        session_native=b"orphan-session-one",
+        producer_index=1,
+    )
+    second = authenticated_intake(
+        "session_started",
+        session_native=b"orphan-session-two",
+        producer_index=2,
+    )
+
+    spool.enqueue(first)
+    _entries(locations.spool_directory)[0].unlink()
+    spool.drain(_RecordingStore())
+    assert spool.health().dropped_events == 1
+
+    spool.enqueue(second)
+    _entries(locations.spool_directory)[0].unlink()
+    assert spool.health().dropped_events == 2
+    spool.drain(_RecordingStore())
+
+    health = spool.health()
+    assert health.dropped_events == 2
+    assert health.last_drop_reason == "spool_incomplete"
+    assert _markers(locations.spool_directory) == ()
+
+
+def test_orphan_reconciliation_and_quota_drop_do_not_double_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    orphan = authenticated_intake(
+        "session_started",
+        session_native=b"orphan-before-quota",
+        producer_index=1,
+    )
+    quota = authenticated_intake(
+        "session_started",
+        session_native=b"quota-after-orphan",
+        producer_index=2,
+    )
+    spool.enqueue(orphan)
+    _entries(locations.spool_directory)[0].unlink()
+    monkeypatch.setattr(spool_module, "MAX_CAPTURE_SPOOL_EVENTS", 0)
+
+    dropped = spool.enqueue(quota)
+    health = spool.health()
+
+    assert dropped.disposition == "dropped_quota"
+    assert health.dropped_events == 2
+    assert health.last_drop_reason == "spool_quota"
+    assert len(_markers(locations.spool_directory)) == 2
+    spool.drain(_RecordingStore())
+    assert spool.health().dropped_events == 2
+    assert _markers(locations.spool_directory) == ()
+
+
+def test_tampered_session_marker_blocks_direct_same_session_admission(
+    tmp_path: Path,
+) -> None:
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    spool.enqueue(authenticated_intake("action_started", producer_index=2))
+    marker = _markers(locations.spool_directory)[0]
+    marker.write_bytes(marker.read_bytes()[:-1] + b"x")
+    store = _AppendOutcomeStore(object())
+
+    with pytest.raises(CaptureSpoolIntegrityError):
+        spool.admit(store, authenticated_intake("session_finished", producer_index=3))
+
+    assert store.calls == 0
 
 
 def test_spool_observation_authenticates_real_clean_and_pending_health(
@@ -582,6 +892,43 @@ def test_spool_quota_drops_new_intakes_and_persists_degraded_health(
     assert reopened.health() == health
 
 
+def test_busy_quota_drop_leaves_a_same_session_ordering_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(spool_module, "MAX_CAPTURE_SPOOL_EVENTS", 1)
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    unrelated = authenticated_intake(
+        "session_started",
+        session_native=b"unrelated-full-session",
+        producer_index=1,
+    )
+    earlier = authenticated_intake(
+        "session_started",
+        session_native=b"quota-barrier-session",
+        producer_index=1,
+    )
+    later = authenticated_intake(
+        "action_started",
+        session_native=b"quota-barrier-session",
+        producer_index=2,
+    )
+    assert spool.enqueue(unrelated).disposition == "queued"
+    busy_store = _AppendOutcomeStore(CaptureStoreBusyError(), raises=True)
+
+    dropped_earlier = spool.admit(busy_store, earlier)
+    healthy_store = _AppendOutcomeStore(object())
+    dropped_later = spool.admit(healthy_store, later)
+
+    assert getattr(dropped_earlier, "disposition", None) == "dropped_quota"
+    assert getattr(dropped_later, "disposition", None) == "dropped_quota"
+    assert busy_store.calls == 1
+    assert healthy_store.calls == 0
+    assert len(_markers(locations.spool_directory)) == 2
+    assert spool.health().dropped_events == 2
+
+
 def test_tampered_spool_record_fails_content_free_and_is_never_removed(
     tmp_path: Path,
 ) -> None:
@@ -765,9 +1112,289 @@ def test_admission_returns_direct_receipt_and_spools_only_store_busy(
 
     busy_store = _AppendOutcomeStore(CaptureStoreBusyError(), raises=True)
     fallback = admit_capture_intake(busy_store, spool, intake)
-    assert fallback.disposition == "queued"
+    assert getattr(fallback, "disposition", None) == "queued"
     assert busy_store.calls == 1
     assert spool.health().queued_events == 1
+
+
+def test_admission_spools_after_the_single_bounded_store_attempt_is_busy(
+    tmp_path: Path,
+) -> None:
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    intake = authenticated_intake("session_started", producer_index=1)
+    receipt = object()
+    store = _BusyThenSuccessStore(receipt)
+
+    queued = admit_capture_intake(store, spool, intake)
+    assert getattr(queued, "disposition", None) == "queued"
+    assert store.calls == 1
+    assert spool.health().queued_events == 1
+
+
+def test_admission_queues_a_finish_behind_same_session_backlog_until_drain(
+    tmp_path: Path,
+) -> None:
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    database_path = tmp_path / "capture.sqlite3"
+    started = authenticated_intake("session_started", producer_index=1)
+    action = authenticated_intake("action_started", producer_index=2)
+    finished = authenticated_intake("session_finished", producer_index=3)
+
+    with initialized_store(database_path) as maintenance_store:
+        register_connection(maintenance_store)
+    with CaptureStore.open(
+        database_path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.HOOK,
+    ) as store:
+        store.append(started)
+        spool.enqueue(action)
+
+        queued = admit_capture_intake(store, spool, finished)
+
+        assert getattr(queued, "disposition", None) == "queued"
+        before_drain = store.verify_session(CONNECTION_ID, started.session_id)
+        assert before_drain.state is CaptureSessionState.OPEN
+        assert before_drain.event_count == 1
+        assert _queued_intakes(locations.spool_directory) == (action, finished)
+
+        drained = spool.drain(store)
+        repeated = spool.drain(store)
+        replayed = admit_capture_intake(store, spool, finished)
+        verification = store.verify_session(CONNECTION_ID, started.session_id)
+
+    assert drained.admitted_events == 2
+    assert drained.remaining_events == 0
+    assert repeated.admitted_events == repeated.remaining_events == 0
+    assert getattr(replayed, "disposition", None) is CaptureAppendDisposition.REPLAYED
+    assert verification.state is CaptureSessionState.CLOSED
+    assert verification.event_count == 3
+    assert spool.health().queued_events == 0
+
+
+def test_concurrent_spool_instances_cannot_bypass_same_session_backlog(
+    tmp_path: Path,
+) -> None:
+    locations = _locations(tmp_path)
+    earlier_spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    later_spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    action = authenticated_intake("action_started", producer_index=2)
+    finished = authenticated_intake("session_finished", producer_index=3)
+    busy_entered = Event()
+    release_busy = Event()
+    earlier_store = _BlockingBusyStore(busy_entered, release_busy)
+    later_store = _AppendOutcomeStore(object())
+    outcomes: list[object] = []
+
+    earlier = Thread(
+        target=lambda: outcomes.append(earlier_spool.admit(earlier_store, action)),
+    )
+    later = Thread(
+        target=lambda: outcomes.append(later_spool.admit(later_store, finished)),
+    )
+    earlier.start()
+    assert busy_entered.wait(timeout=2)
+    later.start()
+    assert later.is_alive()
+    release_busy.set()
+    earlier.join(timeout=2)
+    later.join(timeout=2)
+
+    assert not earlier.is_alive()
+    assert not later.is_alive()
+    assert earlier_store.calls == 1
+    assert later_store.calls == 0
+    assert len(outcomes) == 2
+    assert all(getattr(receipt, "disposition", None) == "queued" for receipt in outcomes)
+    assert _queued_intakes(locations.spool_directory) == (action, finished)
+    assert len(_markers(locations.spool_directory)) == 1
+
+    assert earlier_spool.drain(_RecordingStore()).remaining_events == 0
+    assert _entries(locations.spool_directory) == ()
+    assert _markers(locations.spool_directory) == ()
+
+
+def test_marker_absent_admission_does_not_scan_a_large_unrelated_backlog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    for index in range(1, 1_001):
+        intake = authenticated_intake(
+            "session_started",
+            session_native=f"unrelated-session-{index}".encode(),
+            producer_index=index,
+        )
+        entry_tag, entry_frame = spool._frame(intake)
+        marker_tag, marker_frame = spool._session_marker_frame(
+            intake.connection_id,
+            intake.session_id,
+        )
+        entry = locations.spool_directory / f"{entry_tag}.capture-intake"
+        marker = locations.spool_directory / f"{marker_tag}.capture-session"
+        entry.write_bytes(entry_frame)
+        marker.write_bytes(marker_frame)
+        entry.chmod(0o600)
+        marker.chmod(0o600)
+
+    def reject_global_scan(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("marker-absent admission scanned the global spool")
+
+    monkeypatch.setattr(CaptureSpool, "_entries", reject_global_scan)
+    monkeypatch.setattr(CaptureSpool, "_spool_child_paths", reject_global_scan)
+    target = authenticated_intake(
+        "session_started",
+        session_native=b"independent-target-session",
+        producer_index=2_000,
+    )
+    receipt = object()
+    store = _AppendOutcomeStore(receipt)
+
+    assert spool.admit(store, target) is receipt
+    assert store.calls == 1
+
+
+def test_marker_removal_and_later_admission_are_serialized_across_spool_instances(
+    tmp_path: Path,
+) -> None:
+    locations = _locations(tmp_path)
+    draining_spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    later_spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    action = authenticated_intake("action_started", producer_index=2)
+    finished = authenticated_intake("session_finished", producer_index=3)
+    draining_spool.enqueue(action)
+    drain_entered = Event()
+    release_drain = Event()
+    later_started = Event()
+    drain_store = _BlockingSuccessStore(drain_entered, release_drain)
+    later_receipt = object()
+    later_store = _AppendOutcomeStore(later_receipt)
+    drain_results: list[object] = []
+    later_results: list[object] = []
+
+    drain = Thread(target=lambda: drain_results.append(draining_spool.drain(drain_store)))
+
+    def admit_later() -> None:
+        later_started.set()
+        later_results.append(later_spool.admit(later_store, finished))
+
+    later = Thread(target=admit_later)
+    drain.start()
+    assert drain_entered.wait(timeout=2)
+    later.start()
+    assert later_started.wait(timeout=2)
+    assert later.is_alive()
+    release_drain.set()
+    drain.join(timeout=2)
+    later.join(timeout=2)
+
+    assert not drain.is_alive()
+    assert not later.is_alive()
+    assert getattr(drain_results[0], "remaining_events", None) == 0
+    assert later_results == [later_receipt]
+    assert later_store.calls == 1
+    assert _entries(locations.spool_directory) == ()
+    assert _markers(locations.spool_directory) == ()
+
+
+def test_maintenance_clears_drop_health_only_after_the_queue_is_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(spool_module, "MAX_CAPTURE_SPOOL_EVENTS", 1)
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    first = authenticated_intake("session_started", producer_index=1)
+    second = authenticated_intake("session_finished", producer_index=2)
+    assert spool.enqueue(first).disposition == "queued"
+    direct_store = _AppendOutcomeStore(object())
+    dropped = admit_capture_intake(direct_store, spool, second)
+    assert getattr(dropped, "disposition", None) == "dropped_quota"
+    assert direct_store.calls == 0
+    marker = locations.spool_directory / ".capture-spool-health"
+    marker_before = marker.read_bytes()
+
+    with spool.maintenance() as maintenance:
+        assert maintenance.clear_drop_health_if_empty() is False
+        assert marker.read_bytes() == marker_before
+        assert maintenance.drain(_RecordingStore()).remaining_events == 0
+        assert maintenance.clear_drop_health_if_empty() is True
+        assert maintenance.clear_drop_health_if_empty() is True
+
+    assert not marker.exists()
+    assert spool.health().queued_events == 0
+    assert spool.health().dropped_events == 0
+    assert spool.health().coverage_degraded is False
+
+
+def test_maintenance_fence_rejects_a_waiting_late_event_after_session_delete(
+    tmp_path: Path,
+) -> None:
+    locations = _locations(tmp_path)
+    locations.state_directory.mkdir(mode=0o700, parents=True)
+    initialize_capture_store(locations.database_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    errors: list[type[BaseException]] = []
+    started = Event()
+    finished = Event()
+
+    with CaptureStore.open(
+        locations.database_path,
+        installation_key=INSTALLATION_KEY,
+        mode=CaptureStoreMode.MAINTENANCE,
+    ) as setup_store:
+        register_connection(setup_store)
+    initial = authenticated_intake("session_started", producer_index=1)
+    with CaptureStore.open(
+        locations.database_path,
+        installation_key=INSTALLATION_KEY,
+        mode=CaptureStoreMode.HOOK,
+    ) as hook_store:
+        hook_store.append(initial)
+    with CaptureStore.open(
+        locations.database_path,
+        installation_key=INSTALLATION_KEY,
+        mode=CaptureStoreMode.MAINTENANCE,
+    ) as store:
+        human_id = store.list_sessions()[0].human_id
+        late = authenticated_intake("action_started", producer_index=2)
+
+        def publish_late() -> None:
+            try:
+                with CaptureStore.open(
+                    locations.database_path,
+                    installation_key=INSTALLATION_KEY,
+                    busy_timeout_ms=250,
+                    mode=CaptureStoreMode.HOOK,
+                ) as hook_store:
+                    waiting_spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+                    started.set()
+                    waiting_spool.admit(hook_store, late)
+            except BaseException as error:
+                errors.append(type(error))
+            finally:
+                finished.set()
+
+        with spool.maintenance() as maintenance:
+            worker = Thread(target=publish_late)
+            worker.start()
+            assert started.wait(timeout=2)
+            assert not finished.wait(timeout=0.05)
+            delete_capture_session(
+                store,
+                human_id,
+                drain=lambda: maintenance.drain(store),
+            )
+
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert errors == [CaptureStoreStateError]
+        assert store.list_sessions() == ()
+        assert spool.health().queued_events == 0
 
 
 @pytest.mark.parametrize(

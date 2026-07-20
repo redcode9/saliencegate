@@ -8,8 +8,17 @@ import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from threading import Lock
+
+from saliencegate.security.files import SecureFileError, ensure_private_directory
+from saliencegate.security.windows import (
+    NativeWindowsSecurityOperations,
+    WindowsPathKind,
+    WindowsSecurityError,
+    authorize_windows_private_path,
+    ensure_windows_private_directory,
+)
 
 
 class InvalidInstallationKeyError(ValueError):
@@ -95,6 +104,33 @@ def _validate_key_file(file_stat: os.stat_result, path: Path) -> None:
 
 
 def _read_key(path: Path, *, attempts: int = 50) -> InstallationKey:
+    if os.name == "nt":  # pragma: no cover - exercised by native Windows R01
+        try:
+            operations = NativeWindowsSecurityOperations()
+            windows_path = PureWindowsPath(os.fspath(path))
+            parent_security = operations.inspect_path(windows_path.parent)
+            if parent_security is None:
+                raise FileNotFoundError(os.fspath(path))
+            parent = authorize_windows_private_path(
+                windows_path.parent,
+                kind=WindowsPathKind.DIRECTORY,
+                operations=operations,
+            )
+            if operations.inspect_path(windows_path) is None:
+                parent.revalidate()
+                raise FileNotFoundError(os.fspath(path))
+            stable = operations.read_private_file(windows_path, maximum_bytes=64)
+            parent.revalidate()
+            stable.authorization.revalidate()
+            if len(stable.data) != 32:
+                raise InvalidInstallationKeyError("installation key must contain exactly 32 bytes")
+            return InstallationKey(stable.data)
+        except (FileNotFoundError, InvalidInstallationKeyError):
+            raise
+        except WindowsSecurityError:
+            raise InsecureKeyFileError(
+                "installation key Windows security boundary is invalid"
+            ) from None
     if path.is_symlink():
         raise InsecureKeyFileError("installation key cannot be a symbolic link")
 
@@ -174,6 +210,22 @@ def _unlock_descriptor(descriptor: int) -> None:
 @contextmanager
 def _installation_key_lock(target: Path) -> Iterator[None]:
     path = target.with_name(f".{target.name}.lock")
+    if os.name == "nt":  # pragma: no cover - exercised by native Windows R01
+        try:
+            operations = NativeWindowsSecurityOperations()
+            windows_path = PureWindowsPath(os.fspath(path))
+            authorize_windows_private_path(
+                windows_path.parent,
+                kind=WindowsPathKind.DIRECTORY,
+                operations=operations,
+            ).revalidate()
+            with operations.private_file_lock(windows_path):
+                yield
+            return
+        except WindowsSecurityError:
+            raise InsecureKeyFileError(
+                "installation key lock Windows security boundary is invalid"
+            ) from None
     if path.is_symlink():
         raise InsecureKeyFileError("installation key lock cannot be a symbolic link")
     flags = os.O_RDWR | os.O_CREAT
@@ -194,13 +246,29 @@ def _installation_key_lock(target: Path) -> Iterator[None]:
 
 
 def _load_or_create_locked(target: Path) -> InstallationKey:
-
     try:
         return _read_key(target)
     except FileNotFoundError:
         pass
 
     key = generate_installation_key()
+    if os.name == "nt":  # pragma: no cover - exercised by native Windows R01
+        try:
+            operations = NativeWindowsSecurityOperations()
+            published = operations.publish_private_file(
+                PureWindowsPath(os.fspath(target)),
+                key._serialized(),
+                maximum_bytes=32,
+                validate_published=lambda current: hmac.compare_digest(
+                    current,
+                    key._serialized(),
+                ),
+            )
+            if not hmac.compare_digest(published.data, key._serialized()):
+                raise WindowsSecurityError()
+            return InstallationKey(published.data)
+        except WindowsSecurityError:
+            raise InsecureKeyFileError("installation key Windows publication failed") from None
     temporary = target.with_name(f".{target.name}.{secrets.token_hex(16)}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -228,10 +296,37 @@ def load_or_create_installation_key(path: Path | None = None) -> InstallationKey
     target = default_installation_key_path() if path is None else Path(path).expanduser()
     if not target.is_absolute():
         raise InsecureKeyPathError("installation key path must be absolute")
-    directory_missing = not target.parent.exists()
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if directory_missing and os.name == "posix":
-        target.parent.chmod(0o700)
+    if os.name == "nt":  # pragma: no cover - exercised by native Windows R01
+        try:
+            operations = NativeWindowsSecurityOperations()
+            ensure_windows_private_directory(
+                PureWindowsPath(os.fspath(target.parent)),
+                operations=operations,
+            ).revalidate()
+        except WindowsSecurityError:
+            raise InsecureKeyPathError(
+                "installation key Windows directory boundary is invalid"
+            ) from None
+    else:
+        try:
+            ensure_private_directory(target.parent)
+        except SecureFileError:
+            raise InsecureKeyPathError("installation key directory boundary is invalid") from None
 
     with _PROCESS_KEY_LOCK, _installation_key_lock(target):
         return _load_or_create_locked(target)
+
+
+def load_installation_key(
+    path: Path | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> InstallationKey:
+    """Load one existing installation key without creating files or directories."""
+
+    target = (
+        default_installation_key_path(environ=environ) if path is None else Path(path).expanduser()
+    )
+    if not target.is_absolute():
+        raise InsecureKeyPathError("installation key path must be absolute")
+    return _read_key(target, attempts=1)

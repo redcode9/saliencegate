@@ -33,6 +33,7 @@ from saliencegate.capture.store import (
     CaptureStoreClosedError,
     CaptureStoreError,
     CaptureStoreIntegrityError,
+    CaptureStoreMode,
     CaptureStoreStateError,
 )
 from saliencegate.domain import canonical_json
@@ -245,7 +246,12 @@ def test_store_snapshot_rejects_invalid_targets_deleting_and_closed_store(
 ) -> None:
     path = tmp_path / "state.sqlite3"
     initialize_capture_store(path)
-    store = CaptureStore.open(path, installation_key=INSTALLATION_KEY, busy_timeout_ms=250)
+    store = CaptureStore.open(
+        path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.MAINTENANCE,
+    )
     register_connection(store)
     intake = authenticated_intake("session_started")
     store.append(intake)
@@ -300,12 +306,14 @@ def test_snapshot_is_one_coherent_old_revision_when_a_peer_appends_mid_read(
             path,
             installation_key=INSTALLATION_KEY,
             busy_timeout_ms=2_000,
+            mode=CaptureStoreMode.MAINTENANCE,
             _fault_injector=pause_after_verification,
         ) as reader,
         CaptureStore.open(
             path,
             installation_key=INSTALLATION_KEY,
             busy_timeout_ms=2_000,
+            mode=CaptureStoreMode.MAINTENANCE,
         ) as writer,
     ):
         register_connection(reader)
@@ -357,6 +365,7 @@ def test_store_snapshot_maps_internal_failures_to_a_content_free_error(
         path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
+        mode=CaptureStoreMode.MAINTENANCE,
         _fault_injector=fail_snapshot,
     ) as store:
         register_connection(store)

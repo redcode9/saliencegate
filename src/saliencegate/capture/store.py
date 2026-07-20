@@ -62,11 +62,23 @@ from saliencegate.security.windows import (
 )
 
 if TYPE_CHECKING:
+    from saliencegate.capture.connections import (
+        CaptureConnectionSummary,
+        CaptureSessionInventory,
+        CaptureSessionSummary,
+    )
+    from saliencegate.capture.delete import (
+        CaptureProjectDeleteReceipt,
+        CaptureSessionDeleteReceipt,
+    )
     from saliencegate.capture.sessions import CaptureSessionSnapshot
 
 MAX_CAPTURE_EVENTS_PER_SESSION: Final = 1_000
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _HOST_VERSION = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){1,3}$")
+_PROJECT_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_HUMAN_SESSION_ID = re.compile(r"^[a-z2-7]{12,52}$")
+_MAX_CAPTURE_QUERY_RESULTS: Final = 1_000
 
 
 class CaptureStoreError(RuntimeError):
@@ -356,7 +368,12 @@ _TRANSITIONS = {
     CaptureConnectionState.PENDING: frozenset({CaptureConnectionState.ENABLED}),
     CaptureConnectionState.ENABLED: frozenset({CaptureConnectionState.DRAINING}),
     CaptureConnectionState.DRAINING: frozenset({CaptureConnectionState.DISABLED}),
-    CaptureConnectionState.DISABLED: frozenset({CaptureConnectionState.DELETING}),
+    CaptureConnectionState.DISABLED: frozenset(
+        {
+            CaptureConnectionState.ENABLED,
+            CaptureConnectionState.DELETING,
+        }
+    ),
     CaptureConnectionState.DELETING: frozenset(),
 }
 
@@ -373,6 +390,8 @@ class CaptureStore:
         "_integrity",
         "_lock",
         "_mode",
+        "_verified_append_heads",
+        "_verified_data_version",
     )
 
     _authorization: StableFileAuthorization | WindowsSQLiteAuthorization
@@ -383,6 +402,8 @@ class CaptureStore:
     _integrity: _CaptureStoreIntegrity
     _lock: Lock
     _mode: CaptureStoreMode
+    _verified_append_heads: dict[tuple[str, str], tuple[int, str | None]]
+    _verified_data_version: int
 
     def __init__(self) -> None:
         raise CaptureStoreError()
@@ -487,7 +508,16 @@ class CaptureStore:
             instance._mode = mode
             instance._closed = False
             instance._fault_injector = _fault_injector
-            instance._verify_all_state()
+            instance._verified_append_heads = {}
+            instance._verified_data_version = instance._database_data_version()
+            # The hook is a latency-sensitive append-only caller.  It authenticates
+            # the complete target chain on first observation and after any peer
+            # commit, then verifies the authenticated tip for same-connection
+            # extensions.  A whole-database audit here would make each provider
+            # callback scale with all retained capture history.  Maintenance callers
+            # retain the fail-closed full audit before use.
+            if mode is CaptureStoreMode.MAINTENANCE:
+                instance._verify_all_state()
             opened = True
             return instance
         except CaptureMigrationError:
@@ -509,6 +539,120 @@ class CaptureStore:
                     connection.close()
             if authorization is not None and not opened:
                 authorization._cleanup_created_sqlite_sidecars()
+
+    @classmethod
+    def audit_read_only(
+        cls,
+        path: str | os.PathLike[str],
+        *,
+        installation_key: InstallationKey,
+    ) -> None:
+        """Authenticate a quiescent store through an immutable SQLite snapshot."""
+
+        if type(installation_key) is not InstallationKey:
+            raise CaptureStoreError()
+        connection: sqlite3.Connection | None = None
+        authorization: StableFileAuthorization | WindowsSQLiteAuthorization | None = None
+        sidecars: tuple[StableFileAuthorization, ...] = ()
+        windows_operations: NativeWindowsSecurityOperations | None = None
+        windows_path: PureWindowsPath | None = None
+        try:
+            raw_path = os.fspath(path)
+            if type(raw_path) is not str or not raw_path:
+                raise CaptureStoreError()
+            database_path = Path(raw_path).absolute()
+            if os.name == "nt":  # pragma: no cover - exercised by native Windows R01
+                windows_operations = NativeWindowsSecurityOperations()
+                windows_path = PureWindowsPath(str(database_path))
+                if windows_operations.inspect_path(windows_path) is None:
+                    raise CaptureStoreError()
+                authorization = cast(
+                    StableFileAuthorization | WindowsSQLiteAuthorization,
+                    authorize_windows_private_path(
+                        windows_path,
+                        kind=WindowsPathKind.FILE,
+                        operations=windows_operations,
+                    ),
+                )
+                for suffix in ("-wal", "-journal"):
+                    sidecar_path = PureWindowsPath(f"{windows_path}{suffix}")
+                    if (
+                        windows_operations.inspect_path(sidecar_path) is not None
+                        and Path(str(sidecar_path)).stat().st_size != 0
+                    ):
+                        raise CaptureStoreError()
+            else:
+                authorization = inspect_private_file_location(database_path)
+                if not authorization.target_exists:
+                    raise CaptureStoreError()
+                sidecars = tuple(
+                    inspect_private_file_location(f"{database_path}{suffix}")
+                    for suffix in _SQLITE_SIDECAR_SUFFIXES
+                )
+                if any(
+                    item.target_exists
+                    and item._target_complete_identity is not None
+                    and item._target_complete_identity.size != 0
+                    for suffix, item in zip(_SQLITE_SIDECAR_SUFFIXES, sidecars, strict=True)
+                    if suffix in ("-wal", "-journal")
+                ):
+                    raise CaptureStoreError()
+            authorization.revalidate()
+            connection = sqlite3.connect(
+                f"{database_path.as_uri()}?mode=ro&immutable=1",
+                isolation_level=None,
+                uri=True,
+            )
+            connection.row_factory = sqlite3.Row
+            validate_capture_store_schema(connection)
+            quick_check = connection.execute("PRAGMA quick_check").fetchone()
+            if quick_check is None or tuple(quick_check) != ("ok",):
+                raise CaptureStoreIntegrityError()
+            instance = cls.__new__(cls)
+            instance._authorization = authorization
+            instance._connection = connection
+            instance._context = CaptureDigestContext(installation_key)
+            instance._integrity = _CaptureStoreIntegrity(installation_key)
+            instance._lock = Lock()
+            instance._mode = CaptureStoreMode.MAINTENANCE
+            instance._closed = False
+            instance._fault_injector = None
+            instance._verified_append_heads = {}
+            instance._verified_data_version = instance._database_data_version()
+            instance._verify_all_state(immutable=True)
+            connection.close()
+            connection = None
+            authorization.revalidate()
+            for sidecar in sidecars:
+                sidecar.revalidate()
+            if (
+                windows_operations is not None
+                and windows_path is not None
+                and any(
+                    windows_operations.inspect_path(PureWindowsPath(f"{windows_path}{suffix}"))
+                    is not None
+                    and Path(f"{windows_path}{suffix}").stat().st_size != 0
+                    for suffix in ("-wal", "-journal")
+                )
+            ):
+                raise CaptureStoreError()
+        except CaptureStoreError:
+            raise
+        except CaptureMigrationError:
+            raise CaptureStoreIntegrityError() from None
+        except (
+            OSError,
+            SecureFileError,
+            WindowsSecurityError,
+            sqlite3.Error,
+            TypeError,
+            ValueError,
+        ):
+            raise CaptureStoreError() from None
+        finally:
+            if connection is not None:
+                with suppress(sqlite3.Error):
+                    connection.close()
 
     @staticmethod
     def _configure_connection(
@@ -556,6 +700,32 @@ class CaptureStore:
         if self._closed:
             raise CaptureStoreClosedError()
 
+    def _database_data_version(self) -> int:
+        try:
+            row = self._connection.execute("PRAGMA data_version").fetchone()
+        except sqlite3.Error:
+            raise CaptureStoreIntegrityError() from None
+        if row is None or type(row[0]) is not int or row[0] < 1:
+            raise CaptureStoreIntegrityError()
+        return row[0]
+
+    def _require_maintenance(self) -> None:
+        self._ensure_open()
+        if self._mode is not CaptureStoreMode.MAINTENANCE:
+            raise CaptureStoreStateError()
+
+    @staticmethod
+    def _validate_project_digest(project_digest: object) -> str:
+        if type(project_digest) is not str or _PROJECT_DIGEST.fullmatch(project_digest) is None:
+            raise CaptureStoreStateError()
+        return project_digest
+
+    @staticmethod
+    def _validate_human_id(human_id: object) -> str:
+        if type(human_id) is not str or _HUMAN_SESSION_ID.fullmatch(human_id) is None:
+            raise CaptureStoreStateError()
+        return human_id
+
     def _revalidate_boundary(self) -> None:
         failed = False
         try:
@@ -573,7 +743,11 @@ class CaptureStore:
                 return
             boundary_failed = False
             try:
-                self._authorization.revalidate()
+                # Peer writers may legitimately change SQLite-managed bytes while
+                # this connection is closing.  Pin ownership, type, link count,
+                # inode and sidecar security identities without requiring a
+                # byte-quiescent stat window.
+                self._authorization._revalidate_mutable_sqlite()
             except (SecureFileError, WindowsSecurityError):
                 boundary_failed = True
             try:
@@ -623,7 +797,7 @@ class CaptureStore:
     ) -> CaptureConnectionRegistration:
         """Idempotently register one pending, manifest-bound connector."""
 
-        self._ensure_open()
+        self._require_maintenance()
         try:
             registration = CaptureConnectionRegistration(
                 connection_id=connection_id,
@@ -644,7 +818,7 @@ class CaptureStore:
                 else CompatibilityStatus.SCHEMA_COMPATIBLE_UNVERIFIED_VERSION
             )
             with self._lock:
-                self._ensure_open()
+                self._require_maintenance()
                 self._revalidate_boundary()
                 self._begin_immediate()
                 try:
@@ -718,7 +892,7 @@ class CaptureStore:
     ) -> CaptureConnectionTransition:
         """Apply one authenticated compare-and-swap lifecycle transition."""
 
-        self._ensure_open()
+        self._require_maintenance()
         if (
             type(connection_id) is not str
             or type(expected_state) is not CaptureConnectionState
@@ -727,7 +901,7 @@ class CaptureStore:
         ):
             raise CaptureStoreStateError()
         with self._lock:
-            self._ensure_open()
+            self._require_maintenance()
             self._revalidate_boundary()
             self._begin_immediate()
             try:
@@ -763,6 +937,386 @@ class CaptureStore:
             previous_state=expected_state,
             state=target_state,
         )
+
+    def _connection_summary(self, row: sqlite3.Row) -> CaptureConnectionSummary:
+        from saliencegate.capture.connections import CaptureConnectionSummary
+
+        profile_id = CaptureProfile(row["profile_id"])
+        validate_capture_capability_binding(
+            profile_id,
+            row["capability_manifest_digest"],
+        )
+        return CaptureConnectionSummary(
+            connection_id=row["connection_id"],
+            project_digest=row["project_digest"],
+            profile_id=profile_id,
+            capability_manifest_digest=row["capability_manifest_digest"],
+            host_version=row["host_version"],
+            compatibility_status=CompatibilityStatus(row["compatibility_status"]),
+            state=CaptureConnectionState(row["state"]),
+            created_at=_stored_timestamp(row["created_at"]),
+            updated_at=_stored_timestamp(row["updated_at"]),
+        )
+
+    def _session_summary(
+        self,
+        connection: sqlite3.Row,
+        session: sqlite3.Row,
+    ) -> CaptureSessionSummary:
+        from saliencegate.capture.connections import CaptureSessionSummary
+
+        if (
+            type(session["coverage_degraded"]) is not int
+            or session["coverage_degraded"] not in (0, 1)
+            or type(session["unattributed_drop"]) is not int
+            or session["unattributed_drop"] not in (0, 1)
+        ):
+            raise CaptureStoreIntegrityError()
+        head = self._head_row(session["connection_id"], session["session_id"])
+        self._verify_chain(
+            session["connection_id"],
+            session["session_id"],
+            session,
+            head,
+        )
+        profile_id = CaptureProfile(connection["profile_id"])
+        validate_capture_capability_binding(
+            profile_id,
+            connection["capability_manifest_digest"],
+        )
+        return CaptureSessionSummary(
+            connection_id=session["connection_id"],
+            project_digest=connection["project_digest"],
+            profile_id=profile_id,
+            session_id=session["session_id"],
+            human_id=session["human_id"],
+            state=CaptureSessionState(session["state"]),
+            event_count=session["event_count"],
+            coverage_degraded=bool(session["coverage_degraded"]),
+            unattributed_drop=bool(session["unattributed_drop"]),
+            opened_at=_stored_timestamp(session["opened_at"]),
+            updated_at=_stored_timestamp(session["updated_at"]),
+            closed_at=(
+                None if session["closed_at"] is None else _stored_timestamp(session["closed_at"])
+            ),
+        )
+
+    def list_connections(
+        self,
+        *,
+        project_digest: str | None = None,
+        profile_id: CaptureProfile | None = None,
+    ) -> tuple[CaptureConnectionSummary, ...]:
+        """Return authenticated connection summaries in stable identity order."""
+
+        self._require_maintenance()
+        if project_digest is not None:
+            project_digest = self._validate_project_digest(project_digest)
+        if profile_id is not None and type(profile_id) is not CaptureProfile:
+            raise CaptureStoreStateError()
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                identities = self._connection.execute(
+                    """
+                    SELECT connection_id
+                    FROM connections
+                    WHERE (? IS NULL OR project_digest = ?)
+                      AND (? IS NULL OR profile_id = ?)
+                    ORDER BY connection_id
+                    """,
+                    (
+                        project_digest,
+                        project_digest,
+                        None if profile_id is None else profile_id.value,
+                        None if profile_id is None else profile_id.value,
+                    ),
+                ).fetchall()
+                summaries = tuple(
+                    self._connection_summary(self._connection_row(identity["connection_id"]))
+                    for identity in identities
+                )
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return summaries
+
+    def list_sessions(
+        self,
+        *,
+        project_digest: str | None = None,
+        profile_id: CaptureProfile | None = None,
+        state: CaptureSessionState | None = None,
+        limit: int = 100,
+    ) -> tuple[CaptureSessionSummary, ...]:
+        """Return fully verified sessions in deterministic latest-first order."""
+
+        self._require_maintenance()
+        if project_digest is not None:
+            project_digest = self._validate_project_digest(project_digest)
+        if (
+            (profile_id is not None and type(profile_id) is not CaptureProfile)
+            or (state is not None and type(state) is not CaptureSessionState)
+            or type(limit) is not int
+            or not 1 <= limit <= _MAX_CAPTURE_QUERY_RESULTS
+        ):
+            raise CaptureStoreStateError()
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                identities = self._connection.execute(
+                    """
+                    SELECT sessions.connection_id, sessions.session_id
+                    FROM capture_sessions AS sessions
+                    JOIN connections
+                      ON connections.connection_id = sessions.connection_id
+                    WHERE (? IS NULL OR connections.project_digest = ?)
+                      AND (? IS NULL OR connections.profile_id = ?)
+                      AND (? IS NULL OR sessions.state = ?)
+                    ORDER BY sessions.updated_at DESC, sessions.human_id ASC
+                    LIMIT ?
+                    """,
+                    (
+                        project_digest,
+                        project_digest,
+                        None if profile_id is None else profile_id.value,
+                        None if profile_id is None else profile_id.value,
+                        None if state is None else state.value,
+                        None if state is None else state.value,
+                        limit,
+                    ),
+                ).fetchall()
+                summaries: list[CaptureSessionSummary] = []
+                for identity in identities:
+                    connection = self._connection_row(identity["connection_id"])
+                    session = self._session_row(
+                        identity["connection_id"],
+                        identity["session_id"],
+                    )
+                    if session is None:
+                        raise CaptureStoreIntegrityError()
+                    summaries.append(self._session_summary(connection, session))
+                result = tuple(summaries)
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return result
+
+    def session_inventory(
+        self,
+        *,
+        project_digest: str | None = None,
+        profile_id: CaptureProfile | None = None,
+    ) -> CaptureSessionInventory:
+        """Verify and summarize every matching session without a display limit."""
+
+        from saliencegate.capture.connections import CaptureSessionInventory
+
+        self._require_maintenance()
+        if project_digest is not None:
+            project_digest = self._validate_project_digest(project_digest)
+        if profile_id is not None and type(profile_id) is not CaptureProfile:
+            raise CaptureStoreStateError()
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                identities = self._connection.execute(
+                    """
+                    SELECT sessions.connection_id, sessions.session_id
+                    FROM capture_sessions AS sessions
+                    JOIN connections
+                      ON connections.connection_id = sessions.connection_id
+                    WHERE (? IS NULL OR connections.project_digest = ?)
+                      AND (? IS NULL OR connections.profile_id = ?)
+                    ORDER BY sessions.connection_id, sessions.session_id
+                    """,
+                    (
+                        project_digest,
+                        project_digest,
+                        None if profile_id is None else profile_id.value,
+                        None if profile_id is None else profile_id.value,
+                    ),
+                ).fetchall()
+                summaries: list[CaptureSessionSummary] = []
+                for identity in identities:
+                    connection = self._connection_row(identity["connection_id"])
+                    session = self._session_row(
+                        identity["connection_id"],
+                        identity["session_id"],
+                    )
+                    if session is None:
+                        raise CaptureStoreIntegrityError()
+                    summaries.append(self._session_summary(connection, session))
+                oldest = (
+                    min(summaries, key=lambda item: (item.opened_at, item.human_id))
+                    if summaries
+                    else None
+                )
+                result = CaptureSessionInventory(
+                    session_count=len(summaries),
+                    quarantined_sessions=sum(
+                        item.state is CaptureSessionState.QUARANTINED for item in summaries
+                    ),
+                    degraded_sessions=sum(item.coverage_degraded for item in summaries),
+                    oldest_session=None if oldest is None else oldest.human_id,
+                )
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return result
+
+    def session_by_human_id(self, human_id: str) -> CaptureSessionSummary:
+        """Resolve and fully verify one live human-addressed session."""
+
+        self._require_maintenance()
+        human_id = self._validate_human_id(human_id)
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                identity = self._connection.execute(
+                    """
+                    SELECT connection_id, session_id
+                    FROM capture_sessions
+                    WHERE human_id = ?
+                    """,
+                    (human_id,),
+                ).fetchone()
+                if identity is None:
+                    raise CaptureStoreStateError()
+                connection = self._connection_row(identity["connection_id"])
+                session = self._session_row(
+                    identity["connection_id"],
+                    identity["session_id"],
+                )
+                if session is None:
+                    raise CaptureStoreIntegrityError()
+                result = self._session_summary(connection, session)
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return result
+
+    def session_belongs_to_project(
+        self,
+        human_id: str,
+        project_digest: str,
+        *,
+        include_deleted: bool = False,
+    ) -> bool:
+        """Authenticate one live or deleted session's project ownership."""
+
+        self._require_maintenance()
+        human_id = self._validate_human_id(human_id)
+        project_digest = self._validate_project_digest(project_digest)
+        if type(include_deleted) is not bool:
+            raise CaptureStoreStateError()
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                identity = self._connection.execute(
+                    """
+                    SELECT connection_id, session_id
+                    FROM capture_sessions
+                    WHERE human_id = ?
+                    """,
+                    (human_id,),
+                ).fetchone()
+                if identity is not None:
+                    connection = self._connection_row(identity["connection_id"])
+                    session = self._session_row(
+                        identity["connection_id"],
+                        identity["session_id"],
+                    )
+                    if session is None:
+                        raise CaptureStoreIntegrityError()
+                    summary = self._session_summary(connection, session)
+                    result = hmac.compare_digest(summary.project_digest, project_digest)
+                elif include_deleted:
+                    tombstone = self._deleted_session_for_human_id(human_id)
+                    result = tombstone is not None and hmac.compare_digest(
+                        tombstone["project_digest"],
+                        project_digest,
+                    )
+                else:
+                    result = False
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except sqlite3.Error:
+                self._rollback()
+                raise CaptureStoreError() from None
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return result
+
+    def latest_session(
+        self,
+        *,
+        project_digest: str,
+        profile_id: CaptureProfile | None = None,
+    ) -> CaptureSessionSummary:
+        """Return the deterministic latest session within one explicit project."""
+
+        self._require_maintenance()
+        project_digest = self._validate_project_digest(project_digest)
+        if profile_id is not None and type(profile_id) is not CaptureProfile:
+            raise CaptureStoreStateError()
+        sessions = self.list_sessions(
+            project_digest=project_digest,
+            profile_id=profile_id,
+            limit=1,
+        )
+        if not sessions:
+            raise CaptureStoreStateError()
+        return sessions[0]
 
     def _session_row(self, connection_id: str, session_id: str) -> sqlite3.Row | None:
         row = self._connection.execute(
@@ -818,6 +1372,37 @@ class CaptureStore:
         ):
             raise CaptureStoreIntegrityError()
         return cast(sqlite3.Row, row)
+
+    def _append_session_row(self, connection_id: str, session_id: str) -> sqlite3.Row | None:
+        """Load one authenticated session behind the durable deletion barrier."""
+
+        if self._tombstone_row(connection_id, session_id) is not None:
+            raise CaptureStoreStateError()
+        session = self._session_row(connection_id, session_id)
+        if session is not None and session["state"] == CaptureSessionState.DELETING.value:
+            raise CaptureStoreStateError()
+        return session
+
+    def _verified_feedback_rows(
+        self,
+        connection_id: str,
+        session_id: str,
+    ) -> tuple[sqlite3.Row, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT * FROM feedback_labels
+            WHERE connection_id = ? AND session_id = ?
+            ORDER BY label_id
+            """,
+            (connection_id, session_id),
+        ).fetchall()
+        verified: list[sqlite3.Row] = []
+        for row in rows:
+            expected = self._integrity.tag("feedback", _feedback_material(row))
+            if type(row["row_tag"]) is not str or not hmac.compare_digest(row["row_tag"], expected):
+                raise CaptureStoreIntegrityError()
+            verified.append(cast(sqlite3.Row, row))
+        return tuple(verified)
 
     def _load_verified_health_rows(
         self,
@@ -997,10 +1582,77 @@ class CaptureStore:
         )
         return tuple(event for event, _row in events)
 
-    def _verify_all_state(self) -> None:
+    def _verify_append_commitment(
+        self,
+        connection_id: str,
+        session_id: str,
+        session: sqlite3.Row,
+        head: sqlite3.Row,
+    ) -> CaptureEvent | None:
+        """Authenticate the bounded state needed to extend one session safely."""
+
+        event_count = session["event_count"]
+        receipt_count = head["receipt_count"]
+        if event_count != receipt_count:
+            raise CaptureStoreIntegrityError()
+        data_version = self._database_data_version()
+        if data_version != self._verified_data_version:
+            self._verified_append_heads.clear()
+            self._verified_data_version = data_version
+        key = (connection_id, session_id)
+        commitment = (receipt_count, head["head_event_tag"])
+        if self._verified_append_heads.get(key) != commitment:
+            events = self._verify_chain(connection_id, session_id, session, head)
+            self._verified_append_heads[key] = commitment
+            return None if not events else events[-1]
+        inventory = self._connection.execute(
+            """
+            SELECT COUNT(*) AS event_count
+            FROM capture_events
+            WHERE connection_id = ? AND session_id = ?
+            """,
+            (connection_id, session_id),
+        ).fetchone()
+        if inventory is None or inventory["event_count"] != receipt_count:
+            raise CaptureStoreIntegrityError()
+        latest = self._connection.execute(
+            """
+            SELECT *
+            FROM capture_events
+            WHERE connection_id = ? AND session_id = ?
+            ORDER BY receipt_ordinal DESC
+            LIMIT 1
+            """,
+            (connection_id, session_id),
+        ).fetchone()
+        if receipt_count == 0:
+            if latest is not None or head["head_event_tag"] is not None:
+                raise CaptureStoreIntegrityError()
+            self._verify_health_set(connection_id, session_id, session)
+            return None
+        if latest is None or latest["receipt_ordinal"] != receipt_count:
+            raise CaptureStoreIntegrityError()
+        event = self._load_verified_event(latest)
+        if (
+            event.intake.connection_id != connection_id
+            or event.intake.session_id != session_id
+            or event.receipt_ordinal != receipt_count
+            or latest["event_tag"] != head["head_event_tag"]
+            or event.event_tag != head["head_event_tag"]
+        ):
+            raise CaptureStoreIntegrityError()
+        self._verify_health_set(connection_id, session_id, session)
+        return event
+
+    def _verify_all_state(self, *, immutable: bool = False) -> None:
         """Authenticate every currently persisted mutable row before use."""
 
-        self._revalidate_boundary()
+        if type(immutable) is not bool:
+            raise CaptureStoreError()
+        if immutable:
+            self._authorization.revalidate()
+        else:
+            self._revalidate_boundary()
         try:
             self._connection.execute("BEGIN")
             connection_rows = self._connection.execute(
@@ -1049,9 +1701,12 @@ class CaptureStore:
         except Exception:
             self._rollback()
             raise CaptureStoreIntegrityError() from None
-        self._revalidate_boundary()
+        if immutable:
+            self._authorization.revalidate()
+        else:
+            self._revalidate_boundary()
 
-    def _human_session_id(self, connection_id: str, session_id: str) -> str:
+    def _encoded_human_session_id(self, connection_id: str, session_id: str) -> str:
         digest = self._integrity.tag(
             "human_id",
             {
@@ -1060,7 +1715,10 @@ class CaptureStore:
                 "session_id": session_id,
             },
         )
-        encoded = base64.b32encode(bytes.fromhex(digest)).decode("ascii").lower().rstrip("=")
+        return base64.b32encode(bytes.fromhex(digest)).decode("ascii").lower().rstrip("=")
+
+    def _human_session_id(self, connection_id: str, session_id: str) -> str:
+        encoded = self._encoded_human_session_id(connection_id, session_id)
         for length in range(12, len(encoded) + 1):
             candidate = encoded[:length]
             row = self._connection.execute(
@@ -1072,6 +1730,435 @@ class CaptureStore:
             ):
                 return candidate
         raise CaptureStoreIntegrityError()
+
+    def _deleted_session_for_human_id(self, human_id: str) -> sqlite3.Row | None:
+        identities = self._connection.execute(
+            """
+            SELECT connection_id, session_id
+            FROM deleted_sessions
+            ORDER BY connection_id, session_id
+            """
+        ).fetchall()
+        matched: sqlite3.Row | None = None
+        for identity in identities:
+            tombstone = self._tombstone_row(
+                identity["connection_id"],
+                identity["session_id"],
+            )
+            if tombstone is None:
+                raise CaptureStoreIntegrityError()
+            encoded = self._encoded_human_session_id(
+                tombstone["connection_id"],
+                tombstone["session_id"],
+            )
+            if encoded.startswith(human_id):
+                if matched is not None:
+                    raise CaptureStoreIntegrityError()
+                matched = tombstone
+        return matched
+
+    def _enable_secure_delete(self) -> None:
+        try:
+            self._connection.execute("PRAGMA secure_delete = ON")
+            setting = self._connection.execute("PRAGMA secure_delete").fetchone()
+        except sqlite3.Error:
+            raise CaptureStoreError() from None
+        if setting is None or len(setting) != 1 or setting[0] != 1:
+            raise CaptureStoreError()
+
+    def _checkpoint_wal(self) -> None:
+        try:
+            result = self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.Error as error:
+            code = getattr(error, "sqlite_errorcode", None)
+            if type(code) is int and code & 0xFF == sqlite3.SQLITE_BUSY:
+                raise CaptureStoreBusyError() from None
+            raise CaptureStoreError() from None
+        if result is None or len(result) != 3 or any(type(value) is not int for value in result):
+            raise CaptureStoreError()
+        if result[0] != 0:
+            raise CaptureStoreBusyError()
+        self._fault("delete_after_checkpoint")
+
+    def _require_project_connections_disabled(self, project_digest: str) -> bool:
+        self._require_maintenance()
+        project_digest = self._validate_project_digest(project_digest)
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                identities = self._connection.execute(
+                    """
+                    SELECT connection_id
+                    FROM connections
+                    WHERE project_digest = ?
+                    ORDER BY connection_id
+                    """,
+                    (project_digest,),
+                ).fetchall()
+                states: list[CaptureConnectionState] = []
+                for identity in identities:
+                    connection = self._connection_row(identity["connection_id"])
+                    states.append(CaptureConnectionState(connection["state"]))
+                state_set = set(states)
+                if state_set not in (
+                    set(),
+                    {CaptureConnectionState.DISABLED},
+                    {CaptureConnectionState.DELETING},
+                ):
+                    raise CaptureStoreStateError()
+                should_drain = state_set == {CaptureConnectionState.DISABLED}
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except sqlite3.Error:
+                self._rollback()
+                raise CaptureStoreError() from None
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return should_drain
+
+    def _session_delete_requires_drain(self, human_id: str) -> bool:
+        self._require_maintenance()
+        human_id = self._validate_human_id(human_id)
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                identity = self._connection.execute(
+                    """
+                    SELECT connection_id, session_id
+                    FROM capture_sessions
+                    WHERE human_id = ?
+                    """,
+                    (human_id,),
+                ).fetchone()
+                if identity is None:
+                    if self._deleted_session_for_human_id(human_id) is None:
+                        raise CaptureStoreStateError()
+                    should_drain = False
+                else:
+                    connection_id = identity["connection_id"]
+                    session_id = identity["session_id"]
+                    self._connection_row(connection_id)
+                    session = self._session_row(connection_id, session_id)
+                    if session is None:
+                        raise CaptureStoreIntegrityError()
+                    head = self._head_row(connection_id, session_id)
+                    self._verify_chain(connection_id, session_id, session, head)
+                    self._verified_feedback_rows(connection_id, session_id)
+                    should_drain = session["state"] != CaptureSessionState.DELETING.value
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except sqlite3.Error:
+                self._rollback()
+                raise CaptureStoreError() from None
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return should_drain
+
+    def _delete_session(self, human_id: str) -> CaptureSessionDeleteReceipt:
+        from saliencegate.capture.delete import (
+            CaptureDeleteDisposition,
+            CaptureSessionDeleteReceipt,
+        )
+
+        self._require_maintenance()
+        human_id = self._validate_human_id(human_id)
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            self._enable_secure_delete()
+            self._begin_immediate()
+            try:
+                identity = self._connection.execute(
+                    """
+                    SELECT connection_id, session_id
+                    FROM capture_sessions
+                    WHERE human_id = ?
+                    """,
+                    (human_id,),
+                ).fetchone()
+                if identity is None:
+                    tombstone = self._deleted_session_for_human_id(human_id)
+                    if tombstone is None:
+                        raise CaptureStoreStateError()
+                    self._connection.commit()
+                    self._revalidate_boundary()
+                    self._checkpoint_wal()
+                    self._revalidate_boundary()
+                    return CaptureSessionDeleteReceipt(
+                        disposition=CaptureDeleteDisposition.ALREADY_DELETED,
+                        human_id=human_id,
+                    )
+                connection_id = identity["connection_id"]
+                session_id = identity["session_id"]
+                self._connection_row(connection_id)
+                session = self._session_row(connection_id, session_id)
+                if session is None:
+                    raise CaptureStoreIntegrityError()
+                head = self._head_row(connection_id, session_id)
+                self._verify_chain(connection_id, session_id, session, head)
+                self._verified_feedback_rows(connection_id, session_id)
+                if session["state"] != CaptureSessionState.DELETING.value:
+                    self._update_session(
+                        session,
+                        state=CaptureSessionState.DELETING,
+                        event_count=session["event_count"],
+                        coverage_degraded=bool(session["coverage_degraded"]),
+                    )
+                self._connection.commit()
+                self._fault("delete_after_mark_commit")
+            except sqlite3.Error:
+                self._rollback()
+                raise CaptureStoreError() from None
+            except BaseException:
+                self._rollback()
+                raise
+
+            self._begin_immediate()
+            try:
+                connection = self._connection_row(connection_id)
+                session = self._session_row(connection_id, session_id)
+                if session is None:
+                    tombstone = self._tombstone_row(connection_id, session_id)
+                    if tombstone is None:
+                        raise CaptureStoreIntegrityError()
+                    self._connection.commit()
+                    disposition = CaptureDeleteDisposition.ALREADY_DELETED
+                else:
+                    if session["state"] != CaptureSessionState.DELETING.value:
+                        raise CaptureStoreIntegrityError()
+                    head = self._head_row(connection_id, session_id)
+                    self._verify_chain(connection_id, session_id, session, head)
+                    self._verified_feedback_rows(connection_id, session_id)
+                    tombstone = self._tombstone_row(connection_id, session_id)
+                    if tombstone is None:
+                        material: dict[str, object] = {
+                            "connection_id": connection_id,
+                            "session_id": session_id,
+                            "project_digest": connection["project_digest"],
+                            "deleted_at": _now(),
+                        }
+                        tombstone_tag = self._integrity.tag(
+                            "tombstone",
+                            _tombstone_material(material),
+                        )
+                        self._connection.execute(
+                            """
+                            INSERT INTO deleted_sessions(
+                                connection_id, session_id, project_digest,
+                                deleted_at, tombstone_tag
+                            ) VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (*material.values(), tombstone_tag),
+                        )
+                        tombstone = self._tombstone_row(connection_id, session_id)
+                    if (
+                        tombstone is None
+                        or tombstone["project_digest"] != connection["project_digest"]
+                    ):
+                        raise CaptureStoreIntegrityError()
+                    self._fault("delete_after_tombstone_write")
+                    deleted = self._connection.execute(
+                        """
+                        DELETE FROM capture_sessions
+                        WHERE connection_id = ? AND session_id = ?
+                        """,
+                        (connection_id, session_id),
+                    )
+                    if deleted.rowcount != 1:
+                        raise CaptureStoreIntegrityError()
+                    self._fault("delete_before_purge_commit")
+                    self._connection.commit()
+                    self._fault("delete_after_purge_commit")
+                    disposition = CaptureDeleteDisposition.DELETED
+            except sqlite3.Error:
+                self._rollback()
+                raise CaptureStoreError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            self._checkpoint_wal()
+            self._revalidate_boundary()
+            return CaptureSessionDeleteReceipt(
+                disposition=disposition,
+                human_id=human_id,
+            )
+
+    def _delete_project(self, project_digest: str) -> CaptureProjectDeleteReceipt:
+        from saliencegate.capture.delete import (
+            CaptureDeleteDisposition,
+            CaptureProjectDeleteReceipt,
+        )
+
+        self._require_maintenance()
+        project_digest = self._validate_project_digest(project_digest)
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            self._enable_secure_delete()
+            self._begin_immediate()
+            try:
+                identity_rows = self._connection.execute(
+                    """
+                    SELECT connection_id
+                    FROM connections
+                    WHERE project_digest = ?
+                    ORDER BY connection_id
+                    """,
+                    (project_digest,),
+                ).fetchall()
+                connection_ids = tuple(row["connection_id"] for row in identity_rows)
+                if not connection_ids:
+                    self._connection.commit()
+                    self._revalidate_boundary()
+                    self._checkpoint_wal()
+                    self._revalidate_boundary()
+                    return CaptureProjectDeleteReceipt(
+                        disposition=CaptureDeleteDisposition.ALREADY_DELETED,
+                        project_digest=project_digest,
+                        deleted_connections=0,
+                        deleted_sessions=0,
+                        deleted_tombstones=0,
+                    )
+                for connection_id in connection_ids:
+                    connection = self._connection_row(connection_id)
+                    state = CaptureConnectionState(connection["state"])
+                    if state not in {
+                        CaptureConnectionState.DISABLED,
+                        CaptureConnectionState.DELETING,
+                    }:
+                        raise CaptureStoreStateError()
+                    if state is CaptureConnectionState.DISABLED:
+                        material = dict(connection)
+                        material["state"] = CaptureConnectionState.DELETING.value
+                        material["updated_at"] = _now()
+                        row_tag = self._integrity.tag(
+                            "connection",
+                            _connection_material(material),
+                        )
+                        updated = self._connection.execute(
+                            """
+                            UPDATE connections
+                            SET state = ?, updated_at = ?, row_tag = ?
+                            WHERE connection_id = ? AND state = ?
+                            """,
+                            (
+                                material["state"],
+                                material["updated_at"],
+                                row_tag,
+                                connection_id,
+                                CaptureConnectionState.DISABLED.value,
+                            ),
+                        )
+                        if updated.rowcount != 1:
+                            raise CaptureStoreStateError()
+                self._connection.commit()
+                self._fault("delete_project_after_mark_commit")
+            except sqlite3.Error:
+                self._rollback()
+                raise CaptureStoreError() from None
+            except BaseException:
+                self._rollback()
+                raise
+
+            self._begin_immediate()
+            try:
+                current_rows = self._connection.execute(
+                    """
+                    SELECT connection_id
+                    FROM connections
+                    WHERE project_digest = ?
+                    ORDER BY connection_id
+                    """,
+                    (project_digest,),
+                ).fetchall()
+                current_ids = tuple(row["connection_id"] for row in current_rows)
+                if current_ids != connection_ids:
+                    raise CaptureStoreStateError()
+                deleted_sessions = 0
+                deleted_tombstones = 0
+                for connection_id in connection_ids:
+                    connection = self._connection_row(connection_id)
+                    if connection["state"] != CaptureConnectionState.DELETING.value:
+                        raise CaptureStoreStateError()
+                    sessions = self._connection.execute(
+                        """
+                        SELECT session_id
+                        FROM capture_sessions
+                        WHERE connection_id = ?
+                        ORDER BY session_id
+                        """,
+                        (connection_id,),
+                    ).fetchall()
+                    for identity in sessions:
+                        session_id = identity["session_id"]
+                        session = self._session_row(connection_id, session_id)
+                        if session is None:
+                            raise CaptureStoreIntegrityError()
+                        head = self._head_row(connection_id, session_id)
+                        self._verify_chain(connection_id, session_id, session, head)
+                        self._verified_feedback_rows(connection_id, session_id)
+                    tombstones = self._connection.execute(
+                        """
+                        SELECT session_id
+                        FROM deleted_sessions
+                        WHERE connection_id = ?
+                        ORDER BY session_id
+                        """,
+                        (connection_id,),
+                    ).fetchall()
+                    for identity in tombstones:
+                        tombstone = self._tombstone_row(
+                            connection_id,
+                            identity["session_id"],
+                        )
+                        if tombstone is None or tombstone["project_digest"] != project_digest:
+                            raise CaptureStoreIntegrityError()
+                    deleted_sessions += len(sessions)
+                    deleted_tombstones += len(tombstones)
+                deleted = self._connection.execute(
+                    "DELETE FROM connections WHERE project_digest = ?",
+                    (project_digest,),
+                )
+                if deleted.rowcount != len(connection_ids):
+                    raise CaptureStoreIntegrityError()
+                self._fault("delete_project_before_purge_commit")
+                self._connection.commit()
+                self._fault("delete_project_after_purge_commit")
+            except sqlite3.Error:
+                self._rollback()
+                raise CaptureStoreError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            self._checkpoint_wal()
+            self._revalidate_boundary()
+            return CaptureProjectDeleteReceipt(
+                disposition=CaptureDeleteDisposition.DELETED,
+                project_digest=project_digest,
+                deleted_connections=len(connection_ids),
+                deleted_sessions=deleted_sessions,
+                deleted_tombstones=deleted_tombstones,
+            )
 
     def _create_session(self, intake: CaptureIntake) -> sqlite3.Row:
         timestamp = _now()
@@ -1313,6 +2400,8 @@ class CaptureStore:
                     != authenticated.capability_manifest_digest
                 ):
                     raise CaptureStoreStateError()
+                if connection["state"] == CaptureConnectionState.DELETING.value:
+                    raise CaptureStoreStateError()
                 allowed_states = (
                     {CaptureConnectionState.ENABLED.value}
                     if source is CaptureAdmissionSource.DIRECT
@@ -1321,6 +2410,10 @@ class CaptureStore:
                         CaptureConnectionState.DRAINING.value,
                         CaptureConnectionState.DISABLED.value,
                     }
+                )
+                incoming_session = self._append_session_row(
+                    authenticated.connection_id,
+                    authenticated.session_id,
                 )
                 existing_row = self._connection.execute(
                     """
@@ -1334,7 +2427,7 @@ class CaptureStore:
                 ).fetchone()
                 if existing_row is not None:
                     existing = self._load_verified_event(existing_row)
-                    existing_session = self._session_row(
+                    existing_session = self._append_session_row(
                         existing.intake.connection_id,
                         existing.intake.session_id,
                     )
@@ -1356,26 +2449,13 @@ class CaptureStore:
                         return self._replay_receipt(existing, existing_session)
                     if connection["state"] not in allowed_states:
                         raise CaptureStoreStateError()
-                    if (
-                        self._tombstone_row(
-                            authenticated.connection_id,
-                            authenticated.session_id,
-                        )
-                        is not None
-                    ):
-                        raise CaptureStoreStateError()
                     affected = {(authenticated.connection_id, authenticated.session_id)}
                     affected.add((existing.intake.connection_id, existing.intake.session_id))
                     for affected_connection, affected_session_id in affected:
-                        if (
-                            self._tombstone_row(
-                                affected_connection,
-                                affected_session_id,
-                            )
-                            is not None
-                        ):
-                            raise CaptureStoreStateError()
-                        session = self._session_row(affected_connection, affected_session_id)
+                        session = self._append_session_row(
+                            affected_connection,
+                            affected_session_id,
+                        )
                         if session is None:
                             if (affected_connection, affected_session_id) != (
                                 authenticated.connection_id,
@@ -1394,7 +2474,7 @@ class CaptureStore:
                                 affected_connection,
                                 affected_session_id,
                             )
-                            self._verify_chain(
+                            self._verify_append_commitment(
                                 affected_connection,
                                 affected_session_id,
                                 session,
@@ -1431,16 +2511,7 @@ class CaptureStore:
                     )
                 if connection["state"] not in allowed_states:
                     raise CaptureStoreStateError()
-                tombstone = self._tombstone_row(
-                    authenticated.connection_id,
-                    authenticated.session_id,
-                )
-                if tombstone is not None:
-                    raise CaptureStoreStateError()
-                session = self._session_row(
-                    authenticated.connection_id,
-                    authenticated.session_id,
-                )
+                session = incoming_session
                 if session is None:
                     if authenticated.kind != "session_started":
                         raise CaptureStoreStateError()
@@ -1451,7 +2522,7 @@ class CaptureStore:
                 ):
                     raise CaptureStoreStateError()
                 head = self._head_row(authenticated.connection_id, authenticated.session_id)
-                self._verify_chain(
+                self._verify_append_commitment(
                     authenticated.connection_id,
                     authenticated.session_id,
                     session,
@@ -1569,6 +2640,9 @@ class CaptureStore:
                 )
                 self._fault("after_session_health_write")
                 self._fault("before_commit")
+                self._verified_append_heads[
+                    (authenticated.connection_id, authenticated.session_id)
+                ] = (ordinal, event_tag)
                 self._connection.commit()
                 self._fault("after_commit")
             except BaseException:

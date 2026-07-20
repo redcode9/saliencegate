@@ -10,10 +10,10 @@
   },
   "runtime_source": {
     "path": "src/saliencegate",
-    "git_tracked_regular_file_count": 141,
+    "git_tracked_regular_file_count": 182,
     "digest_algorithm": "sha256",
     "framing": "uint64be(path_utf8_length) || path_utf8 || uint64be(content_length) || content",
-    "sha256": "d9505c7deff0b726223790eb53b5c04339c9f82fe0b0b2e7642678b2106683a1"
+    "sha256": "e1a45072fa37a90de2d1900f3492d39e1bf7d827f766153f70b3b68eabd6c03e"
   },
   "socket_guard": {
     "path": "scripts/run_without_sockets.py",

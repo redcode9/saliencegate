@@ -17,6 +17,8 @@ from saliencegate.security.files import (
     authorize_atomic_file_publication,
     authorize_private_sqlite_path,
     claim_private_sqlite_location,
+    ensure_private_directory,
+    inspect_private_directory,
     inspect_private_file_location,
     read_stable_file,
 )
@@ -27,6 +29,7 @@ from saliencegate.security.keys import (
     InvalidInstallationKeyError,
     default_installation_key_path,
     generate_installation_key,
+    load_installation_key,
     load_or_create_installation_key,
 )
 from saliencegate.security.redaction import (
@@ -71,8 +74,11 @@ __all__ = [
     "authorize_private_sqlite_path",
     "claim_private_sqlite_location",
     "default_installation_key_path",
+    "ensure_private_directory",
     "generate_installation_key",
+    "inspect_private_directory",
     "inspect_private_file_location",
+    "load_installation_key",
     "load_or_create_installation_key",
     "read_stable_file",
     "verify_redacted_event",

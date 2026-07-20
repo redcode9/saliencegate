@@ -87,6 +87,8 @@ class StableReadPolicy(StrEnum):
 
     LEGACY_COMPATIBILITY = "legacy_compatibility"
     PRIVATE_OWNER = "private_owner"
+    PRIVATE_EXACT = "private_exact"
+    PRIVATE_EXECUTABLE = "private_executable"
 
 
 class _AuthorizationKind(StrEnum):
@@ -511,11 +513,24 @@ def _safe_target(value: os.stat_result) -> bool:
     )
 
 
+def _safe_executable_target(value: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(value.st_mode)
+        and value.st_nlink == 1
+        and value.st_uid == _current_user_id()
+        and stat.S_IMODE(value.st_mode) == 0o700
+    )
+
+
 def _safe_read_target(value: os.stat_result, policy: StableReadPolicy) -> bool:
     if not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
         return False
     if policy is StableReadPolicy.LEGACY_COMPATIBILITY:
         return True
+    if policy is StableReadPolicy.PRIVATE_EXACT:
+        return _safe_target(value)
+    if policy is StableReadPolicy.PRIVATE_EXECUTABLE:
+        return _safe_executable_target(value)
     return value.st_uid == _current_user_id() and stat.S_IMODE(value.st_mode) & 0o022 == 0
 
 
@@ -612,7 +627,18 @@ def _read_legacy_file(path: Path, maximum_bytes: int) -> StableFileRead:
     return StableFileRead(data=data, authorization=authorization)
 
 
-def _read_private_file(path: Path, maximum_bytes: int) -> StableFileRead:
+def _read_private_file(
+    path: Path,
+    maximum_bytes: int,
+    *,
+    policy: StableReadPolicy,
+) -> StableFileRead:
+    if policy not in (
+        StableReadPolicy.PRIVATE_OWNER,
+        StableReadPolicy.PRIVATE_EXACT,
+        StableReadPolicy.PRIVATE_EXECUTABLE,
+    ):
+        _fail()
     directory_fd, parent_identity = _open_parent(path)
     try:
         named_before = _named_stat(path.name, directory_fd)
@@ -623,7 +649,7 @@ def _read_private_file(path: Path, maximum_bytes: int) -> StableFileRead:
                 named_before,
                 lambda: _named_stat(path.name, directory_fd),
                 maximum_bytes=maximum_bytes,
-                policy=StableReadPolicy.PRIVATE_OWNER,
+                policy=policy,
                 check_acl=True,
             )
         finally:
@@ -633,7 +659,7 @@ def _read_private_file(path: Path, maximum_bytes: int) -> StableFileRead:
         _require_stable_read_metadata(
             identity,
             (final_named,),
-            policy=StableReadPolicy.PRIVATE_OWNER,
+            policy=policy,
         )
     finally:
         os.close(directory_fd)
@@ -643,7 +669,7 @@ def _read_private_file(path: Path, maximum_bytes: int) -> StableFileRead:
         _target_identity=identity.stable,
         _target_complete_identity=identity,
         _kind=_AuthorizationKind.STABLE_READ,
-        _read_policy=StableReadPolicy.PRIVATE_OWNER,
+        _read_policy=policy,
     )
     return StableFileRead(data=data, authorization=authorization)
 
@@ -869,6 +895,110 @@ def _open_or_create_private_directory_chain(path: Path) -> tuple[int, _StableIde
         raise
 
 
+def _open_safe_ancestor_directory(path: Path) -> tuple[int, _StableIdentity]:
+    """Open one existing safe ancestor, allowing a sticky shared leaf."""
+
+    if not path.is_absolute() or path.anchor != os.sep:
+        _fail()
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(os.sep, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not _safe_ancestor(opened):
+            _fail()
+        _require_safe_acl(descriptor, deny_only_allowed=True)
+        for component in path.parts[1:]:
+            if component in ("", ".", ".."):
+                _fail()
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            try:
+                opened = os.fstat(next_descriptor)
+                named = _named_stat(component, descriptor)
+                identity = _StableIdentity.from_stat(opened)
+                if (
+                    not _safe_ancestor(opened)
+                    or not _safe_ancestor(named)
+                    or not identity.matches(named)
+                ):
+                    _fail()
+                _require_safe_acl(next_descriptor, deny_only_allowed=True)
+            except BaseException:
+                os.close(next_descriptor)
+                raise
+            previous_descriptor = descriptor
+            descriptor = next_descriptor
+            os.close(previous_descriptor)
+        opened = os.fstat(descriptor)
+        if not _safe_ancestor(opened):
+            _fail()
+        _require_safe_acl(descriptor, deny_only_allowed=True)
+        return descriptor, _StableIdentity.from_stat(opened)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _inspect_private_directory_boundary(path: Path) -> bool:
+    """Return presence after authenticating an exact leaf or absent suffix."""
+
+    if not path.is_absolute() or path.anchor != os.sep or path == Path(os.sep):
+        _fail()
+    components = path.parts[1:]
+    if not components or any(component in ("", ".", "..") for component in components):
+        _fail()
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(os.sep, flags)
+    current_path = Path(os.sep)
+    try:
+        root = os.fstat(descriptor)
+        if not _safe_ancestor(root):
+            _fail()
+        _require_safe_acl(descriptor, deny_only_allowed=True)
+        for index, component in enumerate(components):
+            try:
+                next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                expected_parent = _StableIdentity.from_stat(os.fstat(descriptor))
+                for _attempt in range(2):
+                    _require_absent_target(descriptor, component)
+                    fresh_descriptor, fresh_identity = _open_safe_ancestor_directory(current_path)
+                    try:
+                        if fresh_identity != expected_parent:
+                            _fail()
+                        _require_absent_target(fresh_descriptor, component)
+                    finally:
+                        os.close(fresh_descriptor)
+                _require_absent_target(descriptor, component)
+                return False
+            try:
+                opened = os.fstat(next_descriptor)
+                named = _named_stat(component, descriptor)
+                identity = _StableIdentity.from_stat(opened)
+                is_leaf = index == len(components) - 1
+                if not identity.matches(named):
+                    _fail()
+                if is_leaf:
+                    if not _safe_private_directory(opened) or not _safe_private_directory(named):
+                        _fail()
+                    _require_safe_acl(next_descriptor)
+                else:
+                    if not _safe_ancestor(opened) or not _safe_ancestor(named):
+                        _fail()
+                    _require_safe_acl(next_descriptor, deny_only_allowed=True)
+            except BaseException:
+                os.close(next_descriptor)
+                raise
+            previous_descriptor = descriptor
+            descriptor = next_descriptor
+            os.close(previous_descriptor)
+            current_path /= component
+        snapshot_descriptor, _identity = _open_private_directory_snapshot(path)
+        os.close(snapshot_descriptor)
+        return True
+    finally:
+        os.close(descriptor)
+
+
 def _open_directory_chain(path: Path) -> tuple[int, _StableIdentity]:
     """Open an absolute directory without following any component symlink."""
 
@@ -942,7 +1072,10 @@ def _authorize_private_directory(
     try:
         if type(create) is not bool:
             _fail()
-        _require_private_directory_platform()
+        if create:
+            _require_private_directory_platform()
+        else:
+            _require_secure_platform()
         copied_path = _copy_path(path)
         if create:
             descriptor, created_identity = _open_or_create_private_directory_chain(copied_path)
@@ -1961,13 +2094,18 @@ def _remove_private_delete_stage(
 
 
 def _delete_authorized_private_file(authorization: StableFileAuthorization) -> None:
-    """Atomically stage and then delete one exact PRIVATE_OWNER stable read."""
+    """Atomically stage and then delete one exact private stable read."""
 
     expected = authorization._target_complete_identity
     expected_parent = authorization._parent_identity
     if (
         authorization._kind is not _AuthorizationKind.STABLE_READ
-        or authorization._read_policy is not StableReadPolicy.PRIVATE_OWNER
+        or authorization._read_policy
+        not in (
+            StableReadPolicy.PRIVATE_OWNER,
+            StableReadPolicy.PRIVATE_EXACT,
+            StableReadPolicy.PRIVATE_EXECUTABLE,
+        )
         or authorization._sqlite_sidecars
         or type(expected) is not _CompleteIdentity
         or type(expected_parent) is not _StableIdentity
@@ -2050,7 +2188,12 @@ def _delete_authorized_private_file_at_descriptor(
         type(directory) is not _PrivateDirectoryAuthorization
         or type(authorization) is not StableFileAuthorization
         or authorization._kind is not _AuthorizationKind.STABLE_READ
-        or authorization._read_policy is not StableReadPolicy.PRIVATE_OWNER
+        or authorization._read_policy
+        not in (
+            StableReadPolicy.PRIVATE_OWNER,
+            StableReadPolicy.PRIVATE_EXACT,
+            StableReadPolicy.PRIVATE_EXECUTABLE,
+        )
         or authorization._sqlite_sidecars
         or type(expected) is not _CompleteIdentity
         or authorization._parent_identity != directory._identity
@@ -2695,7 +2838,11 @@ def _rollback_replacement(
         return False
     try:
         os.fsync(directory_fd)
-        restored = _read_private_file(path, max(1, len(old_data)))
+        restored = _read_private_file(
+            path,
+            max(1, len(old_data)),
+            policy=StableReadPolicy.PRIVATE_EXACT,
+        )
     except Exception:
         return False
     restored_exactly = restored.data == old_data
@@ -2821,7 +2968,11 @@ def _publish_atomic_file(
             raise
         published = True
         os.fsync(directory_fd)
-        reopened = _read_private_file(path, publication._maximum_bytes)
+        reopened = _read_private_file(
+            path,
+            publication._maximum_bytes,
+            policy=StableReadPolicy.PRIVATE_EXACT,
+        )
         if (
             reopened.data != data
             or reopened.authorization._target_identity != new_temporary.identity
@@ -3140,7 +3291,11 @@ def authorize_atomic_file_publication(
         if authorization._target_complete_identity is not None:
             if validate_replacement is None:
                 _fail()
-            existing = _read_private_file(copied_path, maximum_bytes)
+            existing = _read_private_file(
+                copied_path,
+                maximum_bytes,
+                policy=StableReadPolicy.PRIVATE_EXACT,
+            )
             if (
                 existing.authorization._target_complete_identity
                 != authorization._target_complete_identity
@@ -3196,7 +3351,11 @@ def read_stable_file(
             result = _read_legacy_file(_copy_legacy_read_path(path), maximum_bytes)
         else:
             _require_secure_platform()
-            result = _read_private_file(_copy_path(path), maximum_bytes)
+            result = _read_private_file(
+                _copy_path(path),
+                maximum_bytes,
+                policy=policy,
+            )
     except SecureFileBoundError:
         bound_exceeded = True
     except Exception:
@@ -3211,7 +3370,7 @@ def read_stable_file(
 def delete_authorized_private_file(
     authorization: StableFileAuthorization,
 ) -> None:
-    """Delete only the exact file authenticated by a PRIVATE_OWNER stable read."""
+    """Delete only the exact file authenticated by a private stable read."""
 
     unsupported = False
     failed = False
@@ -3289,6 +3448,56 @@ def inspect_private_file_location(
     return authorization
 
 
+def ensure_private_directory(path: str | os.PathLike[str]) -> None:
+    """Create or authorize one exact owner-only directory without following links."""
+
+    unsupported = False
+    failed = False
+    try:
+        copied_path = _copy_path(path)
+        if not _inspect_private_directory_boundary(copied_path):
+            authorization = _authorize_private_directory(copied_path, create=True)
+            authorization.revalidate()
+    except (SecureFileUnsupportedError, _UnsupportedFileOperationError):
+        unsupported = True
+    except OSError as error:
+        unsupported = error.errno in _UNSUPPORTED_OPERATION_ERRNOS
+        failed = not unsupported
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        failed = True
+    if unsupported:
+        raise SecureFileUnsupportedError()
+    if failed:
+        raise SecureFileError()
+
+
+def inspect_private_directory(path: str | os.PathLike[str]) -> bool:
+    """Inspect an exact private leaf or a safely absent suffix without mutation."""
+
+    unsupported = False
+    failed = False
+    result: bool | None = None
+    try:
+        _require_secure_platform()
+        result = _inspect_private_directory_boundary(_copy_path(path))
+    except (SecureFileUnsupportedError, _UnsupportedFileOperationError):
+        unsupported = True
+    except OSError as error:
+        unsupported = error.errno in _UNSUPPORTED_OPERATION_ERRNOS
+        failed = not unsupported
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        failed = True
+    if unsupported:
+        raise SecureFileUnsupportedError()
+    if failed or result is None:
+        raise SecureFileError()
+    return result
+
+
 def _claim_private_sqlite_location(
     location: StableFileAuthorization,
     *,
@@ -3355,6 +3564,8 @@ __all__ = [
     "authorize_private_sqlite_path",
     "claim_private_sqlite_location",
     "delete_authorized_private_file",
+    "ensure_private_directory",
+    "inspect_private_directory",
     "inspect_private_file_location",
     "read_stable_file",
 ]

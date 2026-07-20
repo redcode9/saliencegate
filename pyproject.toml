@@ -38,6 +38,7 @@ model-runtime = [
 
 [project.scripts]
 saliencegate = "saliencegate.cli:entrypoint"
+saliencegate-capture-hook = "saliencegate.integrations.hook:entrypoint"
 saliencegate-review = "saliencegate.benchmarks.state_decay_v2.review_cli:entrypoint"
 
 [dependency-groups]
@@ -62,6 +63,7 @@ packages = ["src/saliencegate"]
 artifacts = [
   "src/saliencegate/capture/migrations/*.sql",
   "src/saliencegate/integrations/fixtures/*.json",
+  "src/saliencegate/integrations/launchers/*",
   "src/saliencegate/integrations/profiles.json",
   "src/saliencegate/repository/migrations/*.sql",
   "src/saliencegate/shadow/atif_profile_compatibility.json",

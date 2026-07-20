@@ -13,6 +13,7 @@ from tests.capture.store_support import (
     INSTALLATION_KEY,
     PROJECT_DIGEST,
     authenticated_intake,
+    initialized_store,
     register_connection,
 )
 
@@ -102,7 +103,7 @@ def _create_admitted_session(path: Path) -> CaptureIntake:
         path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as store:
         register_connection(store)
         store.append(intake)
@@ -120,7 +121,7 @@ def _assert_open_rejected_without_repair(
                 path,
                 installation_key=INSTALLATION_KEY,
                 busy_timeout_ms=250,
-                mode=CaptureStoreMode.HOOK,
+                mode=CaptureStoreMode.MAINTENANCE,
             )
     finally:
         if unexpectedly_opened is not None:
@@ -141,6 +142,7 @@ class _FakeWindowsOperations:
     def __init__(self, inspections: list[WindowsPathSecurity | None]) -> None:
         self._inspections = inspections
         self.inspected: list[PureWindowsPath] = []
+        self.ancestor_inspected: list[PureWindowsPath] = []
         self.created: list[tuple[PureWindowsPath, WindowsPathKind]] = []
 
     def current_user_sid(self) -> str:
@@ -151,6 +153,22 @@ class _FakeWindowsOperations:
         if not self._inspections:
             raise AssertionError("unexpected Windows inspection")
         return self._inspections.pop(0)
+
+    def inspect_ancestor_directories(
+        self,
+        path: PureWindowsPath,
+    ) -> tuple[tuple[PureWindowsPath, WindowsPathSecurity], ...]:
+        self.ancestor_inspected.append(path)
+        return tuple(
+            (
+                ancestor,
+                _windows_security(
+                    kind=WindowsPathKind.DIRECTORY,
+                    identity=(index + 1).to_bytes(16, "little"),
+                ),
+            )
+            for index, ancestor in enumerate(reversed(path.parents))
+        )
 
     def create_private_path(self, path: PureWindowsPath, kind: WindowsPathKind) -> None:
         self.created.append((path, kind))
@@ -166,6 +184,8 @@ def _windows_security(
         kind=kind,
         owner_sid=_OWNER_SID,
         owner_private_dacl=True,
+        owner_write_protected_dacl=True,
+        owner_traversal_protected_dacl=True,
         hardlink_count=1,
         reparse_tag=None,
     )
@@ -781,7 +801,7 @@ def test_live_store_rejects_database_and_sidecar_mutations_before_sql(
         locations.database_path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     )
     register_connection(store)
     target = Path(f"{locations.database_path}{suffix}")
@@ -946,7 +966,7 @@ def test_deleted_authenticated_health_marker_is_rejected_without_repair(
         path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     )
     try:
         register_connection(store)
@@ -1006,7 +1026,7 @@ def test_open_rejects_missing_or_orphaned_chain_rows_without_repair(
         path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as store:
         register_connection(store)
         start = authenticated_intake("session_started", producer_index=1)
@@ -1042,7 +1062,7 @@ def test_open_rejects_missing_or_orphaned_chain_rows_without_repair(
             path,
             installation_key=INSTALLATION_KEY,
             busy_timeout_ms=250,
-            mode=CaptureStoreMode.HOOK,
+            mode=CaptureStoreMode.MAINTENANCE,
         )
     assert _database_rows(path) == tampered_rows
 
@@ -1058,7 +1078,7 @@ def test_close_rejects_an_unsafe_database_boundary_after_closing_without_repair(
         locations.database_path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     )
     try:
         locations.database_path.chmod(0o644)
@@ -1095,7 +1115,7 @@ def test_live_store_rejects_event_tag_tampering_before_replay_or_collision(
         path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as store:
         register_connection(store)
         store.append(admitted)
@@ -1117,6 +1137,181 @@ def test_live_store_rejects_event_tag_tampering_before_replay_or_collision(
                 store.append(candidate)
         finally:
             assert _database_rows(path) == tampered_rows
+
+
+def test_hook_replay_rejects_an_authenticated_event_unreachable_from_the_head(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "unreachable-replay.sqlite3"
+    fork_path = tmp_path / "unreachable-replay-fork.sqlite3"
+    start = authenticated_intake("session_started", producer_index=1)
+    current = authenticated_intake("action_started", producer_index=2)
+    tail = authenticated_intake("turn_finished", producer_index=3)
+    alternate = authenticated_intake("controller_failed", producer_index=4)
+    fresh = authenticated_intake("turn_finished", producer_index=5)
+
+    with initialized_store(path) as store:
+        register_connection(store)
+        store.append(start)
+    fork_path.write_bytes(path.read_bytes())
+    fork_path.chmod(0o600)
+
+    with CaptureStore.open(
+        path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.HOOK,
+    ) as store:
+        store.append(current)
+        store.append(tail)
+    with CaptureStore.open(
+        fork_path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.HOOK,
+    ) as fork:
+        fork.append(alternate)
+
+    fork_connection = sqlite3.connect(fork_path)
+    try:
+        alternate_row = fork_connection.execute(
+            """
+            SELECT producer_event_digest, event_kind, event_json,
+                   previous_event_tag, event_tag, admission_source, admitted_at
+            FROM capture_events
+            WHERE connection_id = ? AND session_id = ? AND receipt_ordinal = 2
+            """,
+            (CONNECTION_ID, start.session_id),
+        ).fetchone()
+    finally:
+        fork_connection.close()
+    assert alternate_row is not None
+
+    connection = sqlite3.connect(path)
+    try:
+        updated = connection.execute(
+            """
+            UPDATE capture_events
+            SET producer_event_digest = ?, event_kind = ?, event_json = ?,
+                previous_event_tag = ?, event_tag = ?, admission_source = ?, admitted_at = ?
+            WHERE connection_id = ? AND session_id = ? AND receipt_ordinal = 2
+            """,
+            (*alternate_row, CONNECTION_ID, start.session_id),
+        )
+        assert updated.rowcount == 1
+        connection.commit()
+    finally:
+        connection.close()
+
+    tampered_rows = _database_rows(path)
+    with (
+        CaptureStore.open(
+            path,
+            installation_key=INSTALLATION_KEY,
+            busy_timeout_ms=250,
+            mode=CaptureStoreMode.HOOK,
+        ) as store,
+        pytest.raises(CaptureStoreIntegrityError),
+    ):
+        store.append(alternate)
+    assert _database_rows(path) == tampered_rows
+    with (
+        CaptureStore.open(
+            path,
+            installation_key=INSTALLATION_KEY,
+            busy_timeout_ms=250,
+            mode=CaptureStoreMode.HOOK,
+        ) as store,
+        pytest.raises(CaptureStoreIntegrityError),
+    ):
+        store.append(fresh)
+    assert _database_rows(path) == tampered_rows
+    _assert_open_rejected_without_repair(path, tampered_rows)
+
+
+def test_hook_replay_rejects_an_authenticated_event_deleted_from_the_chain(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "deleted-replay.sqlite3"
+    start = authenticated_intake("session_started", producer_index=1)
+    deleted = authenticated_intake("action_started", producer_index=2)
+    tail = authenticated_intake("turn_finished", producer_index=3)
+
+    with initialized_store(path) as store:
+        register_connection(store)
+        store.append(start)
+        store.append(deleted)
+        store.append(tail)
+
+    connection = sqlite3.connect(path)
+    try:
+        removed = connection.execute(
+            """
+            DELETE FROM capture_events
+            WHERE connection_id = ? AND session_id = ? AND receipt_ordinal = 2
+            """,
+            (CONNECTION_ID, start.session_id),
+        )
+        assert removed.rowcount == 1
+        connection.commit()
+    finally:
+        connection.close()
+
+    tampered_rows = _database_rows(path)
+    with (
+        CaptureStore.open(
+            path,
+            installation_key=INSTALLATION_KEY,
+            busy_timeout_ms=250,
+            mode=CaptureStoreMode.HOOK,
+        ) as store,
+        pytest.raises(CaptureStoreIntegrityError),
+    ):
+        store.append(deleted)
+    assert _database_rows(path) == tampered_rows
+    _assert_open_rejected_without_repair(path, tampered_rows)
+
+
+def test_hook_append_reaudits_a_cached_chain_after_a_peer_commit(tmp_path: Path) -> None:
+    path = tmp_path / "peer-tamper-after-cache.sqlite3"
+    start = authenticated_intake("session_started", producer_index=1)
+    current = authenticated_intake("action_started", producer_index=2)
+    tail = authenticated_intake("turn_finished", producer_index=3)
+    fresh = authenticated_intake("turn_finished", producer_index=4)
+
+    with initialized_store(path) as maintenance:
+        register_connection(maintenance)
+
+    with CaptureStore.open(
+        path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.HOOK,
+    ) as store:
+        store.append(start)
+        store.append(current)
+        store.append(tail)
+
+        connection = sqlite3.connect(path)
+        try:
+            updated = connection.execute(
+                """
+                UPDATE capture_events SET event_tag = ?
+                WHERE connection_id = ? AND session_id = ? AND receipt_ordinal = 2
+                """,
+                ("0" * 64, CONNECTION_ID, start.session_id),
+            )
+            assert updated.rowcount == 1
+            connection.commit()
+        finally:
+            connection.close()
+
+        tampered_rows = _database_rows(path)
+        with pytest.raises(CaptureStoreIntegrityError):
+            store.append(fresh)
+        assert _database_rows(path) == tampered_rows
+
+    _assert_open_rejected_without_repair(path, tampered_rows)
 
 
 @pytest.mark.parametrize("forged_row", ("deleted-session", "feedback-label"))
@@ -1183,7 +1378,7 @@ def test_validly_authenticated_database_rollback_is_explicitly_outside_the_threa
         locations.database_path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as store:
         register_connection(store)
         store.append(first)
@@ -1193,7 +1388,7 @@ def test_validly_authenticated_database_rollback_is_explicitly_outside_the_threa
         locations.database_path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as store:
         store.append(second)
         assert store.verify_session(CONNECTION_ID, first.session_id).event_count == 2
@@ -1204,7 +1399,7 @@ def test_validly_authenticated_database_rollback_is_explicitly_outside_the_threa
         locations.database_path,
         installation_key=INSTALLATION_KEY,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as store:
         accepted_rollback = store.verify_session(CONNECTION_ID, first.session_id)
 
@@ -1333,7 +1528,7 @@ def test_provider_sentinel_never_reaches_key_database_sidecars_or_spool(
         locations.database_path,
         installation_key=installation_key,
         busy_timeout_ms=250,
-        mode=CaptureStoreMode.HOOK,
+        mode=CaptureStoreMode.MAINTENANCE,
     ) as store:
         register_connection(store, connection_id=CONNECTION_ID)
         store.append(admitted)

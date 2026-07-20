@@ -18,16 +18,28 @@ from saliencegate.commands.algorithm import (
     render_algorithm_replay_json,
     run_algorithm_replay,
 )
+from saliencegate.commands.capture import (
+    CaptureCommandConfigurationError,
+    CaptureCommandError,
+    CaptureCommandInputError,
+    CaptureCommandIntegrityError,
+    CaptureCommandRequiresDisconnectError,
+    CaptureCommandUnavailableError,
+)
 from saliencegate.commands.demo import (
     render_demo_human,
     render_demo_json,
     run_demo,
 )
 from saliencegate.commands.doctor import (
+    CaptureDoctorReport,
     DoctorCheckName,
     DoctorCheckStatus,
+    render_capture_doctor_human,
+    render_capture_doctor_json,
     render_doctor_human,
     render_doctor_json,
+    run_capture_doctor,
     run_doctor,
 )
 from saliencegate.commands.replay import (
@@ -61,6 +73,8 @@ _ATIF_CLI_PROFILES = {
     "harbor-terminus-2-v1": ATIFProfile.HARBOR_TERMINUS_2_V1,
     "harbor-codex-v1": ATIFProfile.HARBOR_CODEX_V1,
 }
+
+_CAPTURE_PROVIDERS = ("codex", "claude-code", "opencode", "pi")
 
 
 class ExitCode(IntEnum):
@@ -130,7 +144,46 @@ def _parser() -> _SafeArgumentParser:
     doctor.add_argument("--repository", default="saliencegate.sqlite3")
     doctor.add_argument("--key")
     doctor.add_argument("--endpoint")
+    doctor.add_argument("--capture", action="store_true")
     doctor.add_argument("--json", action="store_true")
+
+    connect = commands.add_parser("connect", help="Install passive project capture")
+    connect.add_argument("provider", choices=_CAPTURE_PROVIDERS)
+    connect.add_argument("--project")
+    connect.add_argument("--dry-run", action="store_true")
+    connect.add_argument("--json", action="store_true")
+
+    disconnect = commands.add_parser("disconnect", help="Remove passive project capture")
+    disconnect.add_argument("provider", choices=_CAPTURE_PROVIDERS)
+    disconnect.add_argument("--project")
+    disconnect.add_argument("--json", action="store_true")
+
+    status = commands.add_parser("status", help="Show passive capture status")
+    status.add_argument("provider", nargs="?", choices=_CAPTURE_PROVIDERS)
+    status.add_argument("--project")
+    status.add_argument("--json", action="store_true")
+
+    sessions = commands.add_parser("sessions", help="List captured project sessions")
+    sessions.add_argument("--provider", choices=_CAPTURE_PROVIDERS)
+    sessions.add_argument("--state", choices=("open", "closed", "quarantined"))
+    sessions.add_argument("--limit", type=int, default=20)
+    sessions.add_argument("--json", action="store_true")
+
+    report = commands.add_parser("report", help="Build a passive capture report")
+    report_target = report.add_mutually_exclusive_group(required=True)
+    report_target.add_argument("--latest", action="store_true")
+    report_target.add_argument("session_id", nargs="?")
+    report.add_argument("--output")
+    report.add_argument("--replace", action="store_true")
+    report.add_argument("--json", action="store_true")
+
+    delete = commands.add_parser("delete", help="Delete local passive capture records")
+    delete_target = delete.add_mutually_exclusive_group(required=True)
+    delete_target.add_argument("session_id", nargs="?")
+    delete_target.add_argument("--all", action="store_true")
+    delete.add_argument("--project")
+    delete.add_argument("--confirm", action="store_true")
+    delete.add_argument("--json", action="store_true")
 
     replay = commands.add_parser("replay")
     replay.add_argument("trace")
@@ -233,12 +286,11 @@ def _write_error(message: str) -> None:
 
 
 def _doctor_exit(report: object) -> ExitCode:
-    checks = getattr(report, "checks", ())
+    environment = report.environment if type(report) is CaptureDoctorReport else report
+    checks = getattr(environment, "checks", ())
     failed = tuple(
         check.name for check in checks if check.required and check.status is DoctorCheckStatus.FAIL
     )
-    if not failed:
-        return ExitCode.SUCCESS
     dependency_checks = {
         DoctorCheckName.PYTHON,
         DoctorCheckName.SQLITE,
@@ -246,7 +298,9 @@ def _doctor_exit(report: object) -> ExitCode:
     }
     if any(name in dependency_checks for name in failed):
         return ExitCode.UNAVAILABLE_DEPENDENCY
-    return ExitCode.CONFIGURATION
+    if type(report) is CaptureDoctorReport and report.capture.status is DoctorCheckStatus.FAIL:
+        return ExitCode.CONFIGURATION
+    return ExitCode.CONFIGURATION if failed else ExitCode.SUCCESS
 
 
 def _dispatch_demo(arguments: argparse.Namespace) -> ExitCode:
@@ -256,13 +310,124 @@ def _dispatch_demo(arguments: argparse.Namespace) -> ExitCode:
 
 
 def _dispatch_doctor(arguments: argparse.Namespace) -> ExitCode:
+    key = None if arguments.key is None else Path(arguments.key)
+    if arguments.capture:
+        capture_report = run_capture_doctor(
+            repository_path=arguments.repository,
+            installation_key_path=key,
+            endpoint=arguments.endpoint,
+        )
+        _write_stdout(
+            render_capture_doctor_json(capture_report)
+            if arguments.json
+            else render_capture_doctor_human(capture_report)
+        )
+        return _doctor_exit(capture_report)
     report = run_doctor(
         repository_path=arguments.repository,
-        installation_key_path=None if arguments.key is None else Path(arguments.key),
+        installation_key_path=key,
         endpoint=arguments.endpoint,
     )
     _write_stdout(render_doctor_json(report) if arguments.json else render_doctor_human(report))
     return _doctor_exit(report)
+
+
+def _dispatch_connect(arguments: argparse.Namespace) -> ExitCode:
+    from saliencegate.commands.capture.connect import (
+        render_connect_human,
+        render_connect_json,
+        run_connect,
+    )
+
+    report = run_connect(
+        provider=arguments.provider,
+        project=arguments.project,
+        dry_run=arguments.dry_run,
+    )
+    _write_stdout(render_connect_json(report) if arguments.json else render_connect_human(report))
+    return ExitCode.SUCCESS
+
+
+def _dispatch_disconnect(arguments: argparse.Namespace) -> ExitCode:
+    from saliencegate.commands.capture.disconnect import (
+        render_disconnect_human,
+        render_disconnect_json,
+        run_disconnect,
+    )
+
+    report = run_disconnect(provider=arguments.provider, project=arguments.project)
+    _write_stdout(
+        render_disconnect_json(report) if arguments.json else render_disconnect_human(report)
+    )
+    return ExitCode.SUCCESS
+
+
+def _dispatch_status(arguments: argparse.Namespace) -> ExitCode:
+    from saliencegate.commands.capture.status import (
+        render_status_human,
+        render_status_json,
+        run_status,
+    )
+
+    report = run_status(provider=arguments.provider, project=arguments.project)
+    _write_stdout(render_status_json(report) if arguments.json else render_status_human(report))
+    return ExitCode.SUCCESS
+
+
+def _dispatch_sessions(arguments: argparse.Namespace) -> ExitCode:
+    from saliencegate.commands.capture.sessions import (
+        render_sessions_human,
+        render_sessions_json,
+        run_sessions,
+    )
+
+    report = run_sessions(
+        provider=arguments.provider,
+        state=arguments.state,
+        limit=arguments.limit,
+    )
+    _write_stdout(render_sessions_json(report) if arguments.json else render_sessions_human(report))
+    return ExitCode.SUCCESS
+
+
+def _dispatch_capture_report(arguments: argparse.Namespace) -> ExitCode:
+    from saliencegate.commands.capture.report import (
+        render_capture_session_report_human,
+        render_capture_session_report_json,
+        run_capture_report,
+    )
+
+    report = run_capture_report(
+        latest=arguments.latest,
+        session_id=arguments.session_id,
+        output_path=arguments.output,
+        replace=arguments.replace,
+    )
+    _write_stdout(
+        render_capture_session_report_json(report)
+        if arguments.json
+        else render_capture_session_report_human(report)
+    )
+    return ExitCode.SUCCESS
+
+
+def _dispatch_delete(arguments: argparse.Namespace) -> ExitCode:
+    from saliencegate.commands.capture.delete import (
+        render_delete_human,
+        render_delete_json,
+        run_delete,
+    )
+
+    if not arguments.all and (arguments.project is not None or arguments.confirm):
+        raise CaptureCommandInputError()
+    report = run_delete(
+        session_id=arguments.session_id,
+        delete_all=arguments.all,
+        confirm=arguments.confirm,
+        project=arguments.project,
+    )
+    _write_stdout(render_delete_json(report) if arguments.json else render_delete_human(report))
+    return ExitCode.SUCCESS
 
 
 def _dispatch_replay(arguments: argparse.Namespace) -> ExitCode:
@@ -467,6 +632,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _dispatch_demo(arguments)
         if arguments.command == "doctor":
             return _dispatch_doctor(arguments)
+        if arguments.command == "connect":
+            return _dispatch_connect(arguments)
+        if arguments.command == "disconnect":
+            return _dispatch_disconnect(arguments)
+        if arguments.command == "status":
+            return _dispatch_status(arguments)
+        if arguments.command == "sessions":
+            return _dispatch_sessions(arguments)
+        if arguments.command == "report":
+            return _dispatch_capture_report(arguments)
+        if arguments.command == "delete":
+            return _dispatch_delete(arguments)
         if arguments.command == "replay":
             return _dispatch_replay(arguments)
         if arguments.command == "shadow":
@@ -531,6 +708,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_error("artifact validation failed")
         return ExitCode.CORRUPTED_ARTIFACT
     except StateDecayDiagnosticError:
+        _write_error("internal error")
+        return ExitCode.INTERNAL_ERROR
+    except CaptureCommandInputError:
+        _write_error("capture command input is invalid")
+        return ExitCode.INVALID_INPUT
+    except CaptureCommandRequiresDisconnectError:
+        _write_error("run saliencegate disconnect before delete --all")
+        return ExitCode.CONFIGURATION
+    except CaptureCommandConfigurationError:
+        _write_error("capture configuration is invalid")
+        return ExitCode.CONFIGURATION
+    except CaptureCommandUnavailableError:
+        _write_error("capture integration is unavailable")
+        return ExitCode.UNAVAILABLE_DEPENDENCY
+    except CaptureCommandIntegrityError:
+        _write_error("capture integrity check failed")
+        return ExitCode.CORRUPTED_ARTIFACT
+    except CaptureCommandError:
         _write_error("internal error")
         return ExitCode.INTERNAL_ERROR
     except BrokenPipeError:

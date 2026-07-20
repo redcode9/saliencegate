@@ -27,6 +27,7 @@ PACKAGE_DESCRIPTION = ROOT / "docs" / "package-description.md"
 REQUIRE_DISTRIBUTIONS = "SALIENCEGATE_REQUIRE_DISTRIBUTIONS"
 EXPECTED_CONSOLE_SCRIPTS = {
     "saliencegate": "saliencegate.cli:entrypoint",
+    "saliencegate-capture-hook": "saliencegate.integrations.hook:entrypoint",
     "saliencegate-review": "saliencegate.benchmarks.state_decay_v2.review_cli:entrypoint",
 }
 BASELINE_PACKAGE_MEMBERS = {
@@ -195,15 +196,35 @@ CAPTURE_RUNTIME_FILES = {
     "saliencegate/capture/__init__.py",
     "saliencegate/capture/adapters.py",
     "saliencegate/capture/capabilities.py",
+    "saliencegate/capture/connections.py",
+    "saliencegate/capture/delete.py",
     "saliencegate/capture/health.py",
     "saliencegate/capture/identities.py",
     "saliencegate/capture/locations.py",
     "saliencegate/capture/migrations/__init__.py",
+    "saliencegate/capture/normalization.py",
     "saliencegate/capture/publication.py",
+    "saliencegate/capture/report.py",
     "saliencegate/capture/schema.py",
+    "saliencegate/capture/sessions.py",
     "saliencegate/capture/spool.py",
     "saliencegate/capture/store.py",
+    "saliencegate/commands/capture/__init__.py",
+    "saliencegate/commands/capture/common.py",
+    "saliencegate/commands/capture/connect.py",
+    "saliencegate/commands/capture/delete.py",
+    "saliencegate/commands/capture/disconnect.py",
+    "saliencegate/commands/capture/report.py",
+    "saliencegate/commands/capture/runtime.py",
+    "saliencegate/commands/capture/sessions.py",
+    "saliencegate/commands/capture/status.py",
     "saliencegate/integrations/__init__.py",
+    "saliencegate/integrations/bootstrap.py",
+    "saliencegate/integrations/config_files.py",
+    "saliencegate/integrations/hook.py",
+    "saliencegate/integrations/installation.py",
+    "saliencegate/integrations/launcher_renderer.py",
+    "saliencegate/integrations/registry.py",
 }
 CAPTURE_RESOURCE_FILES = {
     "saliencegate/capture/migrations/0001_capture_store.sql",
@@ -211,6 +232,8 @@ CAPTURE_RESOURCE_FILES = {
     "saliencegate/integrations/fixtures/codex-hooks-v1.json",
     "saliencegate/integrations/fixtures/opencode-plugin-v1.json",
     "saliencegate/integrations/fixtures/pi-extension-v1.json",
+    "saliencegate/integrations/launchers/posix.sh",
+    "saliencegate/integrations/launchers/windows.cmd",
     "saliencegate/integrations/profiles.json",
 }
 CAPTURE_SECURITY_RUNTIME_FILES = {
@@ -607,6 +630,7 @@ def test_built_sdist_has_exact_reviewable_membership_and_payloads(
         "examples/atif-shadow/terminus-minimal.trajectory.json",
         "examples/shadow_asyncio.py",
         "scripts/benchmark_shadow_trace.py",
+        "scripts/benchmark_capture_hook.py",
         "scripts/run_without_sockets.py",
         "scripts/smoke_core_imports.py",
         "scripts/smoke_launch_contracts.py",

@@ -25,6 +25,7 @@ from saliencegate.security import (
     StableReadPolicy,
     authorize_atomic_file_publication,
     authorize_private_sqlite_path,
+    inspect_private_directory,
     inspect_private_file_location,
     read_stable_file,
 )
@@ -687,6 +688,43 @@ def test_group_or_world_writable_parent_is_rejected(tmp_path: Path, mode: int) -
         authorize_private_sqlite_path(target)
 
     assert not target.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private directory modes require POSIX")
+def test_private_directory_inspection_is_exact_and_never_creates(tmp_path: Path) -> None:
+    exact = _private_directory(tmp_path / "exact")
+    readable = _private_directory(tmp_path / "readable")
+    readable.chmod(0o755)
+    missing = tmp_path / "missing"
+
+    assert inspect_private_directory(exact) is True
+
+    with pytest.raises(SecureFileError):
+        inspect_private_directory(readable)
+    assert inspect_private_directory(missing) is False
+    assert not missing.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private directory modes require POSIX")
+@pytest.mark.parametrize("boundary", ("unsafe", "symlink"))
+def test_absent_private_directory_rejects_an_unsafe_existing_prefix(
+    tmp_path: Path,
+    boundary: str,
+) -> None:
+    existing = _private_directory(tmp_path / "existing")
+    if boundary == "unsafe":
+        existing.chmod(0o777)
+        declared = existing / "missing" / "state"
+    else:
+        outside = _private_directory(tmp_path / "outside")
+        link = tmp_path / "link"
+        link.symlink_to(outside, target_is_directory=True)
+        declared = link / "missing" / "state"
+
+    with pytest.raises(SecureFileError):
+        inspect_private_directory(declared)
+
+    assert not declared.exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="private directory modes require POSIX")
@@ -1421,6 +1459,58 @@ def test_private_reader_accepts_public_read_bits_but_not_public_write_bits(
             maximum_bytes=16,
             policy=StableReadPolicy.PRIVATE_OWNER,
         )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private mode bits require POSIX")
+def test_exact_private_reader_requires_mode_0600_and_authorizes_deletion(
+    tmp_path: Path,
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    exact = _private_file(parent / "exact", b"safe")
+    readable = _private_file(parent / "readable", b"safe")
+    readable.chmod(0o644)
+
+    stable = read_stable_file(
+        exact,
+        maximum_bytes=4,
+        policy=StableReadPolicy.PRIVATE_EXACT,
+    )
+
+    assert stable.data == b"safe"
+    with pytest.raises(SecureFileError):
+        read_stable_file(
+            readable,
+            maximum_bytes=4,
+            policy=StableReadPolicy.PRIVATE_EXACT,
+        )
+    files_module.delete_authorized_private_file(stable.authorization)
+    assert not exact.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private mode bits require POSIX")
+def test_exact_executable_reader_requires_mode_0700_and_authorizes_deletion(
+    tmp_path: Path,
+) -> None:
+    parent = _private_directory(tmp_path / "private")
+    executable = _private_file(parent / "executable", b"#!/bin/sh\n")
+    executable.chmod(0o700)
+    data_only = _private_file(parent / "data-only", b"#!/bin/sh\n")
+
+    stable = read_stable_file(
+        executable,
+        maximum_bytes=32,
+        policy=StableReadPolicy.PRIVATE_EXECUTABLE,
+    )
+
+    assert stable.data == b"#!/bin/sh\n"
+    with pytest.raises(SecureFileError):
+        read_stable_file(
+            data_only,
+            maximum_bytes=32,
+            policy=StableReadPolicy.PRIVATE_EXECUTABLE,
+        )
+    files_module.delete_authorized_private_file(stable.authorization)
+    assert not executable.exists()
 
 
 @pytest.mark.parametrize("maximum_bytes", (0, -1, True, sys.maxsize))
@@ -2768,12 +2858,17 @@ def test_postreplace_reopen_failure_rolls_back_and_cleans_every_temporary(
     real_read = files_module._read_private_file
     failed = False
 
-    def fail_once(path: Path, maximum_bytes: int) -> StableFileRead:
+    def fail_once(
+        path: Path,
+        maximum_bytes: int,
+        *,
+        policy: StableReadPolicy,
+    ) -> StableFileRead:
         nonlocal failed
         if not failed:
             failed = True
             raise OSError("injected reopen failure")
-        return real_read(path, maximum_bytes)
+        return real_read(path, maximum_bytes, policy=policy)
 
     monkeypatch.setattr(files_module, "_read_private_file", fail_once)
 
@@ -2877,6 +2972,7 @@ def test_public_security_api_exports_the_stable_authorization_contract() -> None
     assert security.StableFileAuthorization is StableFileAuthorization
     assert security.StableReadPolicy is StableReadPolicy
     assert security.authorize_private_sqlite_path is authorize_private_sqlite_path
+    assert security.inspect_private_directory is inspect_private_directory
     assert security.inspect_private_file_location is inspect_private_file_location
     assert security.read_stable_file is read_stable_file
     assert {
@@ -2887,6 +2983,7 @@ def test_public_security_api_exports_the_stable_authorization_contract() -> None
         "StableFileAuthorization",
         "StableReadPolicy",
         "authorize_private_sqlite_path",
+        "inspect_private_directory",
         "inspect_private_file_location",
         "read_stable_file",
     }.issubset(security.__all__)
