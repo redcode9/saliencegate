@@ -14,11 +14,13 @@ import tomllib
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
+from itertools import pairwise
 from pathlib import Path, PureWindowsPath
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from saliencegate.domain import canonical_json
 from saliencegate.security.windows import (
     NativeWindowsSecurityOperations,
     WindowsPathKind,
@@ -127,6 +129,7 @@ class OwnedConfigSpec(_ConfigModel):
         tuple[TomlBooleanConstraint, ...],
         Field(max_length=16),
     ] = ()
+    bind_json_paths: bool = Field(default=False, exclude_if=lambda value: not value)
 
     @model_validator(mode="after")
     def fragment_is_closed_and_uniquely_marked(self) -> Self:
@@ -147,10 +150,48 @@ class OwnedConfigSpec(_ConfigModel):
             paths = tuple(item.path for item in self.toml_boolean_constraints)
             if self.syntax is not ConfigSyntax.TOML_DOCUMENT or paths != tuple(sorted(set(paths))):
                 raise ValueError("owned TOML constraints are invalid")
+        if self.bind_json_paths and self.syntax is not ConfigSyntax.JSON_OBJECT:
+            raise ValueError("owned JSON path binding is invalid")
         return self
 
 
-class OwnedConfigReverseEdit(_ConfigModel):
+class OwnedConfigSpan(_ConfigModel):
+    """One bounded insertion span containing only integration-owned bytes."""
+
+    start: Annotated[int, Field(ge=0, le=MAX_PROVIDER_CONFIG_BYTES)]
+    end: Annotated[int, Field(ge=1, le=MAX_PROVIDER_CONFIG_BYTES)]
+    owned_span_digest: Annotated[str, StringConstraints(pattern=_SHA256.pattern)]
+    owned_span_base64: Annotated[str, StringConstraints(min_length=4, max_length=400_000)] = Field(
+        repr=False
+    )
+    json_path: Annotated[
+        tuple[Annotated[str, StringConstraints(min_length=1, max_length=1_024)], ...] | None,
+        Field(max_length=8, exclude_if=lambda value: value is None),
+    ] = None
+
+    @model_validator(mode="after")
+    def span_is_self_consistent(self) -> Self:
+        try:
+            span = base64.b64decode(self.owned_span_base64, validate=True)
+        except Exception:
+            raise ValueError("owned configuration span is invalid") from None
+        if (
+            self.end <= self.start
+            or self.end - self.start != len(span)
+            or len(span) > MAX_OWNED_CONFIG_BYTES + 8
+            or hashlib.sha256(span).hexdigest() != self.owned_span_digest
+        ):
+            raise ValueError("owned configuration span is invalid")
+        return self
+
+    def owned_span(self) -> bytes:
+        try:
+            return base64.b64decode(self.owned_span_base64, validate=True)
+        except Exception:
+            raise ConfigFileError() from None
+
+
+class OwnedConfigReverseEdit(OwnedConfigSpan):
     """Minimal reverse edit; it never contains the foreign configuration preimage."""
 
     schema_version: Literal["owned-config-reverse-edit/v1"] = "owned-config-reverse-edit/v1"
@@ -159,34 +200,42 @@ class OwnedConfigReverseEdit(_ConfigModel):
     preimage_digest: Annotated[str, StringConstraints(pattern=_SHA256.pattern)]
     installed_digest: Annotated[str, StringConstraints(pattern=_SHA256.pattern)]
     marker: Annotated[str, StringConstraints(pattern=_MARKER.pattern)]
-    start: Annotated[int, Field(ge=0, le=MAX_PROVIDER_CONFIG_BYTES)]
-    end: Annotated[int, Field(ge=1, le=MAX_PROVIDER_CONFIG_BYTES)]
-    owned_span_digest: Annotated[str, StringConstraints(pattern=_SHA256.pattern)]
-    owned_span_base64: Annotated[str, StringConstraints(min_length=4, max_length=400_000)] = Field(
-        repr=False
-    )
+    additional_spans: Annotated[
+        tuple[OwnedConfigSpan, ...],
+        Field(max_length=15, exclude_if=lambda value: not value),
+    ] = ()
 
     @model_validator(mode="after")
     def reverse_edit_is_self_consistent(self) -> Self:
-        try:
-            span = base64.b64decode(self.owned_span_base64, validate=True)
-        except Exception:
-            raise ValueError("owned configuration reverse edit is invalid") from None
+        all_spans: tuple[OwnedConfigSpan, ...] = (self, *self.additional_spans)
+        spans = tuple(sorted(all_spans, key=lambda item: item.start))
+        if tuple(self.additional_spans) != tuple(
+            sorted(self.additional_spans, key=lambda item: item.start)
+        ):
+            raise ValueError("owned configuration reverse edit is invalid")
+        if any(left.end > right.start for left, right in pairwise(spans)):
+            raise ValueError("owned configuration reverse edit is invalid")
+        payloads = tuple(span.owned_span() for span in spans)
+        marker = self.marker.encode("ascii")
         if (
-            self.end <= self.start
-            or self.end - self.start != len(span)
-            or len(span) > MAX_OWNED_CONFIG_BYTES + 8
-            or hashlib.sha256(span).hexdigest() != self.owned_span_digest
-            or span.count(self.marker.encode("ascii")) != 1
+            sum(len(payload) for payload in payloads) > MAX_OWNED_CONFIG_BYTES + 128
+            or sum(payload.count(marker) for payload in payloads) != 1
+            or self.owned_span().count(marker) != 1
+            or len(set(payloads)) != len(payloads)
+            or (self.additional_spans and self.json_path is None)
+            or any(span.json_path is None for span in self.additional_spans)
+            or (
+                self.syntax is not ConfigSyntax.JSON_OBJECT
+                and any(span.json_path is not None for span in spans)
+            )
+            or (self.syntax is not ConfigSyntax.JSON_OBJECT and self.additional_spans)
         ):
             raise ValueError("owned configuration reverse edit is invalid")
         return self
 
-    def owned_span(self) -> bytes:
-        try:
-            return base64.b64decode(self.owned_span_base64, validate=True)
-        except Exception:
-            raise ConfigFileError() from None
+    def owned_spans(self) -> tuple[OwnedConfigSpan, ...]:
+        all_spans: tuple[OwnedConfigSpan, ...] = (self, *self.additional_spans)
+        return tuple(sorted(all_spans, key=lambda item: item.start))
 
 
 class OwnedConfigPlan(_ConfigModel):
@@ -201,6 +250,56 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _owned_span(
+    start: int,
+    span: bytes,
+    *,
+    json_path: tuple[str, ...] | None = None,
+) -> OwnedConfigSpan:
+    return OwnedConfigSpan(
+        start=start,
+        end=start + len(span),
+        owned_span_digest=_digest(span),
+        owned_span_base64=base64.b64encode(span).decode("ascii"),
+        json_path=json_path,
+    )
+
+
+def _reverse_edit(
+    *,
+    syntax: ConfigSyntax,
+    target_existed: bool,
+    original: bytes,
+    installed: bytes,
+    marker: str,
+    spans: tuple[tuple[int, bytes, tuple[str, ...]], ...],
+    bind_json_paths: bool,
+) -> OwnedConfigReverseEdit:
+    marker_bytes = marker.encode("ascii")
+    marked = tuple(item for item in spans if item[1].count(marker_bytes) == 1)
+    if len(marked) != 1 or sum(span.count(marker_bytes) for _start, span, _path in spans) != 1:
+        raise ConfigFileError()
+    main_start, main_bytes, _main_path = marked[0]
+    additional = tuple(
+        _owned_span(start, span, json_path=json_path)
+        for start, span, json_path in sorted(spans, key=lambda item: item[0])
+        if (start, span, json_path) != marked[0]
+    )
+    return OwnedConfigReverseEdit(
+        syntax=syntax,
+        target_existed=target_existed,
+        preimage_digest=_digest(original),
+        installed_digest=_digest(installed),
+        marker=marker,
+        start=main_start,
+        end=main_start + len(main_bytes),
+        owned_span_digest=_digest(main_bytes),
+        owned_span_base64=base64.b64encode(main_bytes).decode("ascii"),
+        json_path=(_main_path if bind_json_paths or len(spans) > 1 or _main_path else None),
+        additional_spans=additional,
+    )
+
+
 def _validated_spec(value: object) -> OwnedConfigSpec:
     try:
         payload = (
@@ -213,13 +312,443 @@ def _validated_spec(value: object) -> OwnedConfigSpec:
         raise ConfigFileError() from None
 
 
-def _json_object_insertion(current: bytes, fragment: bytes) -> tuple[bytes, int, bytes]:
+def _skip_json_whitespace(value: bytes, start: int) -> int:
+    while start < len(value) and value[start] in b" \t\r\n":
+        start += 1
+    return start
+
+
+def _json_string_end(value: bytes, start: int) -> int:
+    if start >= len(value) or value[start] != ord('"'):
+        raise ConfigFileError()
+    cursor = start + 1
+    while cursor < len(value):
+        current = value[cursor]
+        if current == ord('"'):
+            return cursor + 1
+        if current == ord("\\"):
+            cursor += 2
+        else:
+            cursor += 1
+    raise ConfigFileError()
+
+
+def _json_value_end(value: bytes, start: int) -> int:
+    cursor = _skip_json_whitespace(value, start)
+    if cursor >= len(value):
+        raise ConfigFileError()
+    if value[cursor] == ord('"'):
+        return _json_string_end(value, cursor)
+    if value[cursor] not in b"[{":
+        end = cursor
+        while end < len(value) and value[end] not in b" \t\r\n,]}":
+            end += 1
+        if end == cursor:
+            raise ConfigFileError()
+        return end
+
+    expected_closers = [ord("]") if value[cursor] == ord("[") else ord("}")]
+    cursor += 1
+    while cursor < len(value) and expected_closers:
+        current = value[cursor]
+        if current == ord('"'):
+            cursor = _json_string_end(value, cursor)
+            continue
+        if current == ord("["):
+            expected_closers.append(ord("]"))
+        elif current == ord("{"):
+            expected_closers.append(ord("}"))
+        elif current in b"]}" and current != expected_closers.pop():
+            raise ConfigFileError()
+        cursor += 1
+    if expected_closers:
+        raise ConfigFileError()
+    return cursor
+
+
+def _json_object_member_value_span(
+    document: bytes,
+    member: str,
+) -> tuple[int, int] | None:
+    cursor = _skip_json_whitespace(document, 0)
+    if cursor >= len(document) or document[cursor] != ord("{"):
+        raise ConfigFileError()
+    cursor = _skip_json_whitespace(document, cursor + 1)
+    while cursor < len(document) and document[cursor] != ord("}"):
+        key_start = cursor
+        key_end = _json_string_end(document, key_start)
+        decoded_key = _strict_json_loads(document[key_start:key_end])
+        if type(decoded_key) is not str:
+            raise ConfigFileError()
+        cursor = _skip_json_whitespace(document, key_end)
+        if cursor >= len(document) or document[cursor] != ord(":"):
+            raise ConfigFileError()
+        value_start = _skip_json_whitespace(document, cursor + 1)
+        value_end = _json_value_end(document, value_start)
+        if decoded_key == member:
+            return value_start, value_end
+        cursor = _skip_json_whitespace(document, value_end)
+        if cursor >= len(document) or document[cursor] not in b",}":
+            raise ConfigFileError()
+        if document[cursor] == ord(","):
+            cursor = _skip_json_whitespace(document, cursor + 1)
+    return None
+
+
+def _json_path_value_span(document: bytes, path: tuple[str, ...]) -> tuple[int, int]:
+    start = 0
+    end = len(document)
+    for member in path:
+        relative = _json_object_member_value_span(document[start:end], member)
+        if relative is None:
+            raise ConfigFileError()
+        relative_start, relative_end = relative
+        start, end = start + relative_start, start + relative_end
+    return start, end
+
+
+def _json_insertion_semantics(span: bytes, container: object) -> object:
+    core = span[1:] if span.startswith(b",") else span
+    if type(container) is list:
+        decoded = _strict_json_loads(b"[" + core + b"]")
+        if type(decoded) is not list or not decoded:
+            raise ConfigFileError()
+        return decoded
+    if type(container) is dict:
+        decoded = _strict_json_loads(b"{" + core + b"}")
+        if type(decoded) is not dict or not decoded:
+            raise ConfigFileError()
+        return decoded
+    raise ConfigFileError()
+
+
+def _json_string_values(value: object) -> tuple[str, ...]:
+    if type(value) is str:
+        return (value,)
+    if type(value) is list:
+        return tuple(item for nested in value for item in _json_string_values(nested))
+    if type(value) is dict:
+        return tuple(item for nested in value.values() for item in _json_string_values(nested))
+    return ()
+
+
+def _direct_json_span_offsets(container: bytes, span: bytes) -> tuple[int, ...]:
+    raw_offsets: list[int] = []
+    cursor = 0
+    while True:
+        start = container.find(span, cursor)
+        if start < 0:
+            break
+        raw_offsets.append(start)
+        if len(raw_offsets) > 64:
+            raise ConfigFileError()
+        cursor = start + 1
+
+    leading_comma = span.startswith(b",")
+    core_starts = {start + int(leading_comma) for start in raw_offsets}
+    ends = {start + len(span) for start in raw_offsets}
+    next_nonwhitespace: dict[int, int | None] = {}
+    next_index: int | None = None
+    queries = core_starts | ends
+    for index in range(len(container) - 1, -1, -1):
+        if container[index] not in b" \t\r\n":
+            next_index = index
+        if index in queries:
+            next_nonwhitespace[index] = next_index
+    if len(container) in queries:
+        next_nonwhitespace[len(container)] = None
+
+    candidate_positions: list[tuple[int, int, int | None, int | None]] = []
+    for start in raw_offsets:
+        end = start + len(span)
+        core_start = start + int(leading_comma)
+        candidate_positions.append(
+            (
+                start,
+                end,
+                next_nonwhitespace.get(core_start),
+                next_nonwhitespace.get(end),
+            )
+        )
+
+    needed_states = {
+        position
+        for start, end, first, following in candidate_positions
+        for position in (start, end, first, following)
+        if position is not None
+    }
+    starts = set(raw_offsets)
+    preceding: dict[int, int | None] = {}
+    states: dict[int, tuple[int, bool]] = {}
+    depth = 0
+    in_string = False
+    escaped = False
+    previous_nonwhitespace: int | None = None
+    for index, value in enumerate(container):
+        if index in starts:
+            preceding[index] = previous_nonwhitespace
+        if index in needed_states:
+            states[index] = (depth, in_string)
+        if in_string:
+            if escaped:
+                escaped = False
+            elif value == ord("\\"):
+                escaped = True
+            elif value == ord('"'):
+                in_string = False
+        elif value == ord('"'):
+            in_string = True
+        elif value in b"[{":
+            depth += 1
+        elif value in b"]}":
+            depth -= 1
+        if value not in b" \t\r\n":
+            previous_nonwhitespace = index
+    if len(container) in needed_states:
+        states[len(container)] = (depth, in_string)
+    if depth != 0 or in_string:
+        raise ConfigFileError()
+
+    offsets: list[int] = []
+    for start, end, first, following in candidate_positions:
+        previous = preceding[start]
+        if (
+            first is None
+            or first >= end
+            or following is None
+            or states.get(first) != (1, False)
+            or states.get(end) != (1, False)
+            or states.get(following) != (1, False)
+            or container[following : following + 1] not in b",]}"
+            or (
+                leading_comma
+                and (states.get(start) != (1, False) or container[start : start + 1] != b",")
+            )
+            or (
+                not leading_comma
+                and (previous is None or container[previous : previous + 1] not in b"[{,")
+            )
+        ):
+            continue
+        offsets.append(start)
+    return tuple(offsets)
+
+
+def _locate_json_owned_spans(
+    document: bytes,
+    spans: tuple[OwnedConfigSpan, ...],
+) -> tuple[tuple[int, bytes, tuple[str, ...] | None, object | None], ...]:
+    located: list[tuple[int, bytes, tuple[str, ...] | None, object | None]] = []
+    for owned in spans:
+        span = owned.owned_span()
+        if owned.json_path is not None:
+            container_start, container_end = _json_path_value_span(document, owned.json_path)
+            container_bytes = document[container_start:container_end]
+            container = _strict_json_loads(container_bytes)
+            semantics = _json_insertion_semantics(span, container)
+        else:
+            container_start = 0
+            container_bytes = document
+            container = _strict_json_loads(container_bytes)
+            semantics = None
+        offsets = _direct_json_span_offsets(container_bytes, span)
+        if len(offsets) != 1:
+            raise ConfigFileError()
+        if type(container) not in {dict, list}:
+            raise ConfigFileError()
+        start = container_start + offsets[0]
+        located.append((start, span, owned.json_path, semantics))
+    ordered = tuple(sorted(located, key=lambda item: item[0], reverse=True))
+    ascending = tuple(reversed(ordered))
+    if any(left[0] + len(left[1]) > right[0] for left, right in pairwise(ascending)):
+        raise ConfigFileError()
+    return ordered
+
+
+def _validate_json_owned_semantics_removed(
+    document: bytes,
+    located: tuple[tuple[int, bytes, tuple[str, ...] | None, object | None], ...],
+) -> None:
+    for _start, _span, path, semantics in located:
+        if path is None or semantics is None:
+            continue
+        container_start, container_end = _json_path_value_span(document, path)
+        container = _strict_json_loads(document[container_start:container_end])
+        identity_values = tuple(
+            sorted(
+                (value for value in _json_string_values(semantics) if len(value) >= 20),
+                key=len,
+                reverse=True,
+            )
+        )
+        if type(container) is list and type(semantics) is list:
+            if any(item in container for item in semantics) or (
+                identity_values and identity_values[0] in _json_string_values(container)
+            ):
+                raise ConfigFileError()
+        elif type(container) is dict and type(semantics) is dict:
+            if any(
+                key in container and container[key] == value for key, value in semantics.items()
+            ) or (identity_values and identity_values[0] in _json_string_values(container)):
+                raise ConfigFileError()
+        else:
+            raise ConfigFileError()
+
+
+def _owned_config_edit_matches_spec(
+    edit: OwnedConfigReverseEdit,
+    spec: OwnedConfigSpec,
+) -> bool:
+    """Match a reverse edit to either a top-level or nested owned JSON span."""
+
+    try:
+        checked = _validated_spec(spec)
+        if type(edit) is not OwnedConfigReverseEdit:
+            return False
+        if edit.syntax is not checked.syntax or edit.marker != checked.marker:
+            return False
+        if checked.bind_json_paths and edit.json_path is None:
+            return False
+        spans = tuple(item.owned_span() for item in edit.owned_spans())
+        separator = b"," if checked.syntax is ConfigSyntax.JSON_OBJECT else b"\n"
+        candidates = {checked.owned_fragment, separator + checked.owned_fragment}
+        if checked.syntax is not ConfigSyntax.JSON_OBJECT:
+            return len(spans) == 1 and spans[0] in candidates
+        document = b"{" + checked.owned_fragment + b"}"
+        decoded = _strict_json_loads(document)
+        if type(decoded) is not dict or len(decoded) != 1:
+            return False
+        _key, value = next(iter(decoded.items()))
+        if type(value) is not dict or not value:
+            return len(spans) == 1 and spans[0] in candidates
+        value_span = _json_object_member_value_span(document, _key)
+        if value_span is None:
+            return False
+        value_start, value_end = value_span
+        members = document[value_start + 1 : value_end - 1]
+        candidates.update((members, b"," + members))
+
+        def matches_owned_piece(span: bytes) -> bool:
+            if span in candidates:
+                return True
+            core = span[1:] if span.startswith(b",") else span
+            try:
+                object_piece = _strict_json_loads(b"{" + core + b"}")
+            except ConfigFileError:
+                object_piece = None
+            if (
+                type(object_piece) is dict
+                and object_piece
+                and set(object_piece) <= set(value)
+                and all(object_piece[key] == value[key] for key in object_piece)
+            ):
+                return True
+            try:
+                array_piece = _strict_json_loads(b"[" + core + b"]")
+            except ConfigFileError:
+                return False
+            return type(array_piece) is list and any(
+                array_piece == groups for groups in value.values()
+            )
+
+        return all(matches_owned_piece(span) for span in spans)
+    except Exception:
+        return False
+
+
+def _json_object_insertion(
+    current: bytes,
+    fragment: bytes,
+) -> tuple[bytes, tuple[tuple[int, bytes, tuple[str, ...]], ...]]:
     decoded = _strict_json_loads(current)
     if type(decoded) is not dict:
         raise ConfigFileError()
     owned = _strict_json_loads(b"{" + fragment + b"}")
-    if type(owned) is not dict or len(owned) != 1 or next(iter(owned)) in decoded:
+    if type(owned) is not dict or len(owned) != 1:
         raise ConfigFileError()
+    owned_key, owned_value = next(iter(owned.items()))
+    if owned_key in decoded:
+        existing_value = decoded[owned_key]
+        if type(existing_value) is not dict or type(owned_value) is not dict or not owned_value:
+            raise ConfigFileError()
+        current_value_span = _json_object_member_value_span(current, owned_key)
+        if current_value_span is None:
+            raise ConfigFileError()
+        current_value_start, current_value_end = current_value_span
+        if (
+            current[current_value_start : current_value_start + 1] != b"{"
+            or current[current_value_end - 1 : current_value_end] != b"}"
+        ):
+            raise ConfigFileError()
+        if set(existing_value).isdisjoint(owned_value):
+            owned_document = b"{" + fragment + b"}"
+            owned_value_span = _json_object_member_value_span(owned_document, owned_key)
+            if owned_value_span is None:
+                raise ConfigFileError()
+            owned_value_start, owned_value_end = owned_value_span
+            owned_members = owned_document[owned_value_start + 1 : owned_value_end - 1]
+            separator = b"" if not existing_value else b","
+            span = separator + owned_members
+            close = current_value_end - 1
+            return current[:close] + span + current[close:], ((close, span, (owned_key,)),)
+        current_object = current[current_value_start:current_value_end]
+        operations: list[tuple[int, bytes, tuple[str, ...]]] = []
+        missing: list[bytes] = []
+        for member, owned_member_value in owned_value.items():
+            if member not in existing_value:
+                encoded_member = canonical_json({member: owned_member_value})[1:-1]
+                if not encoded_member:
+                    raise ConfigFileError()
+                missing.append(encoded_member)
+                continue
+            existing_member_value = existing_value[member]
+            if (
+                type(existing_member_value) is not list
+                or type(owned_member_value) is not list
+                or not owned_member_value
+            ):
+                raise ConfigFileError()
+            member_span = _json_object_member_value_span(current_object, member)
+            if member_span is None:
+                raise ConfigFileError()
+            member_start, member_end = member_span
+            if (
+                current_object[member_start : member_start + 1] != b"["
+                or current_object[member_end - 1 : member_end] != b"]"
+            ):
+                raise ConfigFileError()
+            owned_members = canonical_json(owned_member_value)[1:-1]
+            if not owned_members or owned_members in current:
+                raise ConfigFileError()
+            separator = b"," if existing_member_value else b""
+            operations.append(
+                (
+                    current_value_start + member_end - 1,
+                    separator + owned_members,
+                    (owned_key, member),
+                )
+            )
+        if missing:
+            separator = b"," if existing_value else b""
+            operations.append(
+                (
+                    current_value_end - 1,
+                    separator + b",".join(missing),
+                    (owned_key,),
+                )
+            )
+        if not operations or len(operations) > 16:
+            raise ConfigFileError()
+        ordered = tuple(sorted(operations, key=lambda item: item[0]))
+        installed = current
+        for position, span, _json_path in reversed(ordered):
+            installed = installed[:position] + span + installed[position:]
+        shifted: list[tuple[int, bytes, tuple[str, ...]]] = []
+        offset = 0
+        for position, span, json_path in ordered:
+            shifted.append((position + offset, span, json_path))
+            offset += len(span)
+        return installed, tuple(shifted)
     end = len(current)
     while end and current[end - 1] in b" \t\r\n":
         end -= 1
@@ -233,7 +762,7 @@ def _json_object_insertion(current: bytes, fragment: bytes) -> tuple[bytes, int,
         raise ConfigFileError()
     separator = b"" if not decoded else b","
     span = separator + fragment
-    return current[:close] + span + current[close:], close, span
+    return current[:close] + span + current[close:], ((close, span, ()),)
 
 
 def _opaque_insertion(current: bytes, fragment: bytes) -> tuple[bytes, int, bytes]:
@@ -288,9 +817,10 @@ def plan_owned_config_install(
         if marker in original:
             raise ConfigFileError()
         if checked.syntax is ConfigSyntax.JSON_OBJECT:
-            installed, start, span = _json_object_insertion(original, checked.owned_fragment)
+            installed, spans = _json_object_insertion(original, checked.owned_fragment)
         else:
             installed, start, span = _opaque_insertion(original, checked.owned_fragment)
+            spans = ((start, span, ()),)
         if checked.syntax is ConfigSyntax.TOML_DOCUMENT:
             original_document = _strict_toml_loads(original)
             installed_document = _strict_toml_loads(installed)
@@ -304,16 +834,14 @@ def plan_owned_config_install(
             )
         if len(installed) > MAX_PROVIDER_CONFIG_BYTES:
             raise ConfigFileError()
-        reverse = OwnedConfigReverseEdit(
+        reverse = _reverse_edit(
             syntax=checked.syntax,
             target_existed=target_existed,
-            preimage_digest=_digest(original),
-            installed_digest=_digest(installed),
+            original=original,
+            installed=installed,
             marker=checked.marker,
-            start=start,
-            end=start + len(span),
-            owned_span_digest=_digest(span),
-            owned_span_base64=base64.b64encode(span).decode("ascii"),
+            spans=spans,
+            bind_json_paths=checked.bind_json_paths,
         )
         return OwnedConfigPlan(installed_bytes=installed, reverse_edit=reverse)
     except ConfigFileError:
@@ -337,54 +865,75 @@ def remove_owned_config_edit(
             else reverse_edit
         )
         checked = OwnedConfigReverseEdit.model_validate(payload)
-        span = checked.owned_span()
+        spans = checked.owned_spans()
         if _digest(current) == checked.installed_digest:
-            if current[checked.start : checked.end] != span:
-                raise ConfigFileError()
-            restored = current[: checked.start] + current[checked.end :]
+            restored = current
+            for owned in reversed(spans):
+                span = owned.owned_span()
+                if restored[owned.start : owned.end] != span:
+                    raise ConfigFileError()
+                restored = restored[: owned.start] + restored[owned.end :]
             if _digest(restored) != checked.preimage_digest:
                 raise ConfigFileError()
             return None if not checked.target_existed else restored
-        if current.count(span) != 1 or current.count(checked.marker.encode("ascii")) != 1:
+        if current.count(checked.marker.encode("ascii")) != 1:
             raise ConfigFileError()
-        start = current.index(span)
-        before = current[:start]
-        after = current[start + len(span) :]
-        restored = before + after
         if checked.syntax is ConfigSyntax.JSON_OBJECT:
             if type(_strict_json_loads(current)) is not dict:
                 raise ConfigFileError()
-            candidates = [restored]
-            following = next(
-                (index for index, value in enumerate(after) if value not in b" \t\r\n"),
-                None,
-            )
-            if following is not None and after[following : following + 1] == b",":
-                candidates.append(before + after[:following] + after[following + 1 :])
-            preceding = next(
-                (
-                    index
-                    for index in range(len(before) - 1, -1, -1)
-                    if before[index] not in b" \t\r\n"
-                ),
-                None,
-            )
-            if preceding is not None and before[preceding : preceding + 1] == b",":
-                candidates.append(before[:preceding] + before[preceding + 1 :] + after)
-            valid: list[bytes] = []
-            for candidate in candidates:
-                try:
-                    decoded = _strict_json_loads(candidate)
-                except ConfigFileError:
-                    continue
-                if type(decoded) is dict and candidate not in valid:
-                    valid.append(candidate)
-            if len(valid) != 1:
-                raise ConfigFileError()
-            restored = valid[0]
+            restored = current
+            remaining = list(spans)
+            removed: list[tuple[int, bytes, tuple[str, ...] | None, object | None]] = []
+            while remaining:
+                located = _locate_json_owned_spans(restored, tuple(remaining))
+                start, span, path, semantics = located[0]
+                before = restored[:start]
+                after = restored[start + len(span) :]
+                candidates = [before + after]
+                following = next(
+                    (index for index, value in enumerate(after) if value not in b" \t\r\n"),
+                    None,
+                )
+                if following is not None and after[following : following + 1] == b",":
+                    candidates.append(before + after[:following] + after[following + 1 :])
+                preceding = next(
+                    (
+                        index
+                        for index in range(len(before) - 1, -1, -1)
+                        if before[index] not in b" \t\r\n"
+                    ),
+                    None,
+                )
+                if preceding is not None and before[preceding : preceding + 1] == b",":
+                    candidates.append(before[:preceding] + before[preceding + 1 :] + after)
+                valid: list[bytes] = []
+                for candidate in candidates:
+                    try:
+                        decoded = _strict_json_loads(candidate)
+                    except ConfigFileError:
+                        continue
+                    if type(decoded) is dict and candidate not in valid:
+                        valid.append(candidate)
+                if len(valid) != 1:
+                    raise ConfigFileError()
+                restored = valid[0]
+                removed.append((start, span, path, semantics))
+                remaining = [owned for owned in remaining if owned.owned_span() != span]
+            _validate_json_owned_semantics_removed(restored, tuple(removed))
         elif checked.syntax is ConfigSyntax.TOML_DOCUMENT:
+            span = checked.owned_span()
+            if current.count(span) != 1:
+                raise ConfigFileError()
+            start = current.index(span)
+            restored = current[:start] + current[start + len(span) :]
             _strict_toml_loads(current)
             _strict_toml_loads(restored)
+        else:
+            span = checked.owned_span()
+            if current.count(span) != 1:
+                raise ConfigFileError()
+            start = current.index(span)
+            restored = current[:start] + current[start + len(span) :]
         if len(restored) > MAX_PROVIDER_CONFIG_BYTES:
             raise ConfigFileError()
         return restored

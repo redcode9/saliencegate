@@ -37,8 +37,8 @@ from saliencegate.integrations.bootstrap import (
 )
 from saliencegate.integrations.config_files import (
     ConfigFileError,
-    ConfigSyntax,
     OwnedConfigReverseEdit,
+    _owned_config_edit_matches_spec,
     delete_config_bytes,
     plan_owned_config_install,
     publish_config_bytes,
@@ -1417,13 +1417,7 @@ def _config_edit_matches_spec(
     edit: OwnedConfigReverseEdit,
     spec: ProviderInstallationSpec,
 ) -> bool:
-    if edit.syntax is not spec.config.syntax or edit.marker != spec.config.marker:
-        return False
-    separator = b"," if spec.config.syntax is ConfigSyntax.JSON_OBJECT else b"\n"
-    return edit.owned_span() in {
-        spec.config.owned_fragment,
-        separator + spec.config.owned_fragment,
-    }
+    return _owned_config_edit_matches_spec(edit, spec.config)
 
 
 def inspect_provider_installation(

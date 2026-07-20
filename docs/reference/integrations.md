@@ -9,9 +9,9 @@ The contract was audited on **2026-07-19**. The allowlists below describe native
 evidence authority; those fields may exist briefly in bounded memory. Provider identifiers and
 native tool inputs are reduced with a domain-separated HMAC before durable storage. Every unlisted
 field is ignored by the evidence adapter, and no raw field listed here is reportable. A connector
-may separately validate a content-free routing envelope: Codex uses `cwd` in memory to authenticate
-the matching project installation before invoking its adapter, even when that event gives `cwd` no
-evidence authority.
+may separately validate a content-free routing envelope: Codex and Claude Code use `cwd` in memory
+to authenticate the matching project installation before invoking their adapters, even when that
+event gives `cwd` no evidence authority.
 
 ## Compatibility summary
 
@@ -34,6 +34,21 @@ authenticates that receipt without launching Codex; a later connect probes again
 whether an upgrade is needed. Connect also refuses a project layer that sets `features.hooks=false`,
 the deprecated `features.codex_hooks=false`, or `allow_managed_hooks_only=true`; it never changes
 those user or administrator policies.
+
+Claude Code connect accepts the audited `2.1.204` release and newer patch releases in the same
+`2.1.x` line as schema-compatible but unverified. Normal connect performs the bounded local
+`claude --version` probe; dry-run, fixture validation, status, packaging, and artifact smoke never
+launch Claude. Existing unrelated top-level settings and existing hook groups are byte-preserved in
+`.claude/settings.local.json`; SalienceGate appends one distinct owned group to each selected event
+array. Explicit hook disablement and malformed groups on selected event arrays fail before the
+probe. Disconnect removes the authenticated owned spans and exactly restores an otherwise unchanged
+config.
+
+SalienceGate validates the hook control surface it owns, not Claude Code's entire evolving settings
+schema. A malformed foreign setting can therefore cause Claude to reject that settings layer,
+including the appended handlers. Connect proves an authenticated installation, while status remains
+`INSTALLED_NOT_OBSERVED` until an actual lifecycle callback proves activation; this is the explicit
+`host_rejected_foreign_settings_layer` coverage exclusion.
 
 ## Evidence field allowlists
 
@@ -67,28 +82,41 @@ local observation metadata only.
 
 ### Claude Code
 
-Every selected Claude event consumes `session_id`, `cwd`, and `hook_event_name`.
-`prompt_id` is consumed when present and HMAC-reduced as turn correlation; it is available in the
-audited host because it was introduced before `2.1.204`. It is not a sequence number.
+The installed transport requires `session_id`, absolute `cwd`, and `hook_event_name` before it
+loads the adapter. `cwd` authenticates the project-local installation and is admitted as an
+opaque workspace digest only for `PreToolUse`. `prompt_id` is HMAC-reduced only for required
+`StopFailure` correlation; it is not a sequence number.
 
 | Event | Additional consumed fields | Evidence authority |
 |---|---|---|
-| `SessionStart` | `source` | Opens an observed window. `source` is provider claimed. |
-| `PreToolUse` | `tool_name`, `tool_input`, `tool_use_id` | `tool_use_id` is exact parent correlation; tool name and input derive only opaque action identity. |
-| `PostToolUse` | `tool_name`, `tool_input`, `tool_use_id` | The event discriminator is provider-claimed structured success. |
-| `PostToolUseFailure` | `tool_name`, `tool_input`, `tool_use_id`, optional `is_interrupt` | The event discriminator is provider-claimed structured failure; `is_interrupt` is an allowlisted modifier. |
-| `PostToolBatch` | `tool_calls[].tool_name`, `tool_calls[].tool_use_id` | Reconciles and flushes already-reduced calls. A batch is not a task outcome. |
-| `PermissionDenied` | `tool_name`, `tool_input`, `tool_use_id` | The event discriminator is provider-claimed denial in auto mode only. |
-| `SubagentStart`, `SubagentStop` | `agent_id`, `agent_type` | The agent identifiers are correlation inputs only and are HMAC-reduced. |
-| `Stop` | none | Ends one observed turn, not the task or session. |
-| `StopFailure` | `error` | The documented error enum is an allowlisted controller-failure code, not tool or task failure. |
-| `SessionEnd` | `reason` | Closes the observed session with a provider-claimed reason. |
+| `SessionStart` | none | Opens an observed window. |
+| `PreToolUse` | optional `tool_name`, `tool_use_id` | This is only a pre-hook proposal because another hook can rewrite or block it. `tool_use_id` is exact parent correlation; an optional tool name selects one closed generic proposal class. No exact executed-action identity is created. |
+| `PostToolUse` | `tool_use_id` | The event discriminator is provider-claimed structured success. |
+| `PostToolUseFailure` | `tool_use_id`, optional exact boolean `is_interrupt` | The event discriminator is provider-claimed structured failure; `is_interrupt` selects only the generic interrupted class. |
+| `PostToolBatch` | `tool_calls[].tool_use_id` | Validates a bounded, unique reconciliation set and emits no semantic intake. A batch is not an outcome. |
+| `PermissionDenied` | `tool_use_id` | The event discriminator is provider-claimed denial from the pinned auto-mode classifier path; denials outside that path are not covered. |
+| `SubagentStart` | `agent_id` | The agent identifier is correlation-only and HMAC-reduced. |
+| `SubagentStop` | `agent_id` | Validates the bounded selected shape but creates no semantic intake because another hook can continue the subagent. |
+| `Stop` | none | Validates the bounded selected shape but creates no semantic intake because another hook can continue the turn. |
+| `StopFailure` | required `prompt_id` | Emits one provider-callback-reported generic controller/API failure; raw error values and details are excluded. A failure before the first prompt has no `prompt_id`, is omitted, and degrades coverage. |
+| `SessionEnd` | none | Validates the bounded selected shape but creates no semantic intake. Native session identifiers survive resume, so the capture session remains open. |
 
-`transcript_path` is never opened. `tool_response`, `tool_calls[].tool_input`,
-`tool_calls[].tool_response`, `error` text from a tool failure, `reason` text from a denial,
+`transcript_path` and `agent_transcript_path` are never opened. `tool_response`,
+`PreToolUse.tool_input`, `tool_calls[].tool_input`, the optional raw
+`tool_calls[].tool_response`, `duration_ms`, the top-level `PostToolUseFailure.error` text, the
+top-level `PermissionDenied.reason` text,
 `error_details`, `last_assistant_message`, `background_tasks`, `session_crons`,
-`permission_mode`, `effort`, session titles, and every other field are ignored. Event handlers
-must return no decision or context and must always leave normal Claude behavior unchanged.
+`stop_hook_active`, `permission_mode`, every event's optional `effort` object, and the
+`SessionStart` source, model, agent type, and session title are ignored. The audited fixture uses
+valid `2.1.204` `StopFailure.error` and `SessionEnd.reason` values, but the adapter does not persist
+or distinguish them. Every other unlisted field is ignored as well. SalienceGate's event handlers
+return no decision or context and leave normal Claude behavior unchanged.
+
+`SessionEnd` does not close the authenticated capture session, and a resumed `SessionStart` for the
+same native identifier replays the existing open session before later tool records append. An open
+session can still produce a positive memory-review suggestion from observed evidence, but it cannot
+support a negative claim that an event was absent. Disconnect likewise leaves already authenticated
+session evidence open; the normal bounded event limit still applies.
 
 Claude supplies no admitted timestamp or sequence field. Correlation by `prompt_id` and
 `tool_use_id` is provider claimed; receipt order and time are local observation metadata only.

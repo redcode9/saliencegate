@@ -45,6 +45,21 @@ _CODEX_HOOK_EVENT_VALUES: Final = frozenset(
         "Stop",
     )
 )
+_CLAUDE_CODE_HOOK_EVENT_VALUES: Final = frozenset(
+    (
+        "SessionStart",
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "PostToolBatch",
+        "PermissionDenied",
+        "SubagentStart",
+        "SubagentStop",
+        "Stop",
+        "StopFailure",
+        "SessionEnd",
+    )
+)
 _MAX_CAPTURE_NATIVE_BYTES: Final = 2 * 1_024 * 1_024
 _MAX_CAPTURE_JSON_DEPTH: Final = 32
 _MAX_CAPTURE_JSON_ITEMS: Final = 10_000
@@ -192,14 +207,26 @@ def _default_dependencies(
             parse_constant=_reject_json_constant,
             object_pairs_hook=_unique_json_object,
         )
-        if type(document) is not dict or profile != "codex-hooks/v1":
+        providers = {
+            "codex-hooks/v1": (
+                _CODEX_HOOK_EVENT_VALUES,
+                "saliencegate.integrations.codex",
+            ),
+            "claude-code-hooks/v1": (
+                _CLAUDE_CODE_HOOK_EVENT_VALUES,
+                "saliencegate.integrations.claude_code",
+            ),
+        }
+        selected = providers.get(profile)
+        if type(document) is not dict or selected is None:
             return None
+        event_values, module_name = selected
         event_name = document.get("hook_event_name")
         session_id = document.get("session_id")
         cwd = document.get("cwd")
         if (
             type(event_name) is not str
-            or event_name not in _CODEX_HOOK_EVENT_VALUES
+            or event_name not in event_values
             or type(session_id) is not str
             or not 1 <= len(session_id.encode("utf-8")) <= _MAX_CAPTURE_JSON_STRING_BYTES
             or type(cwd) is not str
@@ -210,7 +237,7 @@ def _default_dependencies(
             return None
         import importlib
 
-        module = importlib.import_module("saliencegate.integrations.codex")
+        module = importlib.import_module(module_name)
         builder = getattr(module, "build_capture_hook_dependencies", None)
         if not callable(builder):
             return None

@@ -163,15 +163,16 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
-def test_builtin_registry_is_closed_and_only_codex_is_available(
+def test_builtin_registry_is_closed_and_completed_connectors_are_available(
     tmp_path: Path,
 ) -> None:
     assert tuple(item.alias for item in BUILTIN_PROVIDER_REGISTRY.providers) == tuple(ProviderAlias)
     for alias in ProviderAlias:
         registration = BUILTIN_PROVIDER_REGISTRY.resolve(alias, require_available=False)
         assert registration.alias is alias
-        assert registration.available is (alias is ProviderAlias.CODEX)
-        if alias is ProviderAlias.CODEX:
+        available = alias in (ProviderAlias.CODEX, ProviderAlias.CLAUDE_CODE)
+        assert registration.available is available
+        if available:
             assert BUILTIN_PROVIDER_REGISTRY.resolve(alias) == registration
         else:
             with pytest.raises(ProviderRegistryError):
@@ -383,6 +384,10 @@ def test_receipt_v1_infers_kind_without_changing_the_authenticated_wire_shape(
     command_hook_data = command_hook.receipt_path.read_bytes()
     assert b'"installation_kind"' not in bridge_data
     assert b'"installation_kind"' not in command_hook_data
+    assert b'"additional_spans"' not in bridge_data
+    assert b'"additional_spans"' not in command_hook_data
+    assert b'"json_path"' not in bridge_data
+    assert b'"json_path"' not in command_hook_data
     assert installation_module._decode_receipt(bridge_data, KEY).installation_kind is (
         ProviderInstallationKind.BRIDGE
     )
@@ -1017,6 +1022,8 @@ def test_pending_install_recovers_forward_from_content_free_journal(tmp_path: Pa
     assert spec.journal_path.exists()
     journal = spec.journal_path.read_bytes()
     assert b'"installation_kind"' not in journal
+    assert b'"additional_spans"' not in journal
+    assert b'"json_path"' not in journal
     assert b"journal-secret" not in journal
     assert b"crash-secret" not in journal
 

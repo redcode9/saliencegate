@@ -220,6 +220,7 @@ CAPTURE_RUNTIME_FILES = {
     "saliencegate/commands/capture/status.py",
     "saliencegate/integrations/__init__.py",
     "saliencegate/integrations/bootstrap.py",
+    "saliencegate/integrations/claude_code.py",
     "saliencegate/integrations/codex.py",
     "saliencegate/integrations/config_files.py",
     "saliencegate/integrations/hook.py",

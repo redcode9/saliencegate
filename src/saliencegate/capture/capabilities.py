@@ -119,6 +119,7 @@ _OutcomeAuthority: TypeAlias = Literal[
     "flush_only",
     "lineage_hint_only",
     "no_semantic_intake",
+    "pre_hook_proposal",
     "provider_claimed_controller_failure",
     "provider_claimed_denial",
     "provider_claimed_failure",

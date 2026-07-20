@@ -294,6 +294,7 @@ BUILTIN_PROVIDER_REGISTRY = ProviderRegistry(
             profile=CaptureProfile.CLAUDE_CODE_HOOKS_V1,
             host_name="Claude Code",
             host_version="2.1.204",
+            available=True,
         ),
         ProviderRegistration(
             alias=ProviderAlias.OPENCODE,

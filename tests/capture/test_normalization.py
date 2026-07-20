@@ -560,7 +560,7 @@ def test_later_unresolved_action_blocks_an_earlier_met_absence_minimum(
     assert evidence.minimum_observation_met is False
 
 
-def test_abstained_exact_parent_failures_do_not_meet_repeated_failure_minimum(
+def test_claude_coarse_pre_hook_identity_never_enables_repeated_failure(
     tmp_path: Path,
 ) -> None:
     snapshot = _snapshot(
@@ -587,22 +587,15 @@ def test_abstained_exact_parent_failures_do_not_meet_repeated_failure_minimum(
         snapshot,
         installation_key=INSTALLATION_KEY,
     )
-    evidence = next(
-        item
-        for item in normalized.detector_evidence
-        if item.signal_type is SignalType.REPEATED_FAILURE
-    )
-    final_result = next(
-        item
-        for item in normalized.extraction_reports[-2].evaluations
-        if item.signal_type is SignalType.REPEATED_FAILURE
-    )
-
     assert normalized.counts.exact_parent_classifiable_failed_result_count == 2
-    assert final_result.outcome.status is DetectionStatus.ABSTAINED
-    assert evidence.authorized_observation_count == 1
-    assert evidence.unresolved_observation_count == 1
-    assert evidence.minimum_observation_met is False
+    assert all(
+        item.signal_type is not SignalType.REPEATED_FAILURE for item in normalized.detector_evidence
+    )
+    assert all(
+        item.signal_type is not SignalType.REPEATED_FAILURE
+        for report in normalized.extraction_reports
+        for item in report.evaluations
+    )
 
 
 @pytest.mark.parametrize(
@@ -788,11 +781,7 @@ def test_capture_detector_minimum_rejects_uninstalled_detectors() -> None:
         (CaptureProfile.CODEX_HOOKS_V1, (SignalType.REPEATED_ACTION,)),
         (
             CaptureProfile.CLAUDE_CODE_HOOKS_V1,
-            (
-                SignalType.REPEATED_ACTION,
-                SignalType.REPEATED_FAILURE,
-                SignalType.TOOL_ERROR,
-            ),
+            (SignalType.TOOL_ERROR,),
         ),
         (
             CaptureProfile.OPENCODE_PLUGIN_V1,
@@ -841,11 +830,12 @@ def test_only_manifest_selected_detectors_are_evaluated(
         for item in report.evaluations
     )
     repeated = normalized.extraction_reports[-2]
-    assert any(
+    repeated_action_detected = any(
         item.signal_type is SignalType.REPEATED_ACTION
         and item.outcome.status is DetectionStatus.DETECTED
         for item in repeated.evaluations
     )
+    assert repeated_action_detected is (SignalType.REPEATED_ACTION in expected)
 
 
 def test_projection_uses_fixed_logical_order_and_is_byte_stable(tmp_path: Path) -> None:

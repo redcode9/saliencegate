@@ -80,7 +80,8 @@ _PROVIDER_MODULES: dict[ProviderAlias, str] = {
     ProviderAlias.OPENCODE: "saliencegate.integrations.opencode",
     ProviderAlias.PI: "saliencegate.integrations.pi",
 }
-_CODEX_HOST_VERSION = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
+_DYNAMIC_HOST_VERSION = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
+_DYNAMIC_HOST_PROVIDERS = frozenset((ProviderAlias.CODEX, ProviderAlias.CLAUDE_CODE))
 
 
 class CaptureConnectReport(BaseModel):
@@ -126,7 +127,7 @@ def _default_spec_resolver(
         result = factory(
             project,
             environ=environ,
-            **({"probe_host": True} if alias is ProviderAlias.CODEX and probe_host else {}),
+            **({"probe_host": True} if alias in _DYNAMIC_HOST_PROVIDERS and probe_host else {}),
         )
         return ProviderInstallationSpec.model_validate(result)
     except CaptureCommandUnavailableError:
@@ -164,8 +165,8 @@ def resolve_provider_installation_spec(
             or (
                 spec.host_version != registration.host_version
                 and not (
-                    alias is ProviderAlias.CODEX
-                    and _CODEX_HOST_VERSION.fullmatch(spec.host_version) is not None
+                    alias in _DYNAMIC_HOST_PROVIDERS
+                    and _DYNAMIC_HOST_VERSION.fullmatch(spec.host_version) is not None
                 )
             )
             or spec.project_root != project
@@ -332,12 +333,12 @@ def inspect_project_provider_installation(
     """Inspect one fully materialized provider installation without changing it."""
 
     spec = resolve_provider_installation_spec(alias, project, resolver, environ=environ)
-    if resolver is None and alias is ProviderAlias.CODEX:
+    if resolver is None and alias in _DYNAMIC_HOST_PROVIDERS:
         receipt = _load_receipt_optional(spec, installation_key)
         if receipt is not None:
-            from saliencegate.integrations.codex import provider_installation_spec
-
-            spec = provider_installation_spec(
+            module = importlib.import_module(_PROVIDER_MODULES[alias])
+            factory = module.provider_installation_spec
+            spec = factory(
                 project,
                 environ=environ,
                 host_version=receipt.host_version,

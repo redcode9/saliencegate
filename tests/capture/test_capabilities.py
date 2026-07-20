@@ -122,58 +122,58 @@ _EVENTS: Final = {
     CaptureProfile.CLAUDE_CODE_HOOKS_V1: {
         "SessionStart": (
             ("hook_event_name", "session_id"),
-            ("cwd", "prompt_id", "source"),
+            (),
             "window_open",
         ),
         "PreToolUse": (
             ("hook_event_name", "session_id", "tool_use_id"),
-            ("cwd", "prompt_id", "tool_input", "tool_name"),
-            "action_observed",
+            ("cwd", "tool_name"),
+            "pre_hook_proposal",
         ),
         "PostToolUse": (
             ("hook_event_name", "session_id", "tool_use_id"),
-            ("cwd", "prompt_id", "tool_input", "tool_name"),
+            (),
             "provider_claimed_success",
         ),
         "PostToolUseFailure": (
             ("hook_event_name", "session_id", "tool_use_id"),
-            ("cwd", "is_interrupt", "prompt_id", "tool_input", "tool_name"),
+            ("is_interrupt",),
             "provider_claimed_failure",
         ),
         "PostToolBatch": (
             ("hook_event_name", "session_id", "tool_calls[].tool_use_id"),
-            ("cwd", "prompt_id", "tool_calls[].tool_name"),
+            (),
             "reconciliation_only",
         ),
         "PermissionDenied": (
             ("hook_event_name", "session_id", "tool_use_id"),
-            ("cwd", "prompt_id", "tool_input", "tool_name"),
+            (),
             "provider_claimed_denial",
         ),
         "SubagentStart": (
             ("agent_id", "hook_event_name", "session_id"),
-            ("agent_type", "cwd", "prompt_id"),
+            (),
             "correlation_only",
         ),
         "SubagentStop": (
             ("agent_id", "hook_event_name", "session_id"),
-            ("agent_type", "cwd", "prompt_id"),
-            "correlation_only",
+            (),
+            "no_semantic_intake",
         ),
         "Stop": (
             ("hook_event_name", "session_id"),
-            ("cwd", "prompt_id"),
-            "turn_closed",
+            (),
+            "no_semantic_intake",
         ),
         "StopFailure": (
-            ("hook_event_name", "session_id"),
-            ("cwd", "error", "prompt_id"),
+            ("hook_event_name", "prompt_id", "session_id"),
+            (),
             "provider_claimed_controller_failure",
         ),
         "SessionEnd": (
             ("hook_event_name", "session_id"),
-            ("cwd", "prompt_id", "reason"),
-            "window_closed",
+            (),
+            "no_semantic_intake",
         ),
     },
     CaptureProfile.OPENCODE_PLUGIN_V1: {
@@ -258,17 +258,28 @@ _IGNORED_FIELDS: Final = {
         "turn_id",
     ),
     CaptureProfile.CLAUDE_CODE_HOOKS_V1: (
+        "agent_transcript_path",
+        "agent_type",
         "background_tasks",
+        "cwd",
+        "duration_ms",
         "effort",
+        "error",
         "error_details",
         "last_assistant_message",
-        "permission_denied.reason_text",
+        "model",
         "permission_mode",
+        "prompt_id",
+        "reason",
         "session_crons",
-        "session_titles",
+        "session_title",
+        "source",
+        "stop_hook_active",
         "tool_calls[].tool_input",
+        "tool_calls[].tool_name",
         "tool_calls[].tool_response",
-        "tool_failure.error_text",
+        "tool_input",
+        "tool_name",
         "tool_response",
         "transcript_path",
     ),
@@ -367,7 +378,18 @@ _COVERAGE: Final = {
     ),
     CaptureProfile.CLAUDE_CODE_HOOKS_V1: (
         ("selected_project_local_hook_events",),
-        ("background_tasks", "prompt_and_output_content", "session_crons"),
+        (
+            "background_tasks",
+            "coexisting_hooks_can_block_or_rewrite_pre_tool_use",
+            "host_rejected_foreign_settings_layer",
+            "permission_denials_outside_auto_mode",
+            "prompt_and_output_content",
+            "resumable_sessions_remain_open",
+            "runtime_hook_disablement",
+            "session_crons",
+            "stop_and_subagent_stop_callbacks_can_continue",
+            "stop_failures_before_first_prompt",
+        ),
     ),
     CaptureProfile.OPENCODE_PLUGIN_V1: (
         ("message.part.updated:tool",),
@@ -392,8 +414,8 @@ _DETECTORS: Final = {
         SignalType.CONFLICT: CapabilitySupport.UNSUPPORTED,
     },
     CaptureProfile.CLAUDE_CODE_HOOKS_V1: {
-        SignalType.REPEATED_ACTION: CapabilitySupport.CONDITIONAL,
-        SignalType.REPEATED_FAILURE: CapabilitySupport.CONDITIONAL,
+        SignalType.REPEATED_ACTION: CapabilitySupport.UNSUPPORTED,
+        SignalType.REPEATED_FAILURE: CapabilitySupport.UNSUPPORTED,
         SignalType.TEST_FAILURE: CapabilitySupport.UNSUPPORTED,
         SignalType.TOOL_ERROR: CapabilitySupport.SUPPORTED,
         SignalType.CONTEXT_SHIFT: CapabilitySupport.UNSUPPORTED,
@@ -611,6 +633,67 @@ def test_codex_fixture_freezes_the_selected_lifecycle_and_current_ignored_fields
     for event_name, fields in {
         "PermissionRequest": ("tool_input", "tool_name"),
         "SubagentStop": ("last_assistant_message", "stop_hook_active"),
+    }.items():
+        authority = next(item for item in profile.events if item.event_name == event_name)
+        assert set(fields) <= set(authority.ignored_fields)
+
+
+def test_claude_fixture_freezes_the_pinned_lifecycle_shapes_and_ignored_fields() -> None:
+    profile = capture_profile(CaptureProfile.CLAUDE_CODE_HOOKS_V1)
+    fixture_bytes = (
+        resources.files("saliencegate.integrations").joinpath(profile.fixtures[0].path).read_bytes()
+    )
+    fixture_body = json.loads(fixture_bytes.decode("utf-8"))
+    events = fixture_body["events"]
+    payloads = {item["event_name"]: item["payload"] for item in events}
+
+    assert fixture_body["provenance"] == "fully_synthetic_no_provider_or_model_call"
+    assert tuple(payloads) == tuple(_EVENTS[CaptureProfile.CLAUDE_CODE_HOOKS_V1])
+    assert len(events) == 11
+    assert profile.complete_execution_session_coverage is False
+
+    effort = payloads["PreToolUse"]["effort"]
+    assert effort == {"level": "medium"}
+    assert type(effort["level"]) is str
+    assert type(payloads["PostToolUseFailure"]["error"]) is str
+    batch_call = payloads["PostToolBatch"]["tool_calls"][0]
+    assert type(batch_call["tool_response"]) is str
+    assert type(payloads["PermissionDenied"]["reason"]) is str
+    assert payloads["PermissionDenied"]["permission_mode"] == "auto"
+    assert type(payloads["SubagentStop"]["agent_transcript_path"]) is str
+    assert type(payloads["SubagentStop"]["stop_hook_active"]) is bool
+    assert type(payloads["Stop"]["stop_hook_active"]) is bool
+    assert payloads["StopFailure"]["error"] in {
+        "authentication_failed",
+        "oauth_org_not_allowed",
+        "billing_error",
+        "rate_limit",
+        "overloaded",
+        "invalid_request",
+        "model_not_found",
+        "server_error",
+        "unknown",
+        "max_output_tokens",
+    }
+    assert type(payloads["StopFailure"]["error_details"]) is str
+    assert payloads["SessionEnd"]["reason"] in {
+        "clear",
+        "resume",
+        "logout",
+        "prompt_input_exit",
+        "other",
+        "bypass_permissions_disabled",
+    }
+
+    for event_name, fields in {
+        "PreToolUse": ("effort", "tool_input"),
+        "PostToolUseFailure": ("error",),
+        "PostToolBatch": ("tool_calls[].tool_input", "tool_calls[].tool_response"),
+        "PermissionDenied": ("permission_mode", "reason"),
+        "SubagentStop": ("agent_transcript_path", "stop_hook_active"),
+        "Stop": ("prompt_id", "stop_hook_active"),
+        "StopFailure": ("error", "error_details"),
+        "SessionEnd": ("reason",),
     }.items():
         authority = next(item for item in profile.events if item.event_name == event_name)
         assert set(fields) <= set(authority.ignored_fields)
