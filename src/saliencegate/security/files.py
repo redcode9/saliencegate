@@ -3456,8 +3456,15 @@ def ensure_private_directory(path: str | os.PathLike[str]) -> None:
     try:
         copied_path = _copy_path(path)
         if not _inspect_private_directory_boundary(copied_path):
-            authorization = _authorize_private_directory(copied_path, create=True)
-            authorization.revalidate()
+            try:
+                authorization = _authorize_private_directory(copied_path, create=True)
+            except Exception:
+                # Another process may have won the absent-leaf creation race.
+                # Accept only a fresh full private-boundary authorization.
+                if not _inspect_private_directory_boundary(copied_path):
+                    raise
+            else:
+                authorization.revalidate()
     except (SecureFileUnsupportedError, _UnsupportedFileOperationError):
         unsupported = True
     except OSError as error:

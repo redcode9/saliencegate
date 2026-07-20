@@ -1051,6 +1051,31 @@ class CaptureStore:
             self._revalidate_boundary()
             return summaries
 
+    def get_connection(self, connection_id: str) -> CaptureConnectionSummary:
+        """Return one authenticated connection without scanning unrelated history."""
+
+        self._ensure_open()
+        if type(connection_id) is not str:
+            raise CaptureStoreError()
+        with self._lock:
+            self._ensure_open()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                summary = self._connection_summary(self._connection_row(connection_id))
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return summary
+
     def list_sessions(
         self,
         *,
@@ -2209,6 +2234,57 @@ class CaptureStore:
             raise CaptureStoreIntegrityError()
         return row
 
+    def _create_degraded_session(self, connection_id: str, session_id: str) -> sqlite3.Row:
+        """Create a content-free quarantine when a callback cannot form evidence."""
+
+        timestamp = _now()
+        material: dict[str, object] = {
+            "connection_id": connection_id,
+            "session_id": session_id,
+            "human_id": self._human_session_id(connection_id, session_id),
+            "state": CaptureSessionState.QUARANTINED.value,
+            "event_count": 0,
+            "coverage_degraded": 1,
+            "unattributed_drop": 0,
+            "health_marker_count": 0,
+            "health_set_digest": self._health_set_digest(()),
+            "opened_at": timestamp,
+            "updated_at": timestamp,
+            "closed_at": None,
+        }
+        row_tag = self._integrity.tag("session", _session_material(material))
+        self._connection.execute(
+            """
+            INSERT INTO capture_sessions(
+                connection_id, session_id, human_id, state, event_count,
+                coverage_degraded, unattributed_drop, health_marker_count,
+                health_set_digest, opened_at, updated_at, closed_at, row_tag
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (*material.values(), row_tag),
+        )
+        head_tag = self._integrity.tag(
+            "head",
+            _head_material(
+                connection_id=connection_id,
+                session_id=session_id,
+                receipt_count=0,
+                head_event_tag=None,
+            ),
+        )
+        self._connection.execute(
+            """
+            INSERT INTO capture_heads(
+                connection_id, session_id, receipt_count, head_event_tag, head_tag
+            ) VALUES (?, ?, 0, NULL, ?)
+            """,
+            (connection_id, session_id, head_tag),
+        )
+        row = self._session_row(connection_id, session_id)
+        if row is None:
+            raise CaptureStoreIntegrityError()
+        return row
+
     def _update_session(
         self,
         row: sqlite3.Row,
@@ -2355,6 +2431,58 @@ class CaptureStore:
         if updated_session is None:
             raise CaptureStoreIntegrityError()
         self._verify_health_set(connection_id, session_id, updated_session)
+
+    def mark_session_health(
+        self,
+        connection_id: str,
+        session_id: str,
+        code: CaptureHealthCode,
+    ) -> None:
+        """Atomically attach one authenticated health marker to an existing session."""
+
+        self._ensure_open()
+        if (
+            type(connection_id) is not str
+            or type(session_id) is not str
+            or _PROJECT_DIGEST.fullmatch(session_id) is None
+            or type(code) is not CaptureHealthCode
+        ):
+            raise CaptureStoreError()
+        with self._lock:
+            self._ensure_open()
+            self._revalidate_boundary()
+            self._begin_immediate()
+            try:
+                connection = self._connection_row(connection_id)
+                if connection["state"] != CaptureConnectionState.ENABLED.value:
+                    raise CaptureStoreStateError()
+                session = self._append_session_row(connection_id, session_id)
+                if session is None:
+                    session = self._create_degraded_session(connection_id, session_id)
+                    head = self._head_row(connection_id, session_id)
+                else:
+                    head = self._head_row(connection_id, session_id)
+                    self._verify_append_commitment(connection_id, session_id, session, head)
+                    session = self._update_session(
+                        session,
+                        state=CaptureSessionState(session["state"]),
+                        event_count=session["event_count"],
+                        coverage_degraded=True,
+                    )
+                self._record_health(
+                    connection_id=connection_id,
+                    session_id=session_id,
+                    code=code,
+                )
+                self._verified_append_heads[(connection_id, session_id)] = (
+                    head["receipt_count"],
+                    head["head_event_tag"],
+                )
+                self._connection.commit()
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
 
     def _replay_receipt(self, event: CaptureEvent, session: sqlite3.Row) -> CaptureAppendReceipt:
         return CaptureAppendReceipt(

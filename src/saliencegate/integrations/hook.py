@@ -13,7 +13,7 @@ import math
 import os
 import re
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, BinaryIO, Final, Never, Protocol
@@ -31,6 +31,18 @@ _CAPTURE_PROFILE_VALUES: Final = frozenset(
         "claude-code-hooks/v1",
         "opencode-plugin/v1",
         "pi-extension/v1",
+    )
+)
+_CODEX_HOOK_EVENT_VALUES: Final = frozenset(
+    (
+        "SessionStart",
+        "PreToolUse",
+        "PermissionRequest",
+        "PostToolUse",
+        "PreCompact",
+        "SubagentStart",
+        "SubagentStop",
+        "Stop",
     )
 )
 _MAX_CAPTURE_NATIVE_BYTES: Final = 2 * 1_024 * 1_024
@@ -162,6 +174,57 @@ _UNAVAILABLE_CAPTURE_HOOK_DEPENDENCIES: Final = CaptureHookDependencies(
     mark_health=_unavailable_health,
 )
 DEFAULT_CAPTURE_HOOK_DEPENDENCIES: Final = _UNAVAILABLE_CAPTURE_HOOK_DEPENDENCIES
+
+
+def _default_dependencies(
+    *,
+    profile: str,
+    connection_id: str,
+    source: bytes,
+    environ: Mapping[str, str] | None,
+    capture_executable: str | os.PathLike[str] | None,
+) -> CaptureHookDependencies | None:
+    """Resolve an installed provider runtime only after a plausible native event."""
+
+    try:
+        document = json.loads(
+            source.decode("utf-8", errors="strict"),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_json_object,
+        )
+        if type(document) is not dict or profile != "codex-hooks/v1":
+            return None
+        event_name = document.get("hook_event_name")
+        session_id = document.get("session_id")
+        cwd = document.get("cwd")
+        if (
+            type(event_name) is not str
+            or event_name not in _CODEX_HOOK_EVENT_VALUES
+            or type(session_id) is not str
+            or not 1 <= len(session_id.encode("utf-8")) <= _MAX_CAPTURE_JSON_STRING_BYTES
+            or type(cwd) is not str
+            or not 1 <= len(cwd.encode("utf-8")) <= _MAX_CAPTURE_JSON_STRING_BYTES
+            or not os.path.isabs(cwd)
+            or "\x00" in cwd
+        ):
+            return None
+        import importlib
+
+        module = importlib.import_module("saliencegate.integrations.codex")
+        builder = getattr(module, "build_capture_hook_dependencies", None)
+        if not callable(builder):
+            return None
+        result = builder(
+            source,
+            connection_id=connection_id,
+            environ=environ,
+            capture_executable=capture_executable,
+        )
+        return result if type(result) is CaptureHookDependencies else None
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return None
 
 
 def _parse_capture_hook_argument_values(arguments: Sequence[str]) -> tuple[str, str]:
@@ -398,6 +461,8 @@ def run_capture_hook(
     stream: BinaryIO,
     *,
     dependencies: CaptureHookDependencies | None = None,
+    environ: Mapping[str, str] | None = None,
+    capture_executable: str | os.PathLike[str] | None = None,
 ) -> int:
     """Run one passive admission attempt and absorb all ordinary failures."""
 
@@ -408,17 +473,30 @@ def run_capture_hook(
     try:
         if type(selected) is not CaptureHookDependencies:
             raise CaptureHookError()
+        source: bytes | None = None
         if selected is _UNAVAILABLE_CAPTURE_HOOK_DEPENDENCIES:
-            _parse_capture_hook_argument_values(arguments)
-            read_capture_hook_document(stream)
-            return 0
+            profile_value, connection_id = _parse_capture_hook_argument_values(arguments)
+            source = read_capture_hook_document(stream)
+            if environ is not None and not isinstance(environ, Mapping):
+                return 0
+            resolved = _default_dependencies(
+                profile=profile_value,
+                connection_id=connection_id,
+                source=source,
+                environ=environ,
+                capture_executable=capture_executable,
+            )
+            if resolved is None:
+                return 0
+            selected = resolved
 
         from saliencegate.capture.health import CaptureHealthCode
         from saliencegate.capture.identities import CaptureDigestContext
         from saliencegate.capture.spool import CaptureSpoolError
 
         parsed = parse_capture_hook_arguments(arguments)
-        source = read_capture_hook_document(stream)
+        if source is None:
+            source = read_capture_hook_document(stream)
         registry = _require_evidence(selected.validate_registry(parsed.profile))
         receipt = _require_evidence(
             selected.validate_receipt(parsed.profile, parsed.connection_id, registry)
@@ -502,7 +580,11 @@ def entrypoint(arguments: Sequence[str] | None = None) -> int:
         return 0
     try:
         selected_arguments = sys.argv[1:] if arguments is None else arguments
-        return run_capture_hook(selected_arguments, sys.stdin.buffer)
+        return run_capture_hook(
+            selected_arguments,
+            sys.stdin.buffer,
+            capture_executable=sys.argv[0],
+        )
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception:

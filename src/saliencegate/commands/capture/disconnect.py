@@ -48,6 +48,7 @@ from saliencegate.integrations.registry import (
     MAX_INTEGRATION_BUNDLE_BYTES,
     MAX_INTEGRATION_LAUNCHER_BYTES,
     ProviderAlias,
+    ProviderInstallationKind,
     ProviderInstallationSpec,
 )
 from saliencegate.security import (
@@ -163,10 +164,9 @@ def _resolve_installed_spec(
             return requested, None
         requested_identity = derive_installation_identity(requested, key)
         if (
-            receipt.provider_id != requested.provider_id
+            receipt.installation_kind is not requested.installation_kind
+            or receipt.provider_id != requested.provider_id
             or receipt.profile is not requested.profile
-            or receipt.host_version != requested.host_version
-            or receipt.generation > requested.generation
             or receipt.project_digest != requested_identity.project_digest
             or receipt.capability_digest != requested.capability_digest
             or receipt.config_path != requested.config_path
@@ -177,6 +177,7 @@ def _resolve_installed_spec(
             or receipt.lock_path != requested.lock_path
             or (
                 receipt.generation == requested.generation
+                and receipt.installation_kind is ProviderInstallationKind.BRIDGE
                 and (
                     receipt.bundle_path != requested.bundle_path
                     or receipt.bundle_digest != requested.bundle_digest
@@ -188,11 +189,14 @@ def _resolve_installed_spec(
         bundle_bytes = requested.bundle_bytes
         launcher_bytes = requested.launcher_bytes
         if receipt.state is not InstallationState.DISABLED:
-            bundle_bytes = _read_installed_private_asset(
-                receipt.bundle_path,
-                maximum_bytes=MAX_INTEGRATION_BUNDLE_BYTES,
-                policy=StableReadPolicy.PRIVATE_EXACT,
-            )
+            if receipt.installation_kind is ProviderInstallationKind.BRIDGE:
+                if receipt.bundle_path is None:
+                    raise InstallationError()
+                bundle_bytes = _read_installed_private_asset(
+                    receipt.bundle_path,
+                    maximum_bytes=MAX_INTEGRATION_BUNDLE_BYTES,
+                    policy=StableReadPolicy.PRIVATE_EXACT,
+                )
             launcher_bytes = _read_installed_private_asset(
                 receipt.launcher_path,
                 maximum_bytes=MAX_INTEGRATION_LAUNCHER_BYTES,
@@ -204,6 +208,7 @@ def _resolve_installed_spec(
             bundle_bytes=bundle_bytes,
             bundle_path=receipt.bundle_path,
             generation=receipt.generation,
+            host_version=receipt.host_version,
             launcher_bytes=launcher_bytes,
         )
         installed = ProviderInstallationSpec.model_validate(payload)
@@ -211,8 +216,11 @@ def _resolve_installed_spec(
         if installed_identity.connection_id != receipt.connection_id or (
             receipt.state is not InstallationState.DISABLED
             and (
-                installed.bundle_digest != receipt.bundle_digest
-                or installed.launcher_digest != receipt.launcher_digest
+                installed.launcher_digest != receipt.launcher_digest
+                or (
+                    receipt.installation_kind is ProviderInstallationKind.BRIDGE
+                    and installed.bundle_digest != receipt.bundle_digest
+                )
             )
         ):
             raise InstallationError()
@@ -243,7 +251,12 @@ def run_disconnect(
     environment = os.environ if environ is None else environ
     if not isinstance(environment, Mapping):
         raise CaptureCommandConfigurationError()
-    spec = resolve_provider_installation_spec(alias, resolved_project, spec_resolver)
+    spec = resolve_provider_installation_spec(
+        alias,
+        resolved_project,
+        spec_resolver,
+        environ=environment,
+    )
     try:
         key = load_installation_key(default_installation_key_path(environ=environment))
         identity = derive_installation_identity(spec, key)

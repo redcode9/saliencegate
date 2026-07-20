@@ -47,6 +47,7 @@ from saliencegate.integrations.config_files import (
 )
 from saliencegate.integrations.registry import (
     MAX_INTEGRATION_LAUNCHER_BYTES,
+    ProviderInstallationKind,
     ProviderInstallationSpec,
 )
 from saliencegate.security import InstallationKey
@@ -75,7 +76,15 @@ _CONNECTION_ID = re.compile(r"^sg-[0-9a-f]{48}$")
 _RECEIPT_DOMAIN = b"saliencegate:integration-installation-receipt:v1"
 _JOURNAL_DOMAIN = b"saliencegate:integration-installation-journal:v1"
 _CONNECTION_DOMAIN = b"saliencegate:integration-connection:v1"
-_DRIFT_ORDER = ("receipt", "lock", "config", "bundle", "bootstrap", "launcher")
+_DRIFT_ORDER = (
+    "receipt",
+    "lock",
+    "config",
+    "bundle",
+    "bootstrap",
+    "launcher",
+    "host_version",
+)
 
 
 class InstallationError(RuntimeError):
@@ -158,21 +167,29 @@ class InstallationReceipt(_InstallationModel):
         repr=False
     )
     config_path: Path = Field(repr=False)
-    bundle_path: Path = Field(repr=False)
-    bootstrap_path: Path = Field(repr=False)
+    bundle_path: Path | None = Field(default=None, repr=False)
+    bootstrap_path: Path | None = Field(default=None, repr=False)
     launcher_path: Path = Field(repr=False)
     receipt_path: Path = Field(repr=False)
     journal_path: Path = Field(repr=False)
     lock_path: Path = Field(repr=False)
-    bundle_digest: Annotated[str, StringConstraints(pattern=_SHA256.pattern)] = Field(repr=False)
+    bundle_digest: Annotated[str | None, StringConstraints(pattern=_SHA256.pattern)] = Field(
+        default=None,
+        repr=False,
+    )
     launcher_digest: Annotated[str, StringConstraints(pattern=_SHA256.pattern)] = Field(repr=False)
     config_edit: OwnedConfigReverseEdit = Field(repr=False)
     receipt_mac: Annotated[str, StringConstraints(pattern=_SHA256.pattern)] = Field(repr=False)
 
+    @property
+    def installation_kind(self) -> ProviderInstallationKind:
+        bridge_values = (self.bundle_path, self.bootstrap_path, self.bundle_digest)
+        if all(value is None for value in bridge_values):
+            return ProviderInstallationKind.COMMAND_HOOK
+        return ProviderInstallationKind.BRIDGE
+
     @field_validator(
         "config_path",
-        "bundle_path",
-        "bootstrap_path",
         "launcher_path",
         "receipt_path",
         "journal_path",
@@ -182,21 +199,42 @@ class InstallationReceipt(_InstallationModel):
     def paths_are_absolute(cls, value: Path) -> Path:
         return _absolute_path(value)
 
+    @field_validator("bundle_path", "bootstrap_path")
+    @classmethod
+    def optional_paths_are_absolute(cls, value: Path | None) -> Path | None:
+        return None if value is None else _absolute_path(value)
+
     @model_validator(mode="after")
     def paths_and_digests_are_unambiguous(self) -> Self:
+        bridge_values = (self.bundle_path, self.bootstrap_path, self.bundle_digest)
+        if self.installation_kind is ProviderInstallationKind.BRIDGE:
+            if any(value is None for value in bridge_values):
+                raise ValueError("installation receipt bridge binding is incomplete")
+        elif any(value is not None for value in bridge_values):
+            raise ValueError("command-hook receipt declares bridge assets")
         paths = {
             self.config_path,
-            self.bundle_path,
-            self.bootstrap_path,
             self.launcher_path,
             self.receipt_path,
             self.journal_path,
             self.lock_path,
         }
-        if len(paths) != 7 or not (
+        if self.bundle_path is not None:
+            paths.add(self.bundle_path)
+        if self.bootstrap_path is not None:
+            paths.add(self.bootstrap_path)
+        expected_path_count = 7 if self.installation_kind is ProviderInstallationKind.BRIDGE else 5
+        if len(paths) != expected_path_count or not (
             self.receipt_path.parent == self.journal_path.parent == self.lock_path.parent
         ):
             raise ValueError("installation receipt paths alias")
+        if (
+            self.installation_kind is ProviderInstallationKind.BRIDGE
+            and self.bundle_path is not None
+            and self.bootstrap_path is not None
+            and self.bundle_path.parent != self.bootstrap_path.parent
+        ):
+            raise ValueError("installation receipt bridge boundary is invalid")
         return self
 
 
@@ -206,9 +244,10 @@ class InstallationJournal(_InstallationModel):
     )
     operation: _JournalOperation
     target_receipt: InstallationReceipt = Field(repr=False)
-    target_bootstrap_digest: Annotated[str, StringConstraints(pattern=_SHA256.pattern)] = Field(
-        repr=False
-    )
+    target_bootstrap_digest: Annotated[
+        str | None,
+        StringConstraints(pattern=_SHA256.pattern),
+    ] = Field(default=None, repr=False)
     prior_receipt_mac: Annotated[str | None, StringConstraints(pattern=_SHA256.pattern)] = Field(
         default=None,
         repr=False,
@@ -240,6 +279,17 @@ class InstallationJournal(_InstallationModel):
             raise ValueError("installation journal prior bundle binding is incomplete")
         if (self.prior_launcher_path is None) != (self.prior_launcher_digest is None):
             raise ValueError("installation journal prior launcher binding is incomplete")
+        has_bridge = self.target_receipt.installation_kind is ProviderInstallationKind.BRIDGE
+        if has_bridge != (self.target_bootstrap_digest is not None):
+            raise ValueError("installation journal target bridge binding is incomplete")
+        if (self.prior_bundle_path is None) != (self.prior_bootstrap_digest is None):
+            raise ValueError("installation journal prior bridge binding is incomplete")
+        if not has_bridge and (
+            self.prior_bundle_path is not None
+            or self.prior_bundle_digest is not None
+            or self.prior_bootstrap_digest is not None
+        ):
+            raise ValueError("command-hook journal declares bridge assets")
         if (
             self.operation is _JournalOperation.INSTALL
             and self.target_receipt.state is not InstallationState.ENABLED
@@ -360,7 +410,7 @@ def _validated_spec(value: object) -> ProviderInstallationSpec:
                 or project_security.hardlink_count != 1
             ):
                 raise InstallationError()
-            for project_path in (spec.config_path, spec.bundle_path, spec.bootstrap_path):
+            for project_path in spec.project_local_paths:
                 _reject_project_symlink_traversal(spec.project_root, project_path)
             validate_capture_capability_binding(spec.profile, spec.capability_digest)
             return spec
@@ -371,7 +421,7 @@ def _validated_spec(value: object) -> ProviderInstallationSpec:
             or stat.S_ISLNK(project_metadata.st_mode)
         ):
             raise InstallationError()
-        for project_path in (spec.config_path, spec.bundle_path, spec.bootstrap_path):
+        for project_path in spec.project_local_paths:
             _reject_project_symlink_traversal(spec.project_root, project_path)
         validate_capture_capability_binding(spec.profile, spec.capability_digest)
         return spec
@@ -1151,6 +1201,59 @@ def _fault(callback: Callable[[str], None] | None, stage: str) -> None:
         callback(stage)
 
 
+def _spec_bridge_assets(
+    spec: ProviderInstallationSpec,
+) -> tuple[Path, Path, bytes, str] | None:
+    if spec.installation_kind is ProviderInstallationKind.COMMAND_HOOK:
+        if any(
+            value is not None
+            for value in (
+                spec.bundle_path,
+                spec.bootstrap_path,
+                spec.bundle_bytes,
+                spec.bundle_digest,
+            )
+        ):
+            raise InstallationError()
+        return None
+    if (
+        spec.bundle_path is None
+        or spec.bootstrap_path is None
+        or spec.bundle_bytes is None
+        or spec.bundle_digest is None
+    ):
+        raise InstallationError()
+    return (
+        spec.bundle_path,
+        spec.bootstrap_path,
+        spec.bundle_bytes,
+        spec.bundle_digest,
+    )
+
+
+def _receipt_bridge_assets(
+    receipt: InstallationReceipt,
+) -> tuple[Path, Path, str] | None:
+    if receipt.installation_kind is ProviderInstallationKind.COMMAND_HOOK:
+        if any(
+            value is not None
+            for value in (
+                receipt.bundle_path,
+                receipt.bootstrap_path,
+                receipt.bundle_digest,
+            )
+        ):
+            raise InstallationError()
+        return None
+    if (
+        receipt.bundle_path is None
+        or receipt.bootstrap_path is None
+        or receipt.bundle_digest is None
+    ):
+        raise InstallationError()
+    return receipt.bundle_path, receipt.bootstrap_path, receipt.bundle_digest
+
+
 def _make_receipt(
     spec: ProviderInstallationSpec,
     key: InstallationKey,
@@ -1197,12 +1300,16 @@ def _receipt_with_state(
 
 
 def _bootstrap_for(receipt: InstallationReceipt) -> IntegrationBootstrap:
+    bridge = _receipt_bridge_assets(receipt)
+    if bridge is None:
+        raise InstallationError()
+    _bundle_path, _bootstrap_path, bundle_digest = bridge
     return IntegrationBootstrap(
         profile=receipt.profile,
         connection_id=receipt.connection_id,
         launcher_path=receipt.launcher_path,
         capability_digest=receipt.capability_digest,
-        bundle_digest=receipt.bundle_digest,
+        bundle_digest=bundle_digest,
         receipt_mac=receipt.receipt_mac,
     )
 
@@ -1214,16 +1321,25 @@ def _receipt_matches_spec(
     *,
     generation: bool = True,
 ) -> bool:
+    receipt_bridge = _receipt_bridge_assets(receipt)
+    spec_bridge = _spec_bridge_assets(spec)
+    bridge_matches = (
+        receipt_bridge is None
+        if spec_bridge is None
+        else receipt_bridge is not None
+        and receipt_bridge[0].parent == spec_bridge[0].parent
+        and receipt_bridge[1] == spec_bridge[1]
+    )
     return (
-        receipt.provider_id == spec.provider_id
+        receipt.installation_kind is spec.installation_kind
+        and receipt.provider_id == spec.provider_id
         and receipt.profile is spec.profile
-        and receipt.host_version == spec.host_version
+        and (receipt.host_version == spec.host_version or not generation)
         and (not generation or receipt.generation == spec.generation)
         and receipt.project_digest == _project_digest(spec, key)
         and receipt.capability_digest == spec.capability_digest
         and receipt.config_path == spec.config_path
-        and receipt.bootstrap_path == spec.bootstrap_path
-        and receipt.bundle_path.parent == spec.bundle_path.parent
+        and bridge_matches
         and receipt.launcher_path == spec.launcher_path
         and receipt.receipt_path == spec.receipt_path
         and receipt.journal_path == spec.journal_path
@@ -1366,10 +1482,13 @@ def inspect_provider_installation(
                 orphan_drift.append("config")
         except (ConfigFileError, InstallationError):
             orphan_drift.append("config")
-        if _path_digest(checked.bundle_path, maximum=2 * 1_024 * 1_024) is not None:
-            orphan_drift.append("bundle")
-        if _path_digest(checked.bootstrap_path, maximum=16 * 1_024) is not None:
-            orphan_drift.append("bootstrap")
+        checked_bridge = _spec_bridge_assets(checked)
+        if checked_bridge is not None:
+            bundle_path, bootstrap_path, _bundle_bytes, _bundle_digest = checked_bridge
+            if _path_digest(bundle_path, maximum=2 * 1_024 * 1_024) is not None:
+                orphan_drift.append("bundle")
+            if _path_digest(bootstrap_path, maximum=16 * 1_024) is not None:
+                orphan_drift.append("bootstrap")
         try:
             orphan_launcher = _launcher_digest_optional(checked.launcher_path)
         except InstallationError:
@@ -1400,13 +1519,17 @@ def inspect_provider_installation(
         current_config = None
         drift.append("config")
     marker = receipt.config_edit.marker.encode("ascii")
+    checked_bridge = _spec_bridge_assets(checked)
+    receipt_bridge = _receipt_bridge_assets(receipt)
     if receipt.state is InstallationState.DISABLED:
         if current_config is not None and marker in current_config:
             drift.append("config")
-        if _path_digest(receipt.bundle_path, maximum=len(checked.bundle_bytes) + 1) is not None:
-            drift.append("bundle")
-        if _path_digest(receipt.bootstrap_path, maximum=16 * 1_024) is not None:
-            drift.append("bootstrap")
+        if checked_bridge is not None and receipt_bridge is not None:
+            bundle_path, bootstrap_path, bundle_bytes, _bundle_digest = checked_bridge
+            if _path_digest(bundle_path, maximum=len(bundle_bytes) + 1) is not None:
+                drift.append("bundle")
+            if _path_digest(bootstrap_path, maximum=16 * 1_024) is not None:
+                drift.append("bootstrap")
         try:
             receipt.launcher_path.lstat()
         except FileNotFoundError:
@@ -1420,25 +1543,25 @@ def inspect_provider_installation(
             drift.append("config")
         if receipt.launcher_digest != checked.launcher_digest:
             drift.append("launcher")
-        if (
-            receipt.bundle_path != checked.bundle_path
-            or receipt.bundle_digest != checked.bundle_digest
-        ):
-            drift.append("bundle")
+        if checked_bridge is not None and receipt_bridge is not None:
+            checked_bundle, _checked_bootstrap, _bundle_bytes, checked_digest = checked_bridge
+            receipt_bundle, receipt_bootstrap, receipt_digest = receipt_bridge
+            if receipt_bundle != checked_bundle or receipt_digest != checked_digest:
+                drift.append("bundle")
+            if _path_digest(receipt_bundle, maximum=2 * 1_024 * 1_024) != receipt_digest:
+                drift.append("bundle")
+            try:
+                bootstrap = inspect_integration_bootstrap(receipt_bootstrap)
+                expected_bootstrap = _bootstrap_for(receipt)
+                if bootstrap != expected_bootstrap:
+                    drift.append("bootstrap")
+            except Exception:
+                drift.append("bootstrap")
         if (
             current_config is None
             or hashlib.sha256(current_config).hexdigest() != receipt.config_edit.installed_digest
         ):
             drift.append("config")
-        if _path_digest(receipt.bundle_path, maximum=2 * 1_024 * 1_024) != receipt.bundle_digest:
-            drift.append("bundle")
-        try:
-            bootstrap = inspect_integration_bootstrap(receipt.bootstrap_path)
-            expected_bootstrap = _bootstrap_for(receipt)
-            if bootstrap != expected_bootstrap:
-                drift.append("bootstrap")
-        except Exception:
-            drift.append("bootstrap")
         try:
             if _read_launcher_digest(receipt.launcher_path) != receipt.launcher_digest:
                 drift.append("launcher")
@@ -1472,24 +1595,34 @@ def _journal_for_install(
     *,
     prior: InstallationReceipt | None,
 ) -> InstallationJournal:
-    bootstrap_data = encode_integration_bootstrap(_bootstrap_for(target))
-    prior_assets = prior is not None and prior.state is InstallationState.ENABLED
+    target_bridge = _receipt_bridge_assets(target)
+    target_bootstrap_digest = (
+        None
+        if target_bridge is None
+        else hashlib.sha256(encode_integration_bootstrap(_bootstrap_for(target))).hexdigest()
+    )
+    prior_enabled = prior is not None and prior.state is InstallationState.ENABLED
+    prior_bridge = None if prior is None else _receipt_bridge_assets(prior)
     prior_bootstrap = (
         None
-        if not prior_assets or prior is None
+        if not prior_enabled or prior is None or prior_bridge is None
         else hashlib.sha256(encode_integration_bootstrap(_bootstrap_for(prior))).hexdigest()
     )
     return _seal_journal(
         InstallationJournal(
             operation=_JournalOperation.INSTALL,
             target_receipt=target,
-            target_bootstrap_digest=hashlib.sha256(bootstrap_data).hexdigest(),
+            target_bootstrap_digest=target_bootstrap_digest,
             prior_receipt_mac=None if prior is None else prior.receipt_mac,
-            prior_bundle_path=None if not prior_assets or prior is None else prior.bundle_path,
-            prior_bundle_digest=None if not prior_assets or prior is None else prior.bundle_digest,
-            prior_launcher_path=None if not prior_assets or prior is None else prior.launcher_path,
+            prior_bundle_path=(
+                None if not prior_enabled or prior_bridge is None else prior_bridge[0]
+            ),
+            prior_bundle_digest=(
+                None if not prior_enabled or prior_bridge is None else prior_bridge[2]
+            ),
+            prior_launcher_path=None if not prior_enabled or prior is None else prior.launcher_path,
             prior_launcher_digest=(
-                None if not prior_assets or prior is None else prior.launcher_digest
+                None if not prior_enabled or prior is None else prior.launcher_digest
             ),
             prior_bootstrap_digest=prior_bootstrap,
             journal_mac="0" * 64,
@@ -1537,14 +1670,7 @@ class _ManagedProjectBoundary:
         expected_project_identity: object | None = None,
     ) -> _ManagedProjectBoundary:
         paths = tuple(
-            dict.fromkeys(
-                (
-                    spec.project_root,
-                    spec.config_path.parent,
-                    spec.bundle_path.parent,
-                    spec.bootstrap_path.parent,
-                )
-            )
+            dict.fromkeys((spec.project_root, *(path.parent for path in spec.project_local_paths)))
         )
         result = cls(identities=tuple((path, _managed_directory_identity(path)) for path in paths))
         if (
@@ -1668,13 +1794,7 @@ def _ensure_install_directories(
     expected_project_identity: object,
 ) -> None:
     for path in tuple(
-        dict.fromkeys(
-            (
-                spec.config_path.parent,
-                spec.bundle_path.parent,
-                spec.bootstrap_path.parent,
-            )
-        )
+        dict.fromkeys(project_path.parent for project_path in spec.project_local_paths)
     ):
         _ensure_project_directory(
             spec,
@@ -1693,6 +1813,7 @@ def _install_locked(
     fault_injector: Callable[[str], None] | None,
 ) -> InstallationStatus:
     boundary.revalidate()
+    spec_bridge = _spec_bridge_assets(spec)
     journal = _load_journal_optional(spec, key)
     if journal is not None:
         return _recover_locked(
@@ -1711,6 +1832,7 @@ def _install_locked(
     if prior is not None:
         if not _receipt_matches_spec(prior, spec, key, generation=False):
             raise InstallationError()
+        prior_bridge = _receipt_bridge_assets(prior)
         if prior.state is InstallationState.ENABLED:
             if current_launcher_digest != prior.launcher_digest:
                 raise InstallationError()
@@ -1722,24 +1844,42 @@ def _install_locked(
                 status = inspect_provider_installation(spec, key)
                 if status.drift:
                     raise InstallationError()
-                if (
-                    prior.bundle_digest != spec.bundle_digest
-                    or prior.bundle_path != spec.bundle_path
+                if spec_bridge is not None and (
+                    prior_bridge is None
+                    or prior_bridge[0] != spec_bridge[0]
+                    or prior_bridge[2] != spec_bridge[3]
                 ):
                     raise InstallationError()
                 boundary.revalidate()
                 return status.model_copy(update={"disposition": InstallationDisposition.NOOP})
-            if prior.generation + 1 != spec.generation:
+            if prior.generation >= spec.generation:
                 raise InstallationError()
-            if prior.bundle_path == spec.bundle_path and prior.bundle_digest != spec.bundle_digest:
-                raise InstallationError()
+            bridge_invalid = False
+            if spec_bridge is not None:
+                if prior_bridge is None:
+                    raise InstallationError()
+                spec_bundle_path, _spec_bootstrap_path, _spec_bundle_bytes, spec_bundle_digest = (
+                    spec_bridge
+                )
+                prior_bundle_path, prior_bootstrap_path, prior_bundle_digest = prior_bridge
+                if (
+                    prior_bundle_path == spec_bundle_path
+                    and prior_bundle_digest != spec_bundle_digest
+                ):
+                    raise InstallationError()
+                bridge_invalid = (
+                    _path_digest(prior_bundle_path, maximum=2 * 1_024 * 1_024)
+                    != prior_bundle_digest
+                    or _path_digest(prior_bootstrap_path, maximum=16 * 1_024)
+                    != hashlib.sha256(
+                        encode_integration_bootstrap(_bootstrap_for(prior))
+                    ).hexdigest()
+                )
             if (
                 current is None
                 or hashlib.sha256(current).hexdigest() != prior.config_edit.installed_digest
                 or not _config_edit_matches_spec(prior.config_edit, spec)
-                or _path_digest(prior.bundle_path, maximum=2 * 1_024 * 1_024) != prior.bundle_digest
-                or _path_digest(prior.bootstrap_path, maximum=16 * 1_024)
-                != hashlib.sha256(encode_integration_bootstrap(_bootstrap_for(prior))).hexdigest()
+                or bridge_invalid
             ):
                 raise InstallationError()
             upgrade = True
@@ -1760,15 +1900,22 @@ def _install_locked(
     if config_write:
         plan = plan_owned_config_install(current, spec.config)
         config_edit = plan.reverse_edit
-    target_bundle_digest = _path_digest(spec.bundle_path, maximum=2 * 1_024 * 1_024)
-    target_bootstrap_digest = _path_digest(spec.bootstrap_path, maximum=16 * 1_024)
-    if upgrade:
-        if prior is None:
+    target_bundle_digest: str | None = None
+    target_bootstrap_digest: str | None = None
+    if spec_bridge is not None:
+        bundle_path, bootstrap_path, _bundle_bytes, _bundle_digest = spec_bridge
+        target_bundle_digest = _path_digest(bundle_path, maximum=2 * 1_024 * 1_024)
+        target_bootstrap_digest = _path_digest(bootstrap_path, maximum=16 * 1_024)
+        if upgrade:
+            if prior is None:
+                raise InstallationError()
+            prior_bridge = _receipt_bridge_assets(prior)
+            if prior_bridge is None:
+                raise InstallationError()
+            if bundle_path != prior_bridge[0] and target_bundle_digest is not None:
+                raise InstallationError()
+        elif target_bundle_digest is not None or target_bootstrap_digest is not None:
             raise InstallationError()
-        if spec.bundle_path != prior.bundle_path and target_bundle_digest is not None:
-            raise InstallationError()
-    elif target_bundle_digest is not None or target_bootstrap_digest is not None:
-        raise InstallationError()
     target = _make_receipt(
         spec,
         key,
@@ -1789,27 +1936,29 @@ def _install_locked(
         replace_digest=(prior.launcher_digest if upgrade and prior is not None else None),
     )
     _fault(fault_injector, "after_launcher_publish")
-    if target_bundle_digest is None:
+    if spec_bridge is not None:
+        bundle_path, bootstrap_path, bundle_bytes, bundle_digest = spec_bridge
+        if target_bundle_digest is None:
+            boundary.revalidate()
+            _publish_private(
+                bundle_path,
+                bundle_bytes,
+                maximum=2 * 1_024 * 1_024,
+                managed_parent=True,
+            )
+            boundary.revalidate()
+        elif target_bundle_digest != bundle_digest:
+            raise InstallationError()
+        _fault(fault_injector, "after_bundle_publish")
+        bootstrap = _bootstrap_for(target)
         boundary.revalidate()
-        _publish_private(
-            spec.bundle_path,
-            spec.bundle_bytes,
-            maximum=2 * 1_024 * 1_024,
-            managed_parent=True,
+        publish_integration_bootstrap(
+            bootstrap_path,
+            bootstrap,
+            replace_digest=transaction.prior_bootstrap_digest,
         )
         boundary.revalidate()
-    elif target_bundle_digest != spec.bundle_digest:
-        raise InstallationError()
-    _fault(fault_injector, "after_bundle_publish")
-    bootstrap = _bootstrap_for(target)
-    boundary.revalidate()
-    publish_integration_bootstrap(
-        spec.bootstrap_path,
-        bootstrap,
-        replace_digest=transaction.prior_bootstrap_digest,
-    )
-    boundary.revalidate()
-    _fault(fault_injector, "after_bootstrap_publish")
+        _fault(fault_injector, "after_bootstrap_publish")
     if config_write:
         boundary.revalidate()
         publish_config_bytes(spec.config_path, expected=current, data=plan.installed_bytes)
@@ -1821,7 +1970,7 @@ def _install_locked(
     if (
         transaction.prior_bundle_path is not None
         and transaction.prior_bundle_digest is not None
-        and transaction.prior_bundle_path != spec.bundle_path
+        and (spec_bridge is None or transaction.prior_bundle_path != spec_bridge[0])
     ):
         boundary.revalidate()
         _delete_private_if_present(
@@ -1884,8 +2033,7 @@ def install_provider(
                 would_write=(
                     checked.launcher_path,
                     checked.config_path,
-                    checked.bundle_path,
-                    checked.bootstrap_path,
+                    *checked.project_local_paths[1:],
                     checked.receipt_path,
                     checked.journal_path,
                 ),
@@ -1928,17 +2076,23 @@ def _recover_install(
 ) -> InstallationStatus:
     boundary.revalidate()
     target = journal.target_receipt
+    spec_bridge = _spec_bridge_assets(spec)
+    target_bridge = _receipt_bridge_assets(target)
     if not _receipt_matches_spec(target, spec, key):
         raise InstallationError()
     if (
-        target.bundle_digest != spec.bundle_digest
-        or target.bundle_path != spec.bundle_path
-        or target.launcher_digest != spec.launcher_digest
+        target.launcher_digest != spec.launcher_digest
         or target.launcher_path != spec.launcher_path
         or (
             journal.prior_bundle_path is not None
-            and journal.prior_bundle_path.parent != spec.bundle_path.parent
+            and (spec_bridge is None or journal.prior_bundle_path.parent != spec_bridge[0].parent)
         )
+    ):
+        raise InstallationError()
+    if spec_bridge is not None and (
+        target_bridge is None
+        or target_bridge[0] != spec_bridge[0]
+        or target_bridge[2] != spec_bridge[3]
     ):
         raise InstallationError()
     current_receipt = _load_receipt_optional(spec, key)
@@ -1965,7 +2119,7 @@ def _recover_install(
         and _receipt_matches_spec(current_receipt, spec, key, generation=False)
         and (
             current_receipt.state is InstallationState.DISABLED
-            or current_receipt.generation + 1 == target.generation
+            or current_receipt.generation < target.generation
         )
     ):
         current_data = _publish_receipt(spec, pending, replace_data=current_data)
@@ -1982,30 +2136,32 @@ def _recover_install(
         )
     elif launcher_digest != target.launcher_digest:
         raise InstallationError()
-    bundle_digest = _path_digest(spec.bundle_path, maximum=2 * 1_024 * 1_024)
-    if bundle_digest is None:
-        boundary.revalidate()
-        _publish_private(
-            spec.bundle_path,
-            spec.bundle_bytes,
-            maximum=2 * 1_024 * 1_024,
-            managed_parent=True,
-        )
-        boundary.revalidate()
-    elif bundle_digest != target.bundle_digest:
-        raise InstallationError()
-    expected_bootstrap = encode_integration_bootstrap(_bootstrap_for(target))
-    bootstrap_digest = _path_digest(spec.bootstrap_path, maximum=16 * 1_024)
-    if bootstrap_digest is None or bootstrap_digest == journal.prior_bootstrap_digest:
-        boundary.revalidate()
-        publish_integration_bootstrap(
-            spec.bootstrap_path,
-            _bootstrap_for(target),
-            replace_digest=bootstrap_digest,
-        )
-        boundary.revalidate()
-    elif bootstrap_digest != hashlib.sha256(expected_bootstrap).hexdigest():
-        raise InstallationError()
+    if spec_bridge is not None and target_bridge is not None:
+        bundle_path, bootstrap_path, bundle_bytes, _bundle_digest = spec_bridge
+        bundle_digest = _path_digest(bundle_path, maximum=2 * 1_024 * 1_024)
+        if bundle_digest is None:
+            boundary.revalidate()
+            _publish_private(
+                bundle_path,
+                bundle_bytes,
+                maximum=2 * 1_024 * 1_024,
+                managed_parent=True,
+            )
+            boundary.revalidate()
+        elif bundle_digest != target_bridge[2]:
+            raise InstallationError()
+        expected_bootstrap = encode_integration_bootstrap(_bootstrap_for(target))
+        bootstrap_digest = _path_digest(bootstrap_path, maximum=16 * 1_024)
+        if bootstrap_digest is None or bootstrap_digest == journal.prior_bootstrap_digest:
+            boundary.revalidate()
+            publish_integration_bootstrap(
+                bootstrap_path,
+                _bootstrap_for(target),
+                replace_digest=bootstrap_digest,
+            )
+            boundary.revalidate()
+        elif bootstrap_digest != hashlib.sha256(expected_bootstrap).hexdigest():
+            raise InstallationError()
     current = _current_config_for_plan(spec)
     current_digest = None if current is None else hashlib.sha256(current).hexdigest()
     if current_digest != target.config_edit.installed_digest:
@@ -2022,7 +2178,7 @@ def _recover_install(
     if (
         journal.prior_bundle_path is not None
         and journal.prior_bundle_digest is not None
-        and journal.prior_bundle_path != spec.bundle_path
+        and (spec_bridge is None or journal.prior_bundle_path != spec_bridge[0])
     ):
         boundary.revalidate()
         _delete_private_if_present(
@@ -2047,17 +2203,20 @@ def _journal_for_uninstall(
     key: InstallationKey,
 ) -> InstallationJournal:
     disabled = _receipt_with_state(receipt, InstallationState.DISABLED, key)
-    bootstrap_digest = hashlib.sha256(
-        encode_integration_bootstrap(_bootstrap_for(receipt))
-    ).hexdigest()
+    receipt_bridge = _receipt_bridge_assets(receipt)
+    bootstrap_digest = (
+        None
+        if receipt_bridge is None
+        else hashlib.sha256(encode_integration_bootstrap(_bootstrap_for(receipt))).hexdigest()
+    )
     return _seal_journal(
         InstallationJournal(
             operation=_JournalOperation.UNINSTALL,
             target_receipt=disabled,
             target_bootstrap_digest=bootstrap_digest,
             prior_receipt_mac=receipt.receipt_mac,
-            prior_bundle_path=receipt.bundle_path,
-            prior_bundle_digest=receipt.bundle_digest,
+            prior_bundle_path=None if receipt_bridge is None else receipt_bridge[0],
+            prior_bundle_digest=None if receipt_bridge is None else receipt_bridge[2],
             prior_launcher_path=receipt.launcher_path,
             prior_launcher_digest=receipt.launcher_digest,
             prior_bootstrap_digest=bootstrap_digest,
@@ -2124,12 +2283,18 @@ def _recover_uninstall(
 ) -> InstallationStatus:
     boundary.revalidate()
     target = journal.target_receipt
+    spec_bridge = _spec_bridge_assets(spec)
+    target_bridge = _receipt_bridge_assets(target)
     if (
         not _receipt_matches_spec(target, spec, key)
-        or target.bundle_path != spec.bundle_path
-        or target.bundle_digest != spec.bundle_digest
         or target.launcher_path != spec.launcher_path
         or target.launcher_digest != spec.launcher_digest
+    ):
+        raise InstallationError()
+    if spec_bridge is not None and (
+        target_bridge is None
+        or target_bridge[0] != spec_bridge[0]
+        or target_bridge[2] != spec_bridge[3]
     ):
         raise InstallationError()
     current = _load_receipt_optional(spec, key)
@@ -2153,10 +2318,14 @@ def _recover_uninstall(
     else:
         raise InstallationError()
     config_plan = _plan_config_removal(target)
-    expected_assets = (
-        (target.bootstrap_path, journal.target_bootstrap_digest, 16 * 1_024),
-        (target.bundle_path, target.bundle_digest, 2 * 1_024 * 1_024),
-    )
+    expected_assets: tuple[tuple[Path, str, int], ...] = ()
+    if target_bridge is not None:
+        if journal.target_bootstrap_digest is None:
+            raise InstallationError()
+        expected_assets = (
+            (target_bridge[1], journal.target_bootstrap_digest, 16 * 1_024),
+            (target_bridge[0], target_bridge[2], 2 * 1_024 * 1_024),
+        )
     for path, digest, maximum in expected_assets:
         observed = _path_digest(path, maximum=maximum)
         if observed is not None and observed != digest:
@@ -2169,18 +2338,21 @@ def _recover_uninstall(
         current = draining
     boundary.revalidate()
     _apply_config_removal(target, config_plan)
-    boundary.revalidate()
-    _delete_private_if_present(
-        target.bootstrap_path,
-        journal.target_bootstrap_digest,
-        maximum=16 * 1_024,
-    )
-    boundary.revalidate()
-    _delete_private_if_present(
-        target.bundle_path,
-        target.bundle_digest,
-        maximum=2 * 1_024 * 1_024,
-    )
+    if target_bridge is not None:
+        if journal.target_bootstrap_digest is None:
+            raise InstallationError()
+        boundary.revalidate()
+        _delete_private_if_present(
+            target_bridge[1],
+            journal.target_bootstrap_digest,
+            maximum=16 * 1_024,
+        )
+        boundary.revalidate()
+        _delete_private_if_present(
+            target_bridge[0],
+            target_bridge[2],
+            maximum=2 * 1_024 * 1_024,
+        )
     boundary.revalidate()
     _delete_private_if_present(
         target.launcher_path,
@@ -2305,23 +2477,28 @@ def uninstall_provider(
                 receipt is None
                 or receipt.state is not InstallationState.ENABLED
                 or not _receipt_matches_spec(receipt, checked, installation_key)
-                or receipt.bundle_digest != checked.bundle_digest
-                or receipt.bundle_path != checked.bundle_path
                 or receipt.launcher_digest != checked.launcher_digest
                 or receipt.launcher_path != checked.launcher_path
             ):
                 raise InstallationError()
-            # Plan the reversal and authenticate both owned assets before any write.
-            config_plan = _plan_config_removal(receipt)
-            bootstrap_data = encode_integration_bootstrap(_bootstrap_for(receipt))
-            if (
-                _path_digest(receipt.bundle_path, maximum=2 * 1_024 * 1_024)
-                != receipt.bundle_digest
+            checked_bridge = _spec_bridge_assets(checked)
+            receipt_bridge = _receipt_bridge_assets(receipt)
+            if checked_bridge is not None and (
+                receipt_bridge is None
+                or receipt_bridge[0] != checked_bridge[0]
+                or receipt_bridge[2] != checked_bridge[3]
             ):
                 raise InstallationError()
-            bootstrap_digest = hashlib.sha256(bootstrap_data).hexdigest()
-            if _path_digest(receipt.bootstrap_path, maximum=16 * 1_024) != bootstrap_digest:
-                raise InstallationError()
+            # Plan the reversal and authenticate every owned asset before any write.
+            config_plan = _plan_config_removal(receipt)
+            bootstrap_digest: str | None = None
+            if receipt_bridge is not None:
+                bootstrap_data = encode_integration_bootstrap(_bootstrap_for(receipt))
+                if _path_digest(receipt_bridge[0], maximum=2 * 1_024 * 1_024) != receipt_bridge[2]:
+                    raise InstallationError()
+                bootstrap_digest = hashlib.sha256(bootstrap_data).hexdigest()
+                if _path_digest(receipt_bridge[1], maximum=16 * 1_024) != bootstrap_digest:
+                    raise InstallationError()
             if _read_launcher_digest(receipt.launcher_path) != receipt.launcher_digest:
                 raise InstallationError()
             transaction = _journal_for_uninstall(receipt, installation_key)
@@ -2337,14 +2514,21 @@ def uninstall_provider(
             _apply_config_removal(receipt, config_plan)
             boundary.revalidate()
             _fault(_fault_injector, "after_config_remove")
-            _delete_private_exact(receipt.bootstrap_path, bootstrap_digest, maximum=16 * 1_024)
-            boundary.revalidate()
-            _delete_private_exact(
-                receipt.bundle_path,
-                receipt.bundle_digest,
-                maximum=2 * 1_024 * 1_024,
-            )
-            boundary.revalidate()
+            if receipt_bridge is not None:
+                if bootstrap_digest is None:
+                    raise InstallationError()
+                _delete_private_exact(
+                    receipt_bridge[1],
+                    bootstrap_digest,
+                    maximum=16 * 1_024,
+                )
+                boundary.revalidate()
+                _delete_private_exact(
+                    receipt_bridge[0],
+                    receipt_bridge[2],
+                    maximum=2 * 1_024 * 1_024,
+                )
+                boundary.revalidate()
             _delete_private_exact(
                 receipt.launcher_path,
                 receipt.launcher_digest,
@@ -2399,7 +2583,7 @@ def git_tracked_project_files(spec: ProviderInstallationSpec) -> tuple[Path, ...
     """Return managed files already tracked by Git; never mutate ignore configuration."""
 
     checked = _validated_spec(spec)
-    candidates = (checked.config_path, checked.bundle_path, checked.bootstrap_path)
+    candidates = checked.project_local_paths
     relative = tuple(path.relative_to(checked.project_root).as_posix() for path in candidates)
     try:
         completed = subprocess.run(

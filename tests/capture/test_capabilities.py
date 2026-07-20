@@ -80,42 +80,42 @@ _EVENTS: Final = {
     CaptureProfile.CODEX_HOOKS_V1: {
         "SessionStart": (
             ("hook_event_name", "session_id"),
-            ("cwd", "source"),
+            (),
             "window_open",
         ),
         "PreToolUse": (
             ("hook_event_name", "session_id", "tool_use_id"),
-            ("cwd", "tool_input", "tool_name", "turn_id"),
+            ("cwd", "tool_input", "tool_name"),
             "action_observed",
         ),
         "PermissionRequest": (
             ("hook_event_name", "session_id"),
-            ("cwd", "turn_id"),
-            "coverage_only",
+            (),
+            "no_semantic_intake",
         ),
         "PostToolUse": (
             ("hook_event_name", "session_id", "tool_use_id"),
-            ("cwd", "tool_input", "tool_name", "turn_id"),
+            (),
             "action_closed_outcome_unavailable",
         ),
         "PreCompact": (
             ("hook_event_name", "session_id"),
-            ("cwd", "trigger", "turn_id"),
-            "coverage_boundary",
+            (),
+            "no_semantic_intake",
         ),
         "SubagentStart": (
             ("agent_id", "hook_event_name", "session_id"),
-            ("agent_type", "cwd", "turn_id"),
+            (),
             "correlation_only",
         ),
         "SubagentStop": (
             ("agent_id", "hook_event_name", "session_id"),
-            ("agent_type", "cwd", "turn_id"),
+            (),
             "correlation_only",
         ),
         "Stop": (
             ("hook_event_name", "session_id"),
-            ("cwd", "turn_id"),
+            ("turn_id",),
             "turn_closed",
         ),
     },
@@ -243,12 +243,19 @@ _EVENTS: Final = {
 _IGNORED_FIELDS: Final = {
     CaptureProfile.CODEX_HOOKS_V1: (
         "agent_transcript_path",
+        "agent_type",
+        "cwd",
         "last_assistant_message",
         "model",
         "permission_mode",
+        "source",
         "stop_hook_active",
+        "tool_input",
+        "tool_name",
         "tool_response",
         "transcript_path",
+        "trigger",
+        "turn_id",
     ),
     CaptureProfile.CLAUDE_CODE_HOOKS_V1: (
         "background_tasks",
@@ -288,6 +295,64 @@ _IGNORED_FIELDS: Final = {
         "result",
         "systemPrompt",
         "targetSessionFile",
+    ),
+}
+
+_CODEX_EVENT_IGNORED_FIELDS: Final = {
+    "SessionStart": ("cwd", "model", "permission_mode", "source", "transcript_path"),
+    "PreToolUse": ("model", "permission_mode", "transcript_path", "turn_id"),
+    "PermissionRequest": (
+        "cwd",
+        "model",
+        "permission_mode",
+        "tool_input",
+        "tool_name",
+        "transcript_path",
+        "turn_id",
+    ),
+    "PostToolUse": (
+        "cwd",
+        "model",
+        "permission_mode",
+        "tool_input",
+        "tool_name",
+        "tool_response",
+        "transcript_path",
+        "turn_id",
+    ),
+    "PreCompact": (
+        "cwd",
+        "model",
+        "transcript_path",
+        "trigger",
+        "turn_id",
+    ),
+    "SubagentStart": (
+        "agent_transcript_path",
+        "agent_type",
+        "cwd",
+        "model",
+        "permission_mode",
+        "transcript_path",
+    ),
+    "SubagentStop": (
+        "agent_transcript_path",
+        "agent_type",
+        "cwd",
+        "last_assistant_message",
+        "model",
+        "permission_mode",
+        "stop_hook_active",
+        "transcript_path",
+        "turn_id",
+    ),
+    "Stop": (
+        "cwd",
+        "last_assistant_message",
+        "model",
+        "permission_mode",
+        "stop_hook_active",
+        "transcript_path",
     ),
 }
 
@@ -468,6 +533,10 @@ def test_profile_event_fields_outcome_authority_omissions_and_coverage_are_exact
 
     ignored = tuple(sorted({field for event in profile.events for field in event.ignored_fields}))
     assert ignored == _IGNORED_FIELDS[profile_id]
+    if profile_id is CaptureProfile.CODEX_HOOKS_V1:
+        assert {event.event_name: event.ignored_fields for event in profile.events} == (
+            _CODEX_EVENT_IGNORED_FIELDS
+        )
     assert (profile.tool_coverage, profile.coverage_exclusions) == _COVERAGE[profile_id]
 
 
@@ -515,6 +584,36 @@ def test_manifest_and_fully_synthetic_fixture_are_bound_by_canonical_sha256(
             _fixture_path_present(native_event["payload"], field)
             for field in capability.critical_fields
         )
+
+
+def test_codex_fixture_freezes_the_selected_lifecycle_and_current_ignored_fields() -> None:
+    profile = capture_profile(CaptureProfile.CODEX_HOOKS_V1)
+    fixture_bytes = (
+        resources.files("saliencegate.integrations").joinpath(profile.fixtures[0].path).read_bytes()
+    )
+    fixture_body = json.loads(fixture_bytes.decode("utf-8"))
+    events = fixture_body["events"]
+    payloads = {item["event_name"]: item["payload"] for item in events}
+
+    assert fixture_body["provenance"] == "fully_synthetic_no_provider_or_model_call"
+    assert tuple(payloads) == tuple(_EVENTS[CaptureProfile.CODEX_HOOKS_V1])
+    assert len(events) == 8
+    assert profile.complete_execution_session_coverage is False
+    assert payloads["PreCompact"]["trigger"] == "manual"
+    assert "permission_mode" not in payloads["PreCompact"]
+    assert "turn_id" not in payloads["SubagentStart"]
+    assert payloads["PermissionRequest"]["tool_input"] == {"command": "synthetic-ignored-command"}
+    assert payloads["PermissionRequest"]["tool_name"] == "synthetic-ignored-tool"
+    assert payloads["SubagentStop"]["last_assistant_message"] == "synthetic-ignored-message"
+    assert payloads["SubagentStop"]["stop_hook_active"] is False
+    assert all(payload["model"] == "synthetic-model" for payload in payloads.values())
+
+    for event_name, fields in {
+        "PermissionRequest": ("tool_input", "tool_name"),
+        "SubagentStop": ("last_assistant_message", "stop_hook_active"),
+    }.items():
+        authority = next(item for item in profile.events if item.event_name == event_name)
+        assert set(fields) <= set(authority.ignored_fields)
 
 
 def test_binding_rejects_profile_and_manifest_digest_mismatch_without_value_leakage() -> None:

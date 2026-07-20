@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from tests.capture.store_support import INSTALLATION_KEY, authenticated_intake, register_connection
+from tests.cli.test_capture_connect import _command_hook_spec
 
 from saliencegate.capture import (
     CaptureConnectionState,
@@ -45,6 +46,10 @@ def _environment(tmp_path: Path) -> dict[str, str]:
         "XDG_CONFIG_HOME": str(tmp_path / "configuration"),
         "XDG_STATE_HOME": str(tmp_path / "state"),
     }
+
+
+def _unavailable_spec(_alias: ProviderAlias, _project: Path) -> ProviderInstallationSpec:
+    raise CaptureCommandUnavailableError()
 
 
 def _installation_spec(tmp_path: Path) -> ProviderInstallationSpec:
@@ -107,7 +112,12 @@ def test_status_surfaces_observation_health_and_storage_without_paths(tmp_path: 
         )
         store.append(authenticated_intake("session_started", producer_index=1))
 
-    report = run_status(provider="codex", project=project, environ=environment)
+    report = run_status(
+        provider="codex",
+        project=project,
+        environ=environment,
+        spec_resolver=_unavailable_spec,
+    )
 
     assert len(report.providers) == 1
     item = report.providers[0]
@@ -153,10 +163,45 @@ def test_status_reports_healthy_installation_without_events_as_not_observed(
             project_digest=capture_project_digest(project, installation_key=INSTALLATION_KEY),
         )
 
-    report = run_status(provider="codex", project=project, environ=environment)
+    report = run_status(
+        provider="codex",
+        project=project,
+        environ=environment,
+        spec_resolver=_unavailable_spec,
+    )
 
     assert report.providers[0].status is CaptureOperationalStatus.INSTALLED_NOT_OBSERVED
     assert report.providers[0].drift == ()
+
+
+def test_status_does_not_require_bridge_assets_for_command_hook_installation(
+    tmp_path: Path,
+) -> None:
+    spec = _command_hook_spec(tmp_path)
+    environment = _environment(tmp_path)
+
+    def resolver(alias: ProviderAlias, project: Path) -> ProviderInstallationSpec:
+        del alias, project
+        return spec
+
+    run_connect(
+        provider="codex",
+        project=spec.project_root,
+        environ=environment,
+        spec_resolver=resolver,
+    )
+
+    report = run_status(
+        provider="codex",
+        project=spec.project_root,
+        environ=environment,
+        spec_resolver=resolver,
+    )
+
+    assert report.providers[0].status is CaptureOperationalStatus.INSTALLED_NOT_OBSERVED
+    assert report.providers[0].drift == ()
+    assert CaptureStatusDrift.BUNDLE not in report.providers[0].drift
+    assert CaptureStatusDrift.BOOTSTRAP not in report.providers[0].drift
 
 
 def test_status_without_capture_is_read_only_and_reports_all_providers(tmp_path: Path) -> None:

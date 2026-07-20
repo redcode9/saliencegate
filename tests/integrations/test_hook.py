@@ -898,3 +898,32 @@ def test_default_fail_open_path_does_not_load_capture_or_pydantic_runtime() -> N
     assert completed.returncode == 0
     assert completed.stdout == b""
     assert completed.stderr == b""
+
+
+def test_unknown_default_event_does_not_load_provider_or_capture_runtime() -> None:
+    command = (
+        sys.executable,
+        "-I",
+        "-c",
+        "import sys;from io import BytesIO;"
+        "from saliencegate.integrations.hook import run_capture_hook;"
+        "result=run_capture_hook("
+        "('--profile','codex-hooks/v1','--connection','connection-one'),"
+        'BytesIO(b\'{"hook_event_name":"Unknown","session_id":"one",\''
+        'b\'"cwd":"/provider-controlled"}\'));'
+        "heavy=[name for name in sys.modules if name=='pydantic' "
+        "or name.startswith('saliencegate.capture') "
+        "or name=='saliencegate.integrations.codex'];"
+        "raise SystemExit(result != 0 or bool(heavy))",
+    )
+
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == b""
+    assert completed.stderr == b""

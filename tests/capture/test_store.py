@@ -62,7 +62,7 @@ from saliencegate.capture.store import (
 from saliencegate.domain import canonical_json
 
 _AUTHENTICATION_DOMAIN = b"saliencegate:capture:integrity-tag:v1"
-_KNOWN_INTAKE_TAG = "8623ba43d31975b1619e1ac801abc8138bd8aabff0dfce7de2339c3c40cd90f8"
+_KNOWN_INTAKE_TAG = "d16b16f7c8fec78a4203fa29e77df71ba3be5613e75152ad45e1904702e0f7be"
 
 
 def _expected_hmac(material: bytes, *, domain: bytes, value: bytes) -> str:
@@ -342,6 +342,43 @@ def test_hook_open_defers_the_full_audit_but_maintenance_open_performs_it(
     ):
         pass
     assert calls == [False]
+
+
+def test_hook_connection_lookup_authenticates_only_the_selected_row(tmp_path: Path) -> None:
+    path = tmp_path / "hook-connection.sqlite3"
+    initialize_capture_store(path)
+    with CaptureStore.open(
+        path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.MAINTENANCE,
+    ) as maintenance:
+        register_connection(maintenance)
+        register_connection(
+            maintenance,
+            connection_id=OTHER_CONNECTION_ID,
+            project_digest=OTHER_PROJECT_DIGEST,
+        )
+
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "UPDATE connections SET row_tag = ? WHERE connection_id = ?",
+        ("0" * 64, OTHER_CONNECTION_ID),
+    )
+    connection.commit()
+    connection.close()
+
+    with CaptureStore.open(
+        path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.HOOK,
+    ) as hook:
+        selected = hook.get_connection(CONNECTION_ID)
+        assert selected.connection_id == CONNECTION_ID
+        assert selected.state is CaptureConnectionState.ENABLED
+        with pytest.raises(CaptureStoreIntegrityError):
+            hook.get_connection(OTHER_CONNECTION_ID)
 
 
 def test_hook_append_verifies_only_the_authenticated_session_tip(

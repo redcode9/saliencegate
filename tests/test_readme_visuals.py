@@ -43,8 +43,8 @@ def _svg(body: str, *, labelledby: str = "sample-title sample-desc") -> str:
 def test_reference_evidence_manifest_binds_every_measured_input() -> None:
     assert validate_evidence_manifest(ROOT, MANIFEST) == ()
     count, digest = runtime_source_digest(ROOT)
-    assert count == 141
-    assert digest == "d9505c7deff0b726223790eb53b5c04339c9f82fe0b0b2e7642678b2106683a1"
+    assert count == 183
+    assert digest == "4d8841f58e91803f34b3babbfa0cdc89625de5318b37fb646831d8023570aad7"
 
 
 def test_evidence_metadata_binding_ignores_editorial_packaging_fields(tmp_path: Path) -> None:

@@ -32,7 +32,11 @@ from saliencegate.integrations.installation import (
     ensure_private_installation_directory,
     install_provider,
 )
-from saliencegate.integrations.registry import ProviderAlias, ProviderInstallationSpec
+from saliencegate.integrations.registry import (
+    ProviderAlias,
+    ProviderInstallationKind,
+    ProviderInstallationSpec,
+)
 from saliencegate.security import (
     default_installation_key_path,
     load_installation_key,
@@ -77,6 +81,18 @@ def _spec(tmp_path: Path, *, generation: int = 1) -> ProviderInstallationSpec:
     )
 
 
+def _command_hook_spec(tmp_path: Path, *, generation: int = 1) -> ProviderInstallationSpec:
+    payload = _spec(tmp_path, generation=generation).model_dump(mode="python", warnings="error")
+    payload.update(
+        installation_kind=ProviderInstallationKind.COMMAND_HOOK,
+        bundle_path=None,
+        bootstrap_path=None,
+        bundle_bytes=None,
+        bootstrap_relative_reference=None,
+    )
+    return ProviderInstallationSpec.model_validate(payload)
+
+
 def _environment(tmp_path: Path) -> dict[str, str]:
     return {
         "HOME": str(tmp_path / "home"),
@@ -102,11 +118,39 @@ def test_connect_dry_run_writes_nothing_and_renders_only_safe_summary(tmp_path: 
     assert report.disposition == "planned"
     assert report.dry_run is True
     assert report.capture_enabled is False
+    assert report.project_local_files == 3
     assert before == {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
     assert json.loads(render_connect_json(report)) == report.model_dump(mode="json")
     human = render_connect_human(report)
     assert str(spec.project_root) not in human
     assert spec.capability_digest not in human
+
+
+def test_command_hook_connect_installs_only_config_and_private_launcher(tmp_path: Path) -> None:
+    spec = _command_hook_spec(tmp_path)
+    environment = _environment(tmp_path)
+
+    report = run_connect(
+        provider="codex",
+        project=spec.project_root,
+        environ=environment,
+        spec_resolver=lambda alias, project: spec,
+    )
+
+    assert report.capture_enabled is True
+    assert report.project_local_files == 1
+    assert report.git_tracked_files == 0
+    assert spec.project_local_paths == (spec.config_path,)
+    assert spec.config_path.is_file()
+    assert spec.launcher_path.is_file()
+    assert tuple(path for path in spec.project_root.rglob("*") if path.is_file()) == (
+        spec.config_path,
+    )
+    assert project_provider_artifacts_present(
+        ProviderAlias.CODEX,
+        spec.project_root,
+        resolver=lambda alias, project: spec,
+    )
 
 
 def test_pristine_missing_provider_directory_has_no_managed_artifacts(tmp_path: Path) -> None:

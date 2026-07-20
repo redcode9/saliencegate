@@ -79,6 +79,7 @@ class CaptureStatusDrift(StrEnum):
     CONNECTION_DRAINING = "connection_draining"
     CONNECTION_DELETING = "connection_deleting"
     INSTALLATION_STATE = "installation_state"
+    HOST_VERSION = "host_version"
     LAUNCHER = "launcher"
     LOCK = "lock"
     RECEIPT = "receipt"
@@ -204,6 +205,7 @@ def _status_without_runtime(
                     ProviderAlias(alias),
                     project,
                     resolver=spec_resolver,
+                    environ=environment,
                 )
             except CaptureCommandUnavailableError:
                 artifacts_present = False
@@ -269,6 +271,7 @@ def _status_without_runtime(
                 installation_key,
                 resolver=spec_resolver,
                 capture_executable=capture_executable,
+                environ=environment,
             )
         except CaptureCommandUnavailableError:
             providers.append(_absent(alias))
@@ -336,6 +339,7 @@ def run_status(
                         runtime.installation_key,
                         resolver=spec_resolver,
                         capture_executable=capture_executable,
+                        environ=environ,
                     )
                 except CaptureCommandUnavailableError:
                     installation = None

@@ -5,15 +5,19 @@ SalienceGate 0.2.0. A connector conforms only when its installed package contain
 audited capability manifest. Documentation alone is not evidence that a connector is installed or
 has observed an event; capture status must report that separately.
 
-The contract was audited on **2026-07-19**. Fields listed as consumed may exist briefly in bounded
-memory. Provider identifiers and native tool inputs are reduced with a domain-separated HMAC before
-durable storage. Every unlisted field is ignored, and no raw field listed here is reportable.
+The contract was audited on **2026-07-19**. The allowlists below describe native fields with
+evidence authority; those fields may exist briefly in bounded memory. Provider identifiers and
+native tool inputs are reduced with a domain-separated HMAC before durable storage. Every unlisted
+field is ignored by the evidence adapter, and no raw field listed here is reportable. A connector
+may separately validate a content-free routing envelope: Codex uses `cwd` in memory to authenticate
+the matching project installation before invoking its adapter, even when that event gives `cwd` no
+evidence authority.
 
 ## Compatibility summary
 
 | Profile | Audited host | Project-local installation | Selected lifecycle |
 |---|---|---|---|
-| `codex-hooks/v1` | Codex CLI `0.144.6` | `<repo>/.codex/hooks.json` or `<repo>/.codex/config.toml`; the project and exact hook definition must pass Codex trust review | `SessionStart`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PreCompact`, `SubagentStart`, `SubagentStop`, `Stop` |
+| `codex-hooks/v1` | Codex CLI `0.144.6` | `<repo>/.codex/config.toml`; the project and exact hook definition must pass Codex trust review | `SessionStart`, `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PreCompact`, `SubagentStart`, `SubagentStop`, `Stop` |
 | `claude-code-hooks/v1` | Claude Code `2.1.204` | `<repo>/.claude/settings.local.json`; normal project-local settings trust applies | `SessionStart`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PostToolBatch`, `PermissionDenied`, `SubagentStart`, `SubagentStop`, `Stop`, `StopFailure`, `SessionEnd` |
 | `opencode-plugin/v1` | OpenCode `1.18.3`, release commit [`127bdb3`](https://github.com/anomalyco/opencode/commit/127bdb30784d508cc556c71a0f32b508a3061517) | `<repo>/.opencode/plugins/saliencegate.js`, the documented project plugin directory | `message.part.updated`, `session.idle`, `session.error`, `session.compacted`, `session.deleted`, and plugin `dispose` |
 | `pi-extension/v1` | `@earendil-works/pi-coding-agent` `0.80.10`, tag commit [`8dc7883`](https://github.com/earendil-works/pi/commit/8dc78834cde4e329284cf505f9e3f99763df5529) | `<repo>/.pi/extensions/saliencegate.ts`; Pi must trust the project before loading it | `session_start`, `before_agent_start`, `tool_execution_start`, `tool_execution_end`, `agent_settled`, `session_compact`, `session_tree`, `session_shutdown` |
@@ -22,27 +26,38 @@ Installation must never bypass, pre-approve, or weaken provider trust. Project-l
 TypeScript, hook commands, and sidecars execute with the user's operating-system authority. Users
 should inspect managed files before trusting them.
 
-## Consumed field allowlists
+Codex connect accepts the audited `0.144.6` release and newer patch releases in the same `0.144.x`
+line as schema-compatible but unverified. Older releases and different minor or major lines fail
+closed pending a new audit. Each accepted patch change creates a new local connection generation;
+connect discovers the live version and upgrades the authenticated receipt. Read-only inspection
+authenticates that receipt without launching Codex; a later connect probes again before deciding
+whether an upgrade is needed. Connect also refuses a project layer that sets `features.hooks=false`,
+the deprecated `features.codex_hooks=false`, or `allow_managed_hooks_only=true`; it never changes
+those user or administrator policies.
+
+## Evidence field allowlists
 
 A missing session or call-correlation field is critical: the affected evidence is omitted and
 coverage degrades. Optional fields never gain authority merely because they are present.
 
 ### Codex
 
-| Event | Consumed fields | Evidence authority |
+| Event | Evidence fields | Evidence authority |
 |---|---|---|
-| `SessionStart` | `session_id`, `cwd`, `hook_event_name`, `source` | Opens an observed window. `source` is a provider-claimed lifecycle discriminator. |
-| `PreToolUse` | `session_id`, `cwd`, `hook_event_name`, `turn_id`, `tool_name`, `tool_use_id`, `tool_input` | `tool_use_id` is exact parent correlation. `tool_name` and `tool_input` are canonicalized only to derive opaque action identity. |
-| `PostToolUse` | `session_id`, `cwd`, `hook_event_name`, `turn_id`, `tool_name`, `tool_use_id`, `tool_input` | Closes the correlated action, but supplies no authorized success/failure status. |
-| `PermissionRequest` | `session_id`, `cwd`, `hook_event_name`, `turn_id` | Content-free coverage boundary only. The documented input has no `tool_use_id` or denial result, so it cannot create permission outcome evidence. |
-| `PreCompact` | `session_id`, `cwd`, `hook_event_name`, `turn_id`, `trigger` | Flush boundary; `trigger` is provider claimed. |
-| `SubagentStart`, `SubagentStop` | `session_id`, `cwd`, `hook_event_name`, `turn_id`, `agent_id`, `agent_type` | The agent identifiers are correlation inputs only and are HMAC-reduced. |
-| `Stop` | `session_id`, `cwd`, `hook_event_name`, `turn_id` | Ends one observed turn, not the task or session. |
+| `SessionStart` | `session_id`, `hook_event_name` | Opens an observed window. |
+| `PreToolUse` | `session_id`, `cwd`, `hook_event_name`, `tool_name`, `tool_use_id`, `tool_input` | `tool_use_id` is exact parent correlation. `cwd`, `tool_name`, and `tool_input` are HMAC-reduced into workspace and opaque action identity. |
+| `PostToolUse` | `session_id`, `hook_event_name`, `tool_use_id` | Closes the correlated action, but supplies no authorized success/failure status. |
+| `PermissionRequest` | `session_id`, `hook_event_name` | Validates the selected lifecycle shape but creates no semantic intake. The documented input has no `tool_use_id` or denial result. |
+| `PreCompact` | `session_id`, `hook_event_name` | Validates the selected lifecycle shape but creates no semantic intake. |
+| `SubagentStart`, `SubagentStop` | `session_id`, `hook_event_name`, `agent_id` | `agent_id` is a correlation input only and is HMAC-reduced. |
+| `Stop` | `session_id`, `hook_event_name`, `turn_id` | When `turn_id` is present, ends one observed turn, not the task or session; without it no intake is created. |
 
-`transcript_path` and `agent_transcript_path` are never opened. `tool_response`,
-`last_assistant_message`, `model`, `permission_mode`, `stop_hook_active`, and every other
-field are ignored. In particular, no response text or shell exit status is parsed. Hosted tools and
-specialized paths outside the local function-tool hook path remain an explicit coverage exclusion.
+`transcript_path` and `agent_transcript_path` are never opened. Outside `PreToolUse`, `cwd`,
+`tool_name`, and `tool_input` are ignored. `source`, `turn_id` outside `Stop`, `trigger`,
+`agent_type`, `tool_response`, `last_assistant_message`, `model`, `permission_mode`,
+`stop_hook_active`, and every other field are ignored. In particular, no response text or shell
+exit status is parsed. Hosted tools and specialized paths outside the local function-tool hook path
+remain an explicit coverage exclusion.
 `write_stdin` is continuation transport for an existing unified-exec call and must not create a
 second action.
 

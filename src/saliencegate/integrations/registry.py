@@ -45,6 +45,13 @@ class ProviderAlias(StrEnum):
     PI = "pi"
 
 
+class ProviderInstallationKind(StrEnum):
+    """Closed installation shape for one provider integration."""
+
+    BRIDGE = "bridge"
+    COMMAND_HOOK = "command_hook"
+
+
 class _RegistryModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -121,6 +128,7 @@ def _exact_absolute_path(value: Path) -> Path:
 class ProviderInstallationSpec(_RegistryModel):
     """All provider-neutral inputs for one project-local installation generation."""
 
+    installation_kind: ProviderInstallationKind = ProviderInstallationKind.BRIDGE
     provider_id: Annotated[
         str,
         StringConstraints(min_length=1, max_length=64, pattern=_PROVIDER_ID.pattern),
@@ -132,37 +140,38 @@ class ProviderInstallationSpec(_RegistryModel):
     ]
     project_root: Path
     config_path: Path
-    bundle_path: Path
-    bootstrap_path: Path
+    bundle_path: Path | None = None
+    bootstrap_path: Path | None = None
     receipt_path: Path
     journal_path: Path
     lock_path: Path
     launcher_path: Path
     capability_digest: Annotated[str, StringConstraints(pattern=_SHA256.pattern)]
     bundle_bytes: Annotated[
-        bytes,
+        bytes | None,
         Field(min_length=1, max_length=MAX_INTEGRATION_BUNDLE_BYTES, repr=False),
-    ]
+    ] = None
     launcher_bytes: Annotated[
         bytes,
         Field(min_length=1, max_length=MAX_INTEGRATION_LAUNCHER_BYTES, repr=False),
     ]
-    bootstrap_relative_reference: Annotated[
-        str,
-        StringConstraints(
-            min_length=8,
-            max_length=132,
-            pattern=_RELATIVE_BOOTSTRAP.pattern,
-        ),
-    ]
+    bootstrap_relative_reference: (
+        Annotated[
+            str,
+            StringConstraints(
+                min_length=8,
+                max_length=132,
+                pattern=_RELATIVE_BOOTSTRAP.pattern,
+            ),
+        ]
+        | None
+    ) = None
     config: OwnedConfigSpec
     generation: Annotated[int, Field(ge=1, le=1_000_000)] = 1
 
     @field_validator(
         "project_root",
         "config_path",
-        "bundle_path",
-        "bootstrap_path",
         "receipt_path",
         "journal_path",
         "lock_path",
@@ -172,9 +181,26 @@ class ProviderInstallationSpec(_RegistryModel):
     def paths_are_exact_and_absolute(cls, value: Path) -> Path:
         return _exact_absolute_path(value)
 
+    @field_validator("bundle_path", "bootstrap_path")
+    @classmethod
+    def optional_paths_are_exact_and_absolute(cls, value: Path | None) -> Path | None:
+        return None if value is None else _exact_absolute_path(value)
+
     @model_validator(mode="after")
     def paths_and_bundle_contract_are_closed(self) -> Self:
-        project_files = (self.config_path, self.bundle_path, self.bootstrap_path)
+        bridge_values = (
+            self.bundle_path,
+            self.bootstrap_path,
+            self.bundle_bytes,
+            self.bootstrap_relative_reference,
+        )
+        if self.installation_kind is ProviderInstallationKind.BRIDGE:
+            if any(value is None for value in bridge_values):
+                raise ValueError("integration bridge asset binding is incomplete")
+        elif any(value is not None for value in bridge_values):
+            raise ValueError("command-hook integration declares bridge assets")
+
+        project_files = self.project_local_paths
         try:
             for path in project_files:
                 relative = path.relative_to(self.project_root)
@@ -191,8 +217,6 @@ class ProviderInstallationSpec(_RegistryModel):
         )
         if len(set(all_paths)) != len(all_paths):
             raise ValueError("integration paths alias")
-        if self.bundle_path.parent != self.bootstrap_path.parent:
-            raise ValueError("integration bundle and bootstrap do not share a boundary")
         if not (self.receipt_path.parent == self.journal_path.parent == self.lock_path.parent):
             raise ValueError("integration operational paths do not share a boundary")
         if self.launcher_path.parent != self.receipt_path.parent:
@@ -203,28 +227,53 @@ class ProviderInstallationSpec(_RegistryModel):
             pass
         else:
             raise ValueError("integration receipt must be outside the project")
-        expected_reference = f"./{self.bootstrap_path.name}"
-        reference_bytes = self.bootstrap_relative_reference.encode("utf-8")
+        if b"\x00" in self.launcher_bytes:
+            raise ValueError("integration launcher is invalid")
+        if self.installation_kind is ProviderInstallationKind.COMMAND_HOOK:
+            return self
+
+        bundle_path = self.bundle_path
+        bootstrap_path = self.bootstrap_path
+        bundle_bytes = self.bundle_bytes
+        bootstrap_reference = self.bootstrap_relative_reference
+        if (
+            bundle_path is None
+            or bootstrap_path is None
+            or bundle_bytes is None
+            or bootstrap_reference is None
+        ):
+            raise ValueError("integration bridge asset binding is incomplete")
+        if bundle_path.parent != bootstrap_path.parent:
+            raise ValueError("integration bundle and bootstrap do not share a boundary")
+        expected_reference = f"./{bootstrap_path.name}"
+        reference_bytes = bootstrap_reference.encode("utf-8")
         expected_binding = (
             "export const saliencegateBootstrap = "
-            f'new URL("{self.bootstrap_relative_reference}", import.meta.url);\n'
+            f'new URL("{bootstrap_reference}", import.meta.url);\n'
         ).encode()
         if (
-            self.bootstrap_relative_reference != expected_reference
-            or not self.bundle_bytes.startswith(expected_binding)
-            or self.bundle_bytes.count(expected_binding) != 1
-            or self.bundle_bytes.count(b"new URL(") != 1
-            or self.bundle_bytes.count(b"import.meta.url") != 1
-            or self.bundle_bytes.count(reference_bytes) != 1
-            or b"\x00" in self.bundle_bytes
-            or b"\x00" in self.launcher_bytes
+            bootstrap_reference != expected_reference
+            or not bundle_bytes.startswith(expected_binding)
+            or bundle_bytes.count(expected_binding) != 1
+            or bundle_bytes.count(b"new URL(") != 1
+            or bundle_bytes.count(b"import.meta.url") != 1
+            or bundle_bytes.count(reference_bytes) != 1
+            or b"\x00" in bundle_bytes
         ):
             raise ValueError("integration bundle bootstrap lookup is invalid")
         return self
 
     @property
-    def bundle_digest(self) -> str:
-        return hashlib.sha256(self.bundle_bytes).hexdigest()
+    def project_local_paths(self) -> tuple[Path, ...]:
+        if self.installation_kind is ProviderInstallationKind.COMMAND_HOOK:
+            return (self.config_path,)
+        if self.bundle_path is None or self.bootstrap_path is None:
+            raise ValueError("integration bridge asset binding is incomplete")
+        return (self.config_path, self.bundle_path, self.bootstrap_path)
+
+    @property
+    def bundle_digest(self) -> str | None:
+        return None if self.bundle_bytes is None else hashlib.sha256(self.bundle_bytes).hexdigest()
 
     @property
     def launcher_digest(self) -> str:
@@ -238,6 +287,7 @@ BUILTIN_PROVIDER_REGISTRY = ProviderRegistry(
             profile=CaptureProfile.CODEX_HOOKS_V1,
             host_name="Codex CLI",
             host_version="0.144.6",
+            available=True,
         ),
         ProviderRegistration(
             alias=ProviderAlias.CLAUDE_CODE,
@@ -266,6 +316,7 @@ __all__ = [
     "MAX_INTEGRATION_BUNDLE_BYTES",
     "MAX_INTEGRATION_LAUNCHER_BYTES",
     "ProviderAlias",
+    "ProviderInstallationKind",
     "ProviderInstallationSpec",
     "ProviderRegistration",
     "ProviderRegistry",

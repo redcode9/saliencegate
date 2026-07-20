@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import os
 import stat
 import subprocess
@@ -32,6 +33,7 @@ from saliencegate.integrations.installation import (
 from saliencegate.integrations.registry import (
     BUILTIN_PROVIDER_REGISTRY,
     ProviderAlias,
+    ProviderInstallationKind,
     ProviderInstallationSpec,
     ProviderRegistryError,
 )
@@ -130,20 +132,50 @@ def _make_spec(
     )
 
 
+def _make_command_hook_spec(
+    tmp_path: Path,
+    *,
+    generation: int = 1,
+) -> ProviderInstallationSpec:
+    project = tmp_path / "project"
+    state = tmp_path / "state"
+    project.mkdir(exist_ok=True)
+    _make_private_directory(state)
+    return ProviderInstallationSpec(
+        installation_kind=ProviderInstallationKind.COMMAND_HOOK,
+        provider_id="synthetic",
+        profile=PROFILE,
+        host_version="0.144.6",
+        project_root=project,
+        config_path=project / ".synthetic" / "hooks.json",
+        receipt_path=state / "synthetic.receipt.json",
+        journal_path=state / "synthetic.journal.json",
+        lock_path=state / "synthetic.lock",
+        launcher_path=state / "synthetic-capture-hook",
+        capability_digest=CAPABILITY_DIGEST,
+        launcher_bytes=b"#!/bin/sh\nexit 0\n",
+        config=_config_spec(),
+        generation=generation,
+    )
+
+
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
-def test_builtin_registry_is_closed_and_real_providers_remain_unavailable(
+def test_builtin_registry_is_closed_and_only_codex_is_available(
     tmp_path: Path,
 ) -> None:
     assert tuple(item.alias for item in BUILTIN_PROVIDER_REGISTRY.providers) == tuple(ProviderAlias)
     for alias in ProviderAlias:
         registration = BUILTIN_PROVIDER_REGISTRY.resolve(alias, require_available=False)
         assert registration.alias is alias
-        assert registration.available is False
-        with pytest.raises(ProviderRegistryError):
-            BUILTIN_PROVIDER_REGISTRY.resolve(alias)
+        assert registration.available is (alias is ProviderAlias.CODEX)
+        if alias is ProviderAlias.CODEX:
+            assert BUILTIN_PROVIDER_REGISTRY.resolve(alias) == registration
+        else:
+            with pytest.raises(ProviderRegistryError):
+                BUILTIN_PROVIDER_REGISTRY.resolve(alias)
 
     with pytest.raises(ProviderRegistryError):
         BUILTIN_PROVIDER_REGISTRY.resolve("synthetic")
@@ -174,6 +206,16 @@ def test_builtin_registry_is_closed_and_real_providers_remain_unavailable(
     )
     with pytest.raises(ValidationError):
         ProviderInstallationSpec.model_validate(noncanonical_binding)
+
+    command_hook = _make_command_hook_spec(tmp_path).model_dump(mode="python")
+    command_hook["bundle_path"] = command_hook["config_path"].parent / "unexpected.js"
+    with pytest.raises(ValidationError):
+        ProviderInstallationSpec.model_validate(command_hook)
+
+    incomplete_bridge = _make_spec(tmp_path).model_dump(mode="python")
+    incomplete_bridge["bundle_path"] = None
+    with pytest.raises(ValidationError):
+        ProviderInstallationSpec.model_validate(incomplete_bridge)
 
 
 def test_pristine_missing_provider_directory_is_disabled_without_drift(tmp_path: Path) -> None:
@@ -245,6 +287,108 @@ def test_dry_run_is_side_effect_free_and_reports_project_paths(tmp_path: Path) -
     assert before == {
         path: path.read_bytes() for path in spec.project_root.rglob("*") if path.is_file()
     }
+
+
+def test_command_hook_lifecycle_has_no_bridge_assets_and_reverses_only_owned_config(
+    tmp_path: Path,
+) -> None:
+    spec = _make_command_hook_spec(tmp_path)
+    _make_private_directory(spec.config_path.parent)
+    spec.config_path.write_bytes(b'{"foreign":true}\n')
+
+    planned = install_provider(spec, KEY, dry_run=True)
+    assert planned.would_write == (
+        spec.launcher_path,
+        spec.config_path,
+        spec.receipt_path,
+        spec.journal_path,
+    )
+    assert planned.git_tracked_files == ()
+
+    installed = install_provider(spec, KEY)
+    assert installed.disposition is InstallationDisposition.INSTALLED
+    assert installed.installed is True
+    assert inspect_provider_installation(spec, KEY).drift == ()
+    assert spec.project_local_paths == (spec.config_path,)
+    assert spec.bundle_path is None
+    assert spec.bootstrap_path is None
+    assert spec.bundle_bytes is None
+    assert spec.bundle_digest is None
+    assert spec.launcher_path.read_bytes() == spec.launcher_bytes
+    receipt_payload = json.loads(spec.receipt_path.read_bytes())
+    assert "installation_kind" not in receipt_payload
+    assert receipt_payload["bundle_path"] is None
+    assert receipt_payload["bootstrap_path"] is None
+    assert receipt_payload["bundle_digest"] is None
+
+    installed_config = spec.config_path.read_bytes()
+    spec.config_path.write_bytes(installed_config.replace(b'"foreign":true', b'"foreign":false'))
+    removed = uninstall_provider(spec, KEY)
+
+    assert removed.disposition is InstallationDisposition.UNINSTALLED
+    assert removed.state is InstallationState.DISABLED
+    assert spec.config_path.read_bytes() == b'{"foreign":false}\n'
+    assert not spec.launcher_path.exists()
+    assert spec.receipt_path.is_file()
+    assert not spec.journal_path.exists()
+    assert inspect_provider_installation(spec, KEY).drift == ()
+
+
+def test_command_hook_install_and_uninstall_recovery_skip_bridge_stages(
+    tmp_path: Path,
+) -> None:
+    spec = _make_command_hook_spec(tmp_path)
+
+    def fail_after_launcher(stage: str) -> None:
+        if stage == "after_launcher_publish":
+            raise RuntimeError("synthetic install interruption")
+
+    with pytest.raises(RuntimeError, match="synthetic install interruption"):
+        install_provider(spec, KEY, _fault_injector=fail_after_launcher)
+
+    recovered_install = recover_provider_installation(spec, KEY)
+    assert recovered_install.disposition is InstallationDisposition.RECOVERED
+    assert recovered_install.state is InstallationState.ENABLED
+    assert inspect_provider_installation(spec, KEY).drift == ()
+
+    def fail_after_config_remove(stage: str) -> None:
+        if stage == "after_config_remove":
+            raise RuntimeError("synthetic uninstall interruption")
+
+    with pytest.raises(RuntimeError, match="synthetic uninstall interruption"):
+        uninstall_provider(spec, KEY, _fault_injector=fail_after_config_remove)
+
+    recovered_uninstall = recover_provider_installation(spec, KEY)
+    assert recovered_uninstall.disposition is InstallationDisposition.RECOVERED
+    assert recovered_uninstall.state is InstallationState.DISABLED
+    assert not spec.config_path.exists()
+    assert not spec.launcher_path.exists()
+    assert inspect_provider_installation(spec, KEY).drift == ()
+
+
+def test_receipt_v1_infers_kind_without_changing_the_authenticated_wire_shape(
+    tmp_path: Path,
+) -> None:
+    bridge_root = tmp_path / "bridge"
+    command_hook_root = tmp_path / "command-hook"
+    bridge_root.mkdir()
+    command_hook_root.mkdir()
+    bridge = _make_spec(bridge_root)
+    command_hook = _make_command_hook_spec(command_hook_root)
+
+    install_provider(bridge, KEY)
+    install_provider(command_hook, KEY)
+
+    bridge_data = bridge.receipt_path.read_bytes()
+    command_hook_data = command_hook.receipt_path.read_bytes()
+    assert b'"installation_kind"' not in bridge_data
+    assert b'"installation_kind"' not in command_hook_data
+    assert installation_module._decode_receipt(bridge_data, KEY).installation_kind is (
+        ProviderInstallationKind.BRIDGE
+    )
+    assert installation_module._decode_receipt(command_hook_data, KEY).installation_kind is (
+        ProviderInstallationKind.COMMAND_HOOK
+    )
 
 
 def test_install_absent_is_private_authenticated_and_idempotent(tmp_path: Path) -> None:
@@ -872,6 +1016,7 @@ def test_pending_install_recovers_forward_from_content_free_journal(tmp_path: Pa
 
     assert spec.journal_path.exists()
     journal = spec.journal_path.read_bytes()
+    assert b'"installation_kind"' not in journal
     assert b"journal-secret" not in journal
     assert b"crash-secret" not in journal
 
@@ -925,6 +1070,7 @@ def test_inspection_reports_disabled_receipt_with_unfinished_uninstall_journal(
         uninstall_provider(spec, KEY, _fault_injector=fail)
 
     journal = spec.journal_path.read_bytes()
+    assert b'"installation_kind"' not in journal
     assert recover_provider_installation(spec, KEY).state is InstallationState.DISABLED
     _write_new_private_file(spec.journal_path, journal)
     if os.name == "posix":
@@ -1224,6 +1370,34 @@ def test_controlled_upgrade_uses_a_new_immutable_bundle_and_keeps_config_bytes(
     assert inspect_provider_installation(second, KEY).drift == ()
 
 
+def test_interrupted_skipped_generation_upgrade_recovers_to_exact_target(
+    tmp_path: Path,
+) -> None:
+    first = _make_spec(tmp_path)
+    install_provider(first, KEY)
+    third = _make_spec(
+        tmp_path,
+        generation=3,
+        bundle_name="saliencegate-v3.js",
+        bundle_bytes=_bundle() + b"// v3\n",
+    )
+
+    def fail_after_bundle(stage: str) -> None:
+        if stage == "after_bundle_publish":
+            raise RuntimeError("simulated skipped-generation interruption")
+
+    with pytest.raises(RuntimeError, match="skipped-generation interruption"):
+        install_provider(third, KEY, _fault_injector=fail_after_bundle)
+
+    recovered = recover_provider_installation(third, KEY)
+
+    assert recovered.disposition is InstallationDisposition.RECOVERED
+    assert recovered.state is InstallationState.ENABLED
+    assert not first.bundle_path.exists()
+    assert third.bundle_path.read_bytes() == third.bundle_bytes
+    assert inspect_provider_installation(third, KEY).drift == ()
+
+
 def test_upgrade_rejects_a_changed_config_syntax_without_writing(tmp_path: Path) -> None:
     first = _make_spec(tmp_path)
     install_provider(first, KEY)
@@ -1316,6 +1490,44 @@ def test_git_probe_is_read_only_and_reports_only_managed_project_files(tmp_path:
     assert tracked == (spec.config_path,)
     assert after == before
     assert not (spec.project_root / ".gitignore").exists()
+
+
+def test_command_hook_git_probe_has_no_synthetic_bridge_candidates(tmp_path: Path) -> None:
+    spec = _make_command_hook_spec(tmp_path)
+    if subprocess.run(("git", "--version"), capture_output=True, check=False).returncode != 0:
+        pytest.skip("git is unavailable")
+    subprocess.run(("git", "init", "--quiet"), cwd=spec.project_root, check=True)
+    _make_private_directory(spec.config_path.parent)
+    _write_new_private_file(spec.config_path, b"{}")
+    unrelated = spec.config_path.parent / "foreign.js"
+    _write_new_private_file(unrelated, b"foreign")
+    subprocess.run(
+        (
+            "git",
+            "add",
+            spec.config_path.relative_to(spec.project_root).as_posix(),
+            unrelated.relative_to(spec.project_root).as_posix(),
+        ),
+        cwd=spec.project_root,
+        check=True,
+    )
+    before = subprocess.run(
+        ("git", "status", "--porcelain=v1"),
+        cwd=spec.project_root,
+        capture_output=True,
+        check=True,
+    ).stdout
+
+    tracked = git_tracked_project_files(spec)
+
+    after = subprocess.run(
+        ("git", "status", "--porcelain=v1"),
+        cwd=spec.project_root,
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert tracked == (spec.config_path,)
+    assert after == before
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits are platform-specific")

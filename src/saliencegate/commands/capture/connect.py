@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import shutil
 import stat
 from collections.abc import Callable, Mapping
@@ -42,6 +43,7 @@ from saliencegate.integrations.installation import (
     InstallationError,
     InstallationState,
     InstallationStatus,
+    _load_receipt_optional,
     derive_installation_identity,
     ensure_private_installation_directory,
     git_tracked_project_files,
@@ -78,6 +80,7 @@ _PROVIDER_MODULES: dict[ProviderAlias, str] = {
     ProviderAlias.OPENCODE: "saliencegate.integrations.opencode",
     ProviderAlias.PI: "saliencegate.integrations.pi",
 }
+_CODEX_HOST_VERSION = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
 
 
 class CaptureConnectReport(BaseModel):
@@ -106,7 +109,13 @@ class CaptureConnectReport(BaseModel):
     __str__ = __repr__
 
 
-def _default_spec_resolver(alias: ProviderAlias, project: Path) -> ProviderInstallationSpec:
+def _default_spec_resolver(
+    alias: ProviderAlias,
+    project: Path,
+    *,
+    environ: Mapping[str, str] | None,
+    probe_host: bool,
+) -> ProviderInstallationSpec:
     """Load a provider factory only once that provider milestone exists."""
 
     try:
@@ -114,29 +123,51 @@ def _default_spec_resolver(alias: ProviderAlias, project: Path) -> ProviderInsta
         factory = module.provider_installation_spec
         if not callable(factory):
             raise CaptureCommandUnavailableError()
-        result = factory(project)
+        result = factory(
+            project,
+            environ=environ,
+            **({"probe_host": True} if alias is ProviderAlias.CODEX and probe_host else {}),
+        )
         return ProviderInstallationSpec.model_validate(result)
     except CaptureCommandUnavailableError:
         raise
-    except (AttributeError, ImportError, KeyError, TypeError, ValueError):
+    except (AttributeError, ImportError, KeyError):
         raise CaptureCommandUnavailableError() from None
+    except (TypeError, ValueError):
+        raise CaptureCommandConfigurationError() from None
 
 
 def resolve_provider_installation_spec(
     alias: ProviderAlias,
     project: Path,
     resolver: ProviderSpecResolver | None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    probe_host: bool = False,
 ) -> ProviderInstallationSpec:
     try:
         registration = BUILTIN_PROVIDER_REGISTRY.resolve(alias, require_available=False)
-        selected = _default_spec_resolver if resolver is None else resolver
-        if not callable(selected):
-            raise TypeError
-        spec = ProviderInstallationSpec.model_validate(selected(alias, project))
+        if resolver is None:
+            spec = _default_spec_resolver(
+                alias,
+                project,
+                environ=environ,
+                probe_host=probe_host,
+            )
+        else:
+            if not callable(resolver):
+                raise TypeError
+            spec = ProviderInstallationSpec.model_validate(resolver(alias, project))
         if (
             spec.provider_id != alias.value
             or spec.profile is not registration.profile
-            or spec.host_version != registration.host_version
+            or (
+                spec.host_version != registration.host_version
+                and not (
+                    alias is ProviderAlias.CODEX
+                    and _CODEX_HOST_VERSION.fullmatch(spec.host_version) is not None
+                )
+            )
             or spec.project_root != project
         ):
             raise ValueError
@@ -154,10 +185,11 @@ def project_provider_artifacts_present(
     project: Path,
     *,
     resolver: ProviderSpecResolver | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> bool:
     """Detect known managed artifacts without trusting an unavailable installation key."""
 
-    spec = resolve_provider_installation_spec(alias, project, resolver)
+    spec = resolve_provider_installation_spec(alias, project, resolver, environ=environ)
     try:
         try:
             parent = spec.config_path.parent.lstat()
@@ -172,8 +204,7 @@ def project_provider_artifacts_present(
     if config is not None and spec.config.marker.encode("ascii") in config:
         return True
     for path in (
-        spec.bundle_path,
-        spec.bootstrap_path,
+        *spec.project_local_paths[1:],
         spec.launcher_path,
         spec.receipt_path,
         spec.journal_path,
@@ -296,10 +327,21 @@ def inspect_project_provider_installation(
     *,
     resolver: ProviderSpecResolver | None = None,
     capture_executable: str | os.PathLike[str] | Path | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> InstallationStatus:
     """Inspect one fully materialized provider installation without changing it."""
 
-    spec = resolve_provider_installation_spec(alias, project, resolver)
+    spec = resolve_provider_installation_spec(alias, project, resolver, environ=environ)
+    if resolver is None and alias is ProviderAlias.CODEX:
+        receipt = _load_receipt_optional(spec, installation_key)
+        if receipt is not None:
+            from saliencegate.integrations.codex import provider_installation_spec
+
+            spec = provider_installation_spec(
+                project,
+                environ=environ,
+                host_version=receipt.host_version,
+            )
     try:
         materialized = materialize_provider_launcher(
             spec,
@@ -512,7 +554,13 @@ def run_connect(
     environment = os.environ if environ is None else environ
     if not isinstance(environment, Mapping):
         raise CaptureCommandConfigurationError()
-    spec = resolve_provider_installation_spec(alias, resolved_project, spec_resolver)
+    spec = resolve_provider_installation_spec(
+        alias,
+        resolved_project,
+        spec_resolver,
+        environ=environment,
+        probe_host=spec_resolver is None and not dry_run,
+    )
     try:
         key = _key_for_connect(environment, dry_run=dry_run)
         spec = materialize_provider_launcher(
@@ -524,6 +572,10 @@ def run_connect(
         if dry_run:
             status = install_provider(spec, key, dry_run=True)
         else:
+            # Authenticate and plan the provider side before mutating the store.
+            # Provider-specific preflight has already rejected fresh config
+            # collisions before installation-key creation.
+            install_provider(spec, key, dry_run=True)
             # Register PENDING before publishing the provider integration. A retry
             # completes either side of this boundary and enables admission last.
             identity = derive_installation_identity(spec, key)
@@ -561,17 +613,12 @@ def run_connect(
                 environment=environment,
                 spool=spool,
             )
-        project_paths = frozenset(
-            path
-            for path in status.would_write
-            if path == spec.project_root or spec.project_root in path.parents
-        )
         return CaptureConnectReport(
             provider=alias,
             disposition=status.disposition,
             dry_run=dry_run,
             capture_enabled=not dry_run and status.state is InstallationState.ENABLED,
-            project_local_files=(3 if not dry_run else len(project_paths)),
+            project_local_files=len(spec.project_local_paths),
             git_tracked_files=len(tracked_project_files),
         )
     except CaptureCommandIntegrityError:

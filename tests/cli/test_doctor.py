@@ -5,6 +5,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import sys
 from pathlib import Path
 from typing import Any, cast
 
@@ -15,6 +16,7 @@ from tests.cli.conftest import RunCli
 
 import saliencegate.capture.spool as spool_module
 import saliencegate.commands.doctor as doctor_module
+import saliencegate.integrations.codex as codex_module
 from saliencegate.capture import (
     CaptureSpool,
     CaptureStore,
@@ -22,6 +24,7 @@ from saliencegate.capture import (
     initialize_capture_store,
     resolve_capture_store_locations,
 )
+from saliencegate.commands.capture.connect import run_connect
 from saliencegate.commands.doctor import (
     CaptureDoctorReport,
     CaptureDoctorState,
@@ -159,6 +162,63 @@ def test_capture_doctor_authenticates_store_rows_without_writing(tmp_path: Path)
         capture_project=project,
     )
     assert degraded.capture.state is CaptureDoctorState.DEGRADED
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native Windows lifecycle is covered by R01")
+def test_capture_doctor_never_launches_codex_during_read_only_inspection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "capture-project"
+    project.mkdir()
+    provider_bin = tmp_path / "provider-bin"
+    provider_bin.mkdir()
+    codex_executable = provider_bin / "codex"
+    codex_executable.write_bytes(
+        b'#!/bin/sh\n/bin/mkdir -p "$HOME"\nprintf probed > "$HOME/doctor-probe"\n'
+        b"printf 'codex-cli 0.144.6\\n'\n"
+    )
+    codex_executable.chmod(0o700)
+    environment = {
+        "HOME": str(tmp_path / "home"),
+        "PATH": str(provider_bin),
+        "XDG_CONFIG_HOME": str(tmp_path / "configuration"),
+        "XDG_STATE_HOME": str(tmp_path / "state"),
+    }
+    run_connect(
+        provider="codex",
+        project=project,
+        environ=environment,
+        capture_executable=Path(sys.executable),
+    )
+    probe_marker = Path(environment["HOME"]) / "doctor-probe"
+    assert probe_marker.read_bytes() == b"probed"
+    probe_marker.unlink()
+
+    def forbidden_probe(**_kwargs: object) -> object:
+        raise AssertionError("doctor must not execute Codex")
+
+    monkeypatch.setattr(codex_module, "probe_codex_environment", forbidden_probe)
+    before = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+
+    report = run_capture_doctor(
+        repository_path=tmp_path / "runs.sqlite3",
+        environ=environment,
+        capture_project=project,
+        capture_executable=Path(sys.executable),
+    )
+
+    assert report.capture.state is CaptureDoctorState.READY
+    assert not probe_marker.exists()
+    assert before == {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
 
 
 def test_capture_doctor_requires_the_configured_spool_boundary(tmp_path: Path) -> None:

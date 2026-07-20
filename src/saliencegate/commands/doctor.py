@@ -647,6 +647,7 @@ def _capture_installation_observation(
     installation_key: InstallationKey,
     spec_resolver: ProviderSpecResolver | None,
     capture_executable: str | os.PathLike[str] | Path | None,
+    environ: Mapping[str, str] | None,
 ) -> tuple[bool, bool]:
     from saliencegate.commands.capture.common import (
         CaptureCommandUnavailableError,
@@ -671,6 +672,7 @@ def _capture_installation_observation(
                 installation_key,
                 resolver=spec_resolver,
                 capture_executable=capture_executable,
+                environ=environ,
             )
         except CaptureCommandUnavailableError:
             continue
@@ -684,6 +686,7 @@ def _capture_artifacts_present(
     *,
     project: str | os.PathLike[str] | Path | None,
     spec_resolver: ProviderSpecResolver | None,
+    environ: Mapping[str, str] | None,
 ) -> bool:
     from saliencegate.commands.capture.common import (
         CaptureCommandUnavailableError,
@@ -699,6 +702,7 @@ def _capture_artifacts_present(
                 alias,
                 capture_project,
                 resolver=spec_resolver,
+                environ=environ,
             ):
                 return True
         except CaptureCommandUnavailableError:
@@ -750,6 +754,7 @@ def _check_capture_state(
                     if _capture_artifacts_present(
                         project=project,
                         spec_resolver=spec_resolver,
+                        environ=environment,
                     )
                     else _capture_not_configured()
                 )
@@ -759,6 +764,7 @@ def _check_capture_state(
                 installation_key=installation_key,
                 spec_resolver=spec_resolver,
                 capture_executable=capture_executable,
+                environ=environment,
             )
             return _capture_degraded() if configured else _capture_not_configured()
         if not database_exists or not spool_exists or not key_exists:
@@ -779,6 +785,7 @@ def _check_capture_state(
             installation_key=installation_key,
             spec_resolver=spec_resolver,
             capture_executable=capture_executable,
+            environ=environment,
         )
         if drifted:
             return _capture_degraded()

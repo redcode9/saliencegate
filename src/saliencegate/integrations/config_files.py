@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import stat
+import tomllib
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
@@ -28,6 +29,7 @@ MAX_PROVIDER_CONFIG_BYTES = 2 * 1_024 * 1_024
 MAX_OWNED_CONFIG_BYTES = 256 * 1_024
 _MARKER = re.compile(r"^saliencegate-owned:[a-z0-9][a-z0-9._-]{0,95}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_TOML_KEY = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 class ConfigFileError(ValueError):
@@ -42,6 +44,7 @@ class ConfigFileError(ValueError):
 class ConfigSyntax(StrEnum):
     JSON_OBJECT = "json_object"
     OPAQUE_TEXT = "opaque_text"
+    TOML_DOCUMENT = "toml_document"
 
 
 class _ConfigModel(BaseModel):
@@ -58,6 +61,22 @@ class _ConfigModel(BaseModel):
         return f"{type(self).__name__}(<redacted>)"
 
     __str__ = __repr__
+
+
+class TomlBooleanConstraint(_ConfigModel):
+    """Require one existing TOML boolean path to have a safe value."""
+
+    path: Annotated[
+        tuple[
+            Annotated[
+                str,
+                StringConstraints(min_length=1, max_length=64, pattern=_TOML_KEY.pattern),
+            ],
+            ...,
+        ],
+        Field(min_length=1, max_length=8),
+    ]
+    expected: bool
 
 
 def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -86,6 +105,13 @@ def _strict_json_loads(value: bytes) -> object:
         raise ConfigFileError() from None
 
 
+def _strict_toml_loads(value: bytes) -> dict[str, object]:
+    try:
+        return tomllib.loads(value.decode("utf-8", errors="strict"))
+    except Exception:
+        raise ConfigFileError() from None
+
+
 class OwnedConfigSpec(_ConfigModel):
     """One provider-owned fragment and its schema-neutral ownership marker."""
 
@@ -97,6 +123,10 @@ class OwnedConfigSpec(_ConfigModel):
     owned_fragment: Annotated[bytes, Field(min_length=1, max_length=MAX_OWNED_CONFIG_BYTES)] = (
         Field(repr=False)
     )
+    toml_boolean_constraints: Annotated[
+        tuple[TomlBooleanConstraint, ...],
+        Field(max_length=16),
+    ] = ()
 
     @model_validator(mode="after")
     def fragment_is_closed_and_uniquely_marked(self) -> Self:
@@ -111,6 +141,12 @@ class OwnedConfigSpec(_ConfigModel):
             decoded = _strict_json_loads(b"{" + self.owned_fragment + b"}")
             if type(decoded) is not dict or len(decoded) != 1:
                 raise ValueError("owned JSON configuration fragment is invalid")
+        elif self.syntax is ConfigSyntax.TOML_DOCUMENT:
+            _strict_toml_loads(self.owned_fragment)
+        if self.toml_boolean_constraints:
+            paths = tuple(item.path for item in self.toml_boolean_constraints)
+            if self.syntax is not ConfigSyntax.TOML_DOCUMENT or paths != tuple(sorted(set(paths))):
+                raise ValueError("owned TOML constraints are invalid")
         return self
 
 
@@ -210,6 +246,26 @@ def _opaque_insertion(current: bytes, fragment: bytes) -> tuple[bytes, int, byte
     return current + span, len(current), span
 
 
+def _validate_toml_boolean_constraints(
+    document: dict[str, object],
+    constraints: tuple[TomlBooleanConstraint, ...],
+) -> None:
+    for constraint in constraints:
+        current: object = document
+        missing = False
+        for component in constraint.path:
+            if type(current) is not dict:
+                raise ConfigFileError()
+            if component not in current:
+                missing = True
+                break
+            current = current[component]
+        if missing:
+            continue
+        if type(current) is not bool or current is not constraint.expected:
+            raise ConfigFileError()
+
+
 def plan_owned_config_install(
     current: bytes | None,
     spec: OwnedConfigSpec,
@@ -235,6 +291,17 @@ def plan_owned_config_install(
             installed, start, span = _json_object_insertion(original, checked.owned_fragment)
         else:
             installed, start, span = _opaque_insertion(original, checked.owned_fragment)
+        if checked.syntax is ConfigSyntax.TOML_DOCUMENT:
+            original_document = _strict_toml_loads(original)
+            installed_document = _strict_toml_loads(installed)
+            _validate_toml_boolean_constraints(
+                original_document,
+                checked.toml_boolean_constraints,
+            )
+            _validate_toml_boolean_constraints(
+                installed_document,
+                checked.toml_boolean_constraints,
+            )
         if len(installed) > MAX_PROVIDER_CONFIG_BYTES:
             raise ConfigFileError()
         reverse = OwnedConfigReverseEdit(
@@ -315,6 +382,9 @@ def remove_owned_config_edit(
             if len(valid) != 1:
                 raise ConfigFileError()
             restored = valid[0]
+        elif checked.syntax is ConfigSyntax.TOML_DOCUMENT:
+            _strict_toml_loads(current)
+            _strict_toml_loads(restored)
         if len(restored) > MAX_PROVIDER_CONFIG_BYTES:
             raise ConfigFileError()
         return restored

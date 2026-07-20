@@ -296,25 +296,28 @@ def load_or_create_installation_key(path: Path | None = None) -> InstallationKey
     target = default_installation_key_path() if path is None else Path(path).expanduser()
     if not target.is_absolute():
         raise InsecureKeyPathError("installation key path must be absolute")
-    if os.name == "nt":  # pragma: no cover - exercised by native Windows R01
-        try:
-            operations = NativeWindowsSecurityOperations()
-            ensure_windows_private_directory(
-                PureWindowsPath(os.fspath(target.parent)),
-                operations=operations,
-            ).revalidate()
-        except WindowsSecurityError:
-            raise InsecureKeyPathError(
-                "installation key Windows directory boundary is invalid"
-            ) from None
-    else:
-        try:
-            ensure_private_directory(target.parent)
-        except SecureFileError:
-            raise InsecureKeyPathError("installation key directory boundary is invalid") from None
+    with _PROCESS_KEY_LOCK:
+        if os.name == "nt":  # pragma: no cover - exercised by native Windows R01
+            try:
+                operations = NativeWindowsSecurityOperations()
+                ensure_windows_private_directory(
+                    PureWindowsPath(os.fspath(target.parent)),
+                    operations=operations,
+                ).revalidate()
+            except WindowsSecurityError:
+                raise InsecureKeyPathError(
+                    "installation key Windows directory boundary is invalid"
+                ) from None
+        else:
+            try:
+                ensure_private_directory(target.parent)
+            except SecureFileError:
+                raise InsecureKeyPathError(
+                    "installation key directory boundary is invalid"
+                ) from None
 
-    with _PROCESS_KEY_LOCK, _installation_key_lock(target):
-        return _load_or_create_locked(target)
+        with _installation_key_lock(target):
+            return _load_or_create_locked(target)
 
 
 def load_installation_key(
