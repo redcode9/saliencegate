@@ -6,7 +6,7 @@ an agent, compare memory policies, or establish performance on another system.
 
 The [reference JSON](../../benchmarks/shadow_trace/reference-macos-26.5.2-arm64-cpython-3.12.3.json)
 has SHA-256
-`6b0e2b1e9e39570210df67a56163c56b2695fc3ec6b903b2fab530274fdcf0ba`. Its companion
+`15c5f56fb81e779535f4e0a31edc5718aadb82f45f976186e5a0f19589d03768`. Its companion
 [evidence manifest](../../benchmarks/shadow_trace/reference-macos-26.5.2-arm64-cpython-3.12.3.manifest.json)
 binds that report to the benchmark script, runtime source surface, socket guard, runtime-relevant
 project metadata, dependency lock, Python version file, and captured toolchain. The manifest is
@@ -26,27 +26,27 @@ median of the five isolated measurements; the memory gate applies to the largest
 
 | Backend | Sample | Duration | Peak RSS |
 |---|---:|---:|---:|
-| In memory | 1 | 4.66473575 s | 185.171875 MiB |
-| In memory | 2 | 4.729587833 s | 184.8125 MiB |
-| In memory | 3 | 4.57829925 s | 184.828125 MiB |
-| In memory | 4 | 4.719111875 s | 185.40625 MiB |
-| In memory | 5 | 4.72002375 s | 184.546875 MiB |
-| SQLite | 1 | 7.427851125 s | 213.921875 MiB |
-| SQLite | 2 | 7.412707417 s | 212.78125 MiB |
-| SQLite | 3 | 7.398388584 s | 212.8125 MiB |
-| SQLite | 4 | 7.370406125 s | 212.15625 MiB |
-| SQLite | 5 | 7.507945875 s | 213.890625 MiB |
+| In memory | 1 | 4.475258041 s | 186.25 MiB |
+| In memory | 2 | 4.739888625 s | 186.328125 MiB |
+| In memory | 3 | 4.501317375 s | 186.265625 MiB |
+| In memory | 4 | 4.511588875 s | 185.359375 MiB |
+| In memory | 5 | 4.544195208 s | 185.296875 MiB |
+| SQLite | 1 | 7.22261425 s | 214.46875 MiB |
+| SQLite | 2 | 7.240622834 s | 215.625 MiB |
+| SQLite | 3 | 7.2408065 s | 214.21875 MiB |
+| SQLite | 4 | 7.247394583 s | 214.234375 MiB |
+| SQLite | 5 | 7.238663542 s | 215.328125 MiB |
 
 ## Budgets and result
 
 | Backend | Median | Median budget | Maximum peak RSS | RSS budget | Result |
 |---|---:|---:|---:|---:|---|
-| In memory | 4.719111875 s | 5 s | 185.40625 MiB | 512 MiB | Passed |
-| SQLite | 7.412707417 s | 15 s | 213.921875 MiB | 512 MiB | Passed |
+| In memory | 4.511588875 s | 5 s | 186.359375 MiB | 512 MiB | Passed |
+| SQLite | 7.240622834 s | 15 s | 215.625 MiB | 512 MiB | Passed |
 
-The 1,000-record warm-ups took 4.503220708 seconds in memory and 7.736961959 seconds with SQLite. A
-separate, non-gating 250-record baseline produced median times of 0.903633125 and 1.428466542
-seconds. The recorded 250-to-1,000 ratios are 5.22237592275073 and 5.189276191671558. They do not
+The 1,000-record warm-ups took 4.50987225 seconds in memory and 7.2872745 seconds with SQLite. A
+separate, non-gating 250-record baseline produced median times of 0.890057375 and 1.33724275
+seconds. The recorded 250-to-1,000 ratios are 5.068874211620346 and 5.414591205673016. They do not
 gate the run, and the v1 prefix digest is not claimed to scale linearly.
 
 ## Environment

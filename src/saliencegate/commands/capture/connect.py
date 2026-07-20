@@ -191,21 +191,22 @@ def project_provider_artifacts_present(
     """Detect known managed artifacts without trusting an unavailable installation key."""
 
     spec = resolve_provider_installation_spec(alias, project, resolver, environ=environ)
-    try:
+    if spec.config_path is not None and spec.config is not None:
         try:
-            parent = spec.config_path.parent.lstat()
-        except FileNotFoundError:
-            config = None
-        else:
-            if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
-                return True
-            config = read_config_bytes(spec.config_path)
-    except (ConfigFileError, OSError):
-        return True
-    if config is not None and spec.config.marker.encode("ascii") in config:
-        return True
+            try:
+                parent = spec.config_path.parent.lstat()
+            except FileNotFoundError:
+                config = None
+            else:
+                if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
+                    return True
+                config = read_config_bytes(spec.config_path)
+        except (ConfigFileError, OSError):
+            return True
+        if config is not None and spec.config.marker.encode("ascii") in config:
+            return True
     for path in (
-        *spec.project_local_paths[1:],
+        *(path for path in spec.project_local_paths if path != spec.config_path),
         spec.launcher_path,
         spec.receipt_path,
         spec.journal_path,

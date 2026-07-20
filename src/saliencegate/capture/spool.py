@@ -56,7 +56,8 @@ _SESSION_MARKER_NAME_DOMAIN = b"saliencegate:capture-spool:session-name:v1"
 _SESSION_MARKER_DOMAIN = b"saliencegate:capture-spool:session:v1"
 _COMPONENT_IDENTIFIER = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._:/+\-]{0,255}$")
 _HEALTH_NAME = ".capture-spool-health"
-_HEALTH_HEADER = b"capture-spool-health/v1"
+_HEALTH_HEADER_V1 = b"capture-spool-health/v1"
+_HEALTH_HEADER = b"capture-spool-health/v2"
 _HEALTH_DOMAIN = b"saliencegate:capture-spool:health:v1"
 _OBSERVATION_DOMAIN = b"saliencegate:capture-spool:observation:v1"
 _LOCK_NAME = ".capture-spool-lock"
@@ -64,6 +65,7 @@ _MAX_ENTRY_BYTES = MAX_CAPTURE_EVENT_BYTES + 256
 _MAX_SESSION_MARKER_BYTES = 1_024
 _MAX_HEALTH_BYTES = 4_096
 _MAX_LOCK_BYTES = 4_096
+_MAX_BRIDGE_FALLBACK_EXISTING_EVENTS = 32
 
 
 def _safe_lock_metadata(value: os.stat_result) -> bool:
@@ -781,6 +783,7 @@ class CaptureSpool:
                 dropped_events,
                 last_drop_reason,
                 acknowledged_marker,
+                bridge_barrier_marker,
                 health,
             ) = self._drop_state_record(directory_fd)
             for _path, _intake, stable in entries:
@@ -800,6 +803,7 @@ class CaptureSpool:
                 dropped_events=dropped_events,
                 last_drop_reason=last_drop_reason,
                 acknowledged_marker=acknowledged_marker,
+                bridge_barrier_marker=bridge_barrier_marker,
                 markers=markers,
                 orphan_markers=orphan_markers,
             )
@@ -860,6 +864,50 @@ class CaptureSpool:
             for path in self._spool_child_paths(directory_fd)
             if _SESSION_MARKER_NAME.fullmatch(path.name)
         )
+
+    def _bridge_fallback_backlog_exceeds_limit_locked(
+        self,
+        directory_fd: int | None,
+    ) -> bool:
+        """Validate every child name while avoiding record reads and a sorted path inventory."""
+
+        existing_events = 0
+
+        def inspect_name(name: str) -> None:
+            nonlocal existing_events
+            is_entry = _ENTRY_NAME.fullmatch(name) is not None
+            if (
+                not is_entry
+                and _SESSION_MARKER_NAME.fullmatch(name) is None
+                and name not in {_HEALTH_NAME, _LOCK_NAME}
+            ):
+                raise CaptureSpoolIntegrityError()
+            if is_entry and existing_events <= _MAX_BRIDGE_FALLBACK_EXISTING_EVENTS:
+                existing_events += 1
+
+        if self._windows_operations is not None:  # pragma: no cover - native Windows R01
+            self._revalidate()
+            for path in self._locations.spool_directory.iterdir():
+                inspect_name(path.name)
+            self._revalidate()
+        else:
+            if (
+                type(directory_fd) is not int
+                or type(self._spool_identity) is not security_files._PrivateDirectoryAuthorization
+            ):
+                raise SecureFileError()
+            security_files._require_authorized_private_directory_descriptor(
+                self._spool_identity,
+                directory_fd,
+            )
+            with os.scandir(directory_fd) as candidates:
+                for candidate in candidates:
+                    inspect_name(candidate.name)
+            security_files._require_authorized_private_directory_descriptor(
+                self._spool_identity,
+                directory_fd,
+            )
+        return existing_events > _MAX_BRIDGE_FALLBACK_EXISTING_EVENTS
 
     def _decode_entry(
         self,
@@ -982,11 +1030,12 @@ class CaptureSpool:
     def _decode_drop_state(
         self,
         data: bytes,
-    ) -> tuple[int, str | None, str | None] | None:
+    ) -> tuple[int, str | None, str | None, str | None] | None:
         try:
             parts = data.split(b"\n", maxsplit=2)
-            if len(parts) != 3 or parts[0] != _HEALTH_HEADER:
+            if len(parts) != 3 or parts[0] not in (_HEALTH_HEADER_V1, _HEALTH_HEADER):
                 return None
+            header = parts[0]
             encoded_tag, payload = parts[1:]
             if re.fullmatch(rb"[0-9a-f]{64}", encoded_tag) is None:
                 return None
@@ -996,17 +1045,31 @@ class CaptureSpool:
             import json
 
             value = json.loads(payload)
-            if (
-                type(value) is not dict
-                or set(value)
-                != {
+            if type(value) is not dict:
+                return None
+            if value.get("schema_version") == "capture-spool-health/v1":
+                if header != _HEALTH_HEADER_V1 or set(value) != {
                     "schema_version",
                     "dropped_events",
                     "last_drop_reason",
                     "acknowledged_marker",
-                }
-                or value.get("schema_version") != "capture-spool-health/v1"
-                or type(value.get("dropped_events")) is not int
+                }:
+                    return None
+                bridge_barrier_marker = None
+            elif value.get("schema_version") == "capture-spool-health/v2":
+                if header != _HEALTH_HEADER or set(value) != {
+                    "schema_version",
+                    "dropped_events",
+                    "last_drop_reason",
+                    "acknowledged_marker",
+                    "bridge_barrier_marker",
+                }:
+                    return None
+                bridge_barrier_marker = value["bridge_barrier_marker"]
+            else:
+                return None
+            if (
+                type(value.get("dropped_events")) is not int
                 or value["dropped_events"] < 0
                 or value.get("last_drop_reason") not in (None, "spool_incomplete", "spool_quota")
                 or (
@@ -1016,8 +1079,21 @@ class CaptureSpool:
                         or re.fullmatch(r"[0-9a-f]{64}", value["acknowledged_marker"]) is None
                     )
                 )
+                or (
+                    bridge_barrier_marker is not None
+                    and (
+                        type(bridge_barrier_marker) is not str
+                        or re.fullmatch(r"[0-9a-f]{64}", bridge_barrier_marker) is None
+                    )
+                )
                 or ((value["dropped_events"] == 0) != (value["last_drop_reason"] is None))
-                or (value["dropped_events"] == 0 and value["acknowledged_marker"] is not None)
+                or (
+                    value["dropped_events"] == 0
+                    and (
+                        value["acknowledged_marker"] is not None
+                        or bridge_barrier_marker is not None
+                    )
+                )
                 or canonical_json(value) != payload
             ):
                 return None
@@ -1025,6 +1101,7 @@ class CaptureSpool:
                 value["dropped_events"],
                 value["last_drop_reason"],
                 value["acknowledged_marker"],
+                bridge_barrier_marker,
             )
         except Exception:
             return None
@@ -1032,14 +1109,14 @@ class CaptureSpool:
     def _drop_state_record(
         self,
         directory_fd: int | None,
-    ) -> tuple[int, str | None, str | None, _SpoolFileRead | None]:
+    ) -> tuple[int, str | None, str | None, str | None, _SpoolFileRead | None]:
         path = self._health_path()
         stable: _SpoolFileRead | None = None
         try:
             if self._windows_operations is not None:  # pragma: no cover - native Windows R01
                 windows_path = PureWindowsPath(str(path))
                 if self._windows_operations.inspect_path(windows_path) is None:
-                    return 0, None, None, None
+                    return 0, None, None, None, None
                 stable = self._windows_operations.read_private_file(
                     windows_path,
                     maximum_bytes=_MAX_HEALTH_BYTES,
@@ -1054,7 +1131,7 @@ class CaptureSpool:
                 try:
                     os.stat(_HEALTH_NAME, dir_fd=directory_fd, follow_symlinks=False)
                 except FileNotFoundError:
-                    return 0, None, None, None
+                    return 0, None, None, None, None
                 stable = security_files._read_private_file_at_descriptor(
                     self._spool_identity,
                     directory_fd,
@@ -1069,13 +1146,25 @@ class CaptureSpool:
         if state is None:
             raise CaptureSpoolIntegrityError()
         stable.authorization.revalidate()
-        return state[0], state[1], state[2], stable
+        return state[0], state[1], state[2], state[3], stable
 
-    def _drop_state(self, directory_fd: int | None) -> tuple[int, str | None, str | None]:
-        dropped_events, last_drop_reason, acknowledged_marker, _stable = self._drop_state_record(
-            directory_fd
+    def _drop_state(
+        self,
+        directory_fd: int | None,
+    ) -> tuple[int, str | None, str | None, str | None]:
+        (
+            dropped_events,
+            last_drop_reason,
+            acknowledged_marker,
+            bridge_barrier_marker,
+            _stable,
+        ) = self._drop_state_record(directory_fd)
+        return (
+            dropped_events,
+            last_drop_reason,
+            acknowledged_marker,
+            bridge_barrier_marker,
         )
-        return dropped_events, last_drop_reason, acknowledged_marker
 
     def _write_drop_state(
         self,
@@ -1084,6 +1173,7 @@ class CaptureSpool:
         directory_fd: int | None,
         *,
         acknowledged_marker: str | None = None,
+        bridge_barrier_marker: str | None = None,
     ) -> None:
         if (
             type(dropped_events) is not int
@@ -1096,14 +1186,22 @@ class CaptureSpool:
                     or re.fullmatch(r"[0-9a-f]{64}", acknowledged_marker) is None
                 )
             )
+            or (
+                bridge_barrier_marker is not None
+                and (
+                    type(bridge_barrier_marker) is not str
+                    or re.fullmatch(r"[0-9a-f]{64}", bridge_barrier_marker) is None
+                )
+            )
         ):
             raise CaptureSpoolIntegrityError()
         payload = canonical_json(
             {
-                "schema_version": "capture-spool-health/v1",
+                "schema_version": "capture-spool-health/v2",
                 "dropped_events": dropped_events,
                 "last_drop_reason": reason,
                 "acknowledged_marker": acknowledged_marker,
+                "bridge_barrier_marker": bridge_barrier_marker,
             }
         )
         tag = self._key._hmac_sha256(payload, domain=_HEALTH_DOMAIN)
@@ -1116,7 +1214,13 @@ class CaptureSpool:
                 maximum_bytes=_MAX_HEALTH_BYTES,
                 validate_replacement=lambda value: self._decode_drop_state(value) is not None,
                 validate_published=lambda value: (
-                    self._decode_drop_state(value) == (dropped_events, reason, acknowledged_marker)
+                    self._decode_drop_state(value)
+                    == (
+                        dropped_events,
+                        reason,
+                        acknowledged_marker,
+                        bridge_barrier_marker,
+                    )
                 ),
             )
         else:
@@ -1133,7 +1237,13 @@ class CaptureSpool:
                 maximum_bytes=_MAX_HEALTH_BYTES,
                 validate_replacement=lambda value: self._decode_drop_state(value) is not None,
                 validate_published=lambda value: (
-                    self._decode_drop_state(value) == (dropped_events, reason, acknowledged_marker)
+                    self._decode_drop_state(value)
+                    == (
+                        dropped_events,
+                        reason,
+                        acknowledged_marker,
+                        bridge_barrier_marker,
+                    )
                 ),
             )
 
@@ -1141,12 +1251,18 @@ class CaptureSpool:
         entries = self._entries(directory_fd)
         markers = self._session_markers(directory_fd)
         orphan_markers = self._reconcile_session_markers(entries, markers)
-        dropped_events, last_drop_reason, acknowledged_marker = self._drop_state(directory_fd)
+        (
+            dropped_events,
+            last_drop_reason,
+            acknowledged_marker,
+            bridge_barrier_marker,
+        ) = self._drop_state(directory_fd)
         return self._health_from_state(
             entries,
             dropped_events=dropped_events,
             last_drop_reason=last_drop_reason,
             acknowledged_marker=acknowledged_marker,
+            bridge_barrier_marker=bridge_barrier_marker,
             markers=markers,
             orphan_markers=orphan_markers,
         )
@@ -1158,12 +1274,16 @@ class CaptureSpool:
         dropped_events: int,
         last_drop_reason: str | None,
         acknowledged_marker: str | None,
+        bridge_barrier_marker: str | None,
         markers: dict[_SpoolSessionKey, _SpoolSessionMarker],
         orphan_markers: set[_SpoolSessionKey],
     ) -> CaptureSpoolHealth:
         synthetic_drops = 0
+        bridge_barrier_found = bridge_barrier_marker is None
         for key, (path, state, _stable) in markers.items():
             marker_tag = path.name.removesuffix(_SESSION_MARKER_SUFFIX)
+            if marker_tag == bridge_barrier_marker:
+                bridge_barrier_found = True
             if state == "acknowledged" and dropped_events == 0:
                 raise CaptureSpoolIntegrityError()
             if (
@@ -1172,8 +1292,14 @@ class CaptureSpool:
                 and key not in orphan_markers
             ):
                 raise CaptureSpoolIntegrityError()
-            if key in orphan_markers and state == "pending" and marker_tag != acknowledged_marker:
+            if (
+                key in orphan_markers
+                and state == "pending"
+                and marker_tag not in (acknowledged_marker, bridge_barrier_marker)
+            ):
                 synthetic_drops += 1
+        if not bridge_barrier_found:
+            raise CaptureSpoolIntegrityError()
         if synthetic_drops:
             dropped_events += synthetic_drops
             last_drop_reason = "spool_incomplete"
@@ -1224,11 +1350,41 @@ class CaptureSpool:
         directory_fd: int | None,
         *,
         remove: bool,
+        clear_bridge_barrier: bool = False,
     ) -> None:
         if not orphan_markers:
             return
-        dropped_events, last_drop_reason, acknowledged_marker = self._drop_state(directory_fd)
+        (
+            dropped_events,
+            last_drop_reason,
+            acknowledged_marker,
+            bridge_barrier_marker,
+        ) = self._drop_state(directory_fd)
         remaining_orphans = set(orphan_markers)
+        if bridge_barrier_marker is not None:
+            bridge_barrier_found = False
+            for key, (path, state, stable) in tuple(markers.items()):
+                marker_tag = path.name.removesuffix(_SESSION_MARKER_SUFFIX)
+                if marker_tag != bridge_barrier_marker:
+                    continue
+                bridge_barrier_found = True
+                if state == "pending":
+                    markers[key] = self._set_session_marker_state_locked(
+                        key,
+                        "acknowledged",
+                        directory_fd,
+                    )
+                    path, state, stable = markers[key]
+                if state != "acknowledged":
+                    raise CaptureSpoolIntegrityError()
+                if key in remaining_orphans:
+                    if remove and clear_bridge_barrier:
+                        self._delete_stable_file_locked(stable, directory_fd)
+                        markers.pop(key)
+                    remaining_orphans.remove(key)
+                break
+            if not bridge_barrier_found:
+                raise CaptureSpoolIntegrityError()
         if acknowledged_marker is not None:
             for key, (path, state, stable) in tuple(markers.items()):
                 marker_tag = path.name.removesuffix(_SESSION_MARKER_SUFFIX)
@@ -1239,13 +1395,13 @@ class CaptureSpool:
                 if remove:
                     self._delete_stable_file_locked(stable, directory_fd)
                     markers.pop(key)
-                    remaining_orphans.remove(key)
                 else:
                     markers[key] = self._set_session_marker_state_locked(
                         key,
                         "acknowledged",
                         directory_fd,
                     )
+                remaining_orphans.remove(key)
                 break
         for key in sorted(remaining_orphans):
             path, state, stable = markers[key]
@@ -1261,6 +1417,7 @@ class CaptureSpool:
                     last_drop_reason,
                     directory_fd,
                     acknowledged_marker=acknowledged_marker,
+                    bridge_barrier_marker=bridge_barrier_marker,
                 )
             if remove:
                 self._delete_stable_file_locked(stable, directory_fd)
@@ -1367,10 +1524,15 @@ class CaptureSpool:
             markers,
             directory_fd,
             remove=True,
+            clear_bridge_barrier=True,
         )
-        _dropped_events, _last_drop_reason, _acknowledged_marker, stable = self._drop_state_record(
-            directory_fd
-        )
+        (
+            _dropped_events,
+            _last_drop_reason,
+            _acknowledged_marker,
+            _bridge_barrier_marker,
+            stable,
+        ) = self._drop_state_record(directory_fd)
         if stable is not None:
             self._delete_stable_file_locked(stable, directory_fd)
         return True
@@ -1416,6 +1578,8 @@ class CaptureSpool:
         tag: str,
         framed: bytes,
         directory_fd: int | None,
+        *,
+        bridge_barrier: bool = False,
     ) -> CaptureSpoolEnqueueReceipt:
         entries = self._entries(directory_fd)
         markers = self._session_markers(directory_fd)
@@ -1447,15 +1611,25 @@ class CaptureSpool:
                     directory_fd,
                 )
                 markers[key] = marker
-            dropped_events, _reason, acknowledged_marker = self._drop_state(directory_fd)
+            (
+                dropped_events,
+                _reason,
+                acknowledged_marker,
+                bridge_barrier_marker,
+            ) = self._drop_state(directory_fd)
             marker_tag = marker[0].name.removesuffix(_SESSION_MARKER_SUFFIX)
+            if bridge_barrier and bridge_barrier_marker is None:
+                bridge_barrier_marker = marker_tag
             self._write_drop_state(
                 dropped_events + 1,
                 "spool_quota",
                 directory_fd,
                 acknowledged_marker=(marker_tag if pending_quota_barrier else acknowledged_marker),
+                bridge_barrier_marker=bridge_barrier_marker,
             )
-            if pending_quota_barrier:
+            if pending_quota_barrier or (
+                bridge_barrier_marker == marker_tag and marker[1] == "pending"
+            ):
                 markers[key] = self._set_session_marker_state_locked(
                     key,
                     "acknowledged",
@@ -1489,6 +1663,62 @@ class CaptureSpool:
                 validate_published=lambda value: value == framed,
             )
         return CaptureSpoolEnqueueReceipt(disposition="queued")
+
+    def _drop_bridge_fallback_locked(
+        self,
+        key: _SpoolSessionKey,
+        count: int,
+        directory_fd: int | None,
+    ) -> tuple[CaptureSpoolEnqueueReceipt, ...]:
+        (
+            dropped_events,
+            _reason,
+            acknowledged_marker,
+            bridge_barrier_marker,
+        ) = self._drop_state(directory_fd)
+        if bridge_barrier_marker is not None:
+            self._require_bridge_barrier_locked(bridge_barrier_marker, directory_fd)
+            self._write_drop_state(
+                dropped_events + count,
+                "spool_quota",
+                directory_fd,
+                acknowledged_marker=acknowledged_marker,
+                bridge_barrier_marker=bridge_barrier_marker,
+            )
+            return tuple(
+                CaptureSpoolEnqueueReceipt(disposition="dropped_quota") for _index in range(count)
+            )
+        marker = self._read_session_marker(key[0], key[1], directory_fd)
+        if marker is None:
+            marker = self._ensure_session_marker_locked(key[0], key[1], directory_fd)
+        marker_tag = marker[0].name.removesuffix(_SESSION_MARKER_SUFFIX)
+        self._write_drop_state(
+            dropped_events + count,
+            "spool_quota",
+            directory_fd,
+            acknowledged_marker=acknowledged_marker,
+            bridge_barrier_marker=marker_tag,
+        )
+        if marker[1] == "pending":
+            self._set_session_marker_state_locked(key, "acknowledged", directory_fd)
+        return tuple(
+            CaptureSpoolEnqueueReceipt(disposition="dropped_quota") for _index in range(count)
+        )
+
+    def _require_bridge_barrier_locked(
+        self,
+        marker_tag: str,
+        directory_fd: int | None,
+    ) -> None:
+        marker_path = self._locations.spool_directory / (f"{marker_tag}{_SESSION_MARKER_SUFFIX}")
+        decoded = self._decode_session_marker(marker_path, directory_fd)
+        if decoded is None:
+            raise CaptureSpoolIntegrityError()
+        key, state, _stable = decoded
+        if state == "pending":
+            self._set_session_marker_state_locked(key, "acknowledged", directory_fd)
+        elif state != "acknowledged":
+            raise CaptureSpoolIntegrityError()
 
     def enqueue(self, intake: CaptureIntake) -> CaptureSpoolEnqueueReceipt:
         failed = False
@@ -1557,6 +1787,76 @@ class CaptureSpool:
                 raise CaptureSpoolUnavailableError() from None
             raise CaptureSpoolError() from None
 
+    def admit_transport(
+        self,
+        store: object,
+        chunk: object,
+        intakes: tuple[CaptureIntake, ...],
+        fallback: tuple[CaptureIntake, ...],
+    ) -> tuple[CaptureSpoolEnqueueReceipt, ...]:
+        """Admit one bridge chunk without overtaking same-session fallback records."""
+
+        try:
+            if type(intakes) is not tuple or type(fallback) is not tuple or not fallback:
+                raise CaptureSpoolError()
+            key = (fallback[0].connection_id, fallback[0].session_id)
+            if any((intake.connection_id, intake.session_id) != key for intake in fallback):
+                raise CaptureSpoolError()
+            append_transport_chunk = getattr(store, "append_transport_chunk", None)
+            if not callable(append_transport_chunk):
+                raise CaptureSpoolError()
+            framed = tuple((intake, *self._frame(intake)) for intake in fallback)
+        except CaptureSpoolError:
+            raise
+        except Exception:
+            raise CaptureSpoolError() from None
+        entered = False
+        try:
+            with self._locked(blocking=False) as directory_fd:
+                entered = True
+                (
+                    _dropped_events,
+                    _reason,
+                    _acknowledged_marker,
+                    bridge_barrier_marker,
+                ) = self._drop_state(directory_fd)
+                if bridge_barrier_marker is not None:
+                    self._require_bridge_barrier_locked(
+                        bridge_barrier_marker,
+                        directory_fd,
+                    )
+                    return self._drop_bridge_fallback_locked(key, len(framed), directory_fd)
+                marker = self._read_session_marker(key[0], key[1], directory_fd)
+                if marker is None:
+                    from saliencegate.capture.store import CaptureStoreBusyError
+
+                    try:
+                        append_transport_chunk(chunk, intakes)
+                        return ()
+                    except Exception as error:
+                        if not isinstance(error, CaptureStoreBusyError):
+                            raise
+                if self._bridge_fallback_backlog_exceeds_limit_locked(directory_fd):
+                    return self._drop_bridge_fallback_locked(key, len(framed), directory_fd)
+                return tuple(
+                    self._enqueue_locked(
+                        intake,
+                        tag,
+                        frame,
+                        directory_fd,
+                        bridge_barrier=True,
+                    )
+                    for intake, tag, frame in framed
+                )
+        except CaptureSpoolError:
+            raise
+        except RuntimeError:
+            raise
+        except Exception:
+            if not entered:
+                raise CaptureSpoolUnavailableError() from None
+            raise CaptureSpoolError() from None
+
     @contextmanager
     def maintenance(self) -> Iterator[CaptureSpoolMaintenance]:
         """Hold the spool fence across drain and a store lifecycle mutation."""
@@ -1600,6 +1900,14 @@ class CaptureSpool:
             directory_fd,
             remove=True,
         )
+        (
+            _dropped_events,
+            _reason,
+            _acknowledged_marker,
+            bridge_barrier_marker,
+        ) = self._drop_state(directory_fd)
+        if bridge_barrier_marker is not None:
+            self._require_bridge_barrier_locked(bridge_barrier_marker, directory_fd)
         remaining_by_session: dict[_SpoolSessionKey, int] = {}
         for _path, intake, _stable in entries:
             key = (intake.connection_id, intake.session_id)
@@ -1621,8 +1929,11 @@ class CaptureSpool:
             key = (intake.connection_id, intake.session_id)
             remaining_by_session[key] -= 1
             if remaining_by_session[key] == 0:
-                _marker_path, _state, marker = markers.pop(key)
-                self._delete_stable_file_locked(marker, directory_fd)
+                marker_path, _marker_state, marker = markers[key]
+                marker_tag = marker_path.name.removesuffix(_SESSION_MARKER_SUFFIX)
+                if marker_tag != bridge_barrier_marker:
+                    markers.pop(key)
+                    self._delete_stable_file_locked(marker, directory_fd)
             admitted += 1
         return CaptureSpoolDrainReceipt(admitted_events=admitted, remaining_events=0)
 

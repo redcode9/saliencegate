@@ -16,6 +16,8 @@ ENV/
 # Packaging
 build/
 dist/
+node_modules/
+connectors/.build/
 *.egg-info/
 .eggs/
 wheels/

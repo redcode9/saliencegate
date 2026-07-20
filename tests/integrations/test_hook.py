@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -13,10 +14,12 @@ from pathlib import Path
 import pytest
 from tests.capture.store_support import (
     CONNECTION_ID,
+    INSTALLATION_KEY,
     authenticated_intake,
     capture_context,
 )
 
+import saliencegate.capture.spool as spool_module
 from saliencegate.capture.adapters import (
     CAPTURE_ADAPTER_PROTOCOL_VERSION,
     CaptureAdapterCapabilities,
@@ -28,13 +31,29 @@ from saliencegate.capture.capabilities import (
 )
 from saliencegate.capture.health import CaptureHealthCode
 from saliencegate.capture.identities import CaptureDigestContext
-from saliencegate.capture.schema import MAX_CAPTURE_NATIVE_BYTES, CaptureIntake
-from saliencegate.capture.spool import CaptureSpoolUnavailableError
-from saliencegate.capture.store import CaptureStoreBusyError, CaptureStoreStateError
+from saliencegate.capture.locations import resolve_capture_store_locations
+from saliencegate.capture.migrations import initialize_capture_store
+from saliencegate.capture.schema import (
+    MAX_CAPTURE_NATIVE_BYTES,
+    CaptureIntake,
+    canonical_capture_intake,
+)
+from saliencegate.capture.spool import CaptureSpool, CaptureSpoolUnavailableError
+from saliencegate.capture.store import (
+    CaptureConnectionState,
+    CaptureSessionState,
+    CaptureStore,
+    CaptureStoreBusyError,
+    CaptureStoreMode,
+    CaptureStoreStateError,
+)
+from saliencegate.capture.transport import CaptureTransportChunk
 from saliencegate.integrations.hook import (
     CaptureHookArguments,
     CaptureHookDependencies,
     CaptureHookError,
+    _bounded_transport_fallback,
+    _transport_gap_intake,
     parse_capture_hook_arguments,
     read_capture_hook_document,
     run_capture_hook,
@@ -139,6 +158,24 @@ class _Spool:
             return append(intake)
         except CaptureStoreBusyError:
             return self.enqueue(intake)
+
+    def admit_transport(
+        self,
+        store: object,
+        chunk: object,
+        intakes: tuple[CaptureIntake, ...],
+        fallback: tuple[CaptureIntake, ...],
+    ) -> tuple[object, ...]:
+        self.calls.append("admit_transport")
+        if self.failure is not None:
+            raise self.failure
+        append = getattr(store, "append_transport_chunk", None)
+        assert callable(append)
+        try:
+            append(chunk, intakes)
+            return ()
+        except CaptureStoreBusyError:
+            return tuple(self.enqueue(intake) for intake in fallback)
 
 
 registry_evidence = object()
@@ -370,6 +407,684 @@ def test_configured_admission_uses_the_spool_ordering_fence_and_falls_back_on_bu
         "enqueue",
         "close_store",
     ]
+
+
+def test_bridge_busy_fallback_discards_middle_evidence_under_one_gap_marker() -> None:
+    start = authenticated_intake("session_started", producer_index=1)
+    middle = tuple(
+        authenticated_intake("turn_finished", producer_index=index) for index in range(2, 1_000)
+    )
+    finish = authenticated_intake("session_finished", producer_index=1_000)
+    gap = authenticated_intake(
+        "controller_failed",
+        producer_index=1_001,
+        changes={
+            "capture_disposition": "degraded",
+            "error_code": "gap_detected",
+            "failure_signature": None,
+        },
+    )
+
+    fallback = _bounded_transport_fallback((start, *middle, finish), gap)
+
+    assert fallback == (start, gap, finish)
+    assert not any(intake in fallback for intake in middle)
+
+
+def test_bridge_busy_gap_is_session_stable_across_failed_chunks() -> None:
+    profile = CaptureProfile.OPENCODE_PLUGIN_V1
+    start = authenticated_intake(
+        "session_started",
+        context=capture_context_object,
+        changes={
+            "adapter_profile": profile.value,
+            "capability_manifest_digest": capture_capability_digest(capture_profile(profile)),
+            "producer_sequence": None,
+            "sequence_authority": "unavailable",
+        },
+    )
+    first = CaptureTransportChunk(
+        connection_id=CONNECTION_ID,
+        session_id=start.session_id,
+        batch_ref=capture_context_object.transport_batch_ref(b"first-batch"),
+        chunk_index=0,
+        chunk_count=2,
+        chunk_digest=capture_context_object.transport_chunk_digest(b"first-chunk"),
+    )
+    second = CaptureTransportChunk(
+        connection_id=CONNECTION_ID,
+        session_id=start.session_id,
+        batch_ref=capture_context_object.transport_batch_ref(b"second-batch"),
+        chunk_index=1,
+        chunk_count=2,
+        chunk_digest=capture_context_object.transport_chunk_digest(b"second-chunk"),
+    )
+
+    first_gap = _transport_gap_intake((start,), first, context=capture_context_object)
+    second_gap = _transport_gap_intake((start,), second, context=capture_context_object)
+
+    assert canonical_capture_intake(first_gap) == canonical_capture_intake(second_gap)
+
+
+def test_bridge_busy_hook_force_enqueues_controls_without_retrying_generic_append() -> None:
+    calls: list[str] = []
+    profile = CaptureProfile.OPENCODE_PLUGIN_V1
+    manifest = capture_profile(profile)
+    capability_digest = capture_capability_digest(manifest)
+    context = capture_context_object
+    start = authenticated_intake(
+        "session_started",
+        context=context,
+        changes={
+            "adapter_profile": profile.value,
+            "capability_manifest_digest": capability_digest,
+            "producer_sequence": None,
+            "sequence_authority": "unavailable",
+        },
+    )
+    descriptor = CaptureTransportChunk(
+        connection_id=CONNECTION_ID,
+        session_id=start.session_id,
+        batch_ref=context.transport_batch_ref(b"synthetic-busy-batch"),
+        chunk_index=0,
+        chunk_count=1,
+        chunk_digest=context.transport_chunk_digest(b"{}"),
+    )
+
+    class BridgeAdapter:
+        def capabilities(self) -> CaptureAdapterCapabilities:
+            return CaptureAdapterCapabilities(
+                protocol_version=CAPTURE_ADAPTER_PROTOCOL_VERSION,
+                profile_id=profile,
+                capability_digest=capability_digest,
+                host_version=manifest.host_version,
+            )
+
+        def adapt_bytes(self, source: bytes, *, context: object) -> tuple[CaptureIntake, ...]:
+            assert source == b"{}"
+            assert context is capture_context_object
+            return (start,)
+
+        def transport_chunk(self, source: bytes, *, context: object) -> CaptureTransportChunk:
+            assert source == b"{}"
+            assert context is capture_context_object
+            return descriptor
+
+    class BridgeStore(_Store):
+        def append(self, intake: CaptureIntake) -> object:
+            del intake
+            calls.append("unexpected_generic_append")
+            raise AssertionError
+
+        def append_transport_chunk(self, chunk: object, intakes: object) -> object:
+            assert chunk == descriptor
+            assert intakes == (start,)
+            calls.append("append_transport")
+            raise CaptureStoreBusyError()
+
+    registry = object()
+    receipt = object()
+    connection = object()
+    spool = _Spool(calls)
+    dependencies = CaptureHookDependencies(
+        validate_registry=lambda selected: registry if selected is profile else None,
+        validate_receipt=lambda selected, identity, evidence: (
+            receipt
+            if (selected, identity, evidence) == (profile, CONNECTION_ID, registry)
+            else None
+        ),
+        validate_connection=lambda selected, identity, registry_value, receipt_value: (
+            connection
+            if (selected, identity, registry_value, receipt_value)
+            == (profile, CONNECTION_ID, registry, receipt)
+            else None
+        ),
+        load_context=lambda selected: context if selected is connection else None,
+        resolve_adapter=lambda selected: BridgeAdapter() if selected is connection else None,
+        open_store=lambda selected: BridgeStore(calls) if selected is connection else None,
+        open_spool=lambda selected: spool if selected is connection else None,
+        mark_health=lambda selected, code: calls.append(f"health:{code.value}"),
+    )
+
+    assert (
+        run_capture_hook(
+            ("--profile", profile.value, "--connection", CONNECTION_ID),
+            BytesIO(b"{}"),
+            dependencies=dependencies,
+        )
+        == 0
+    )
+    assert "append_transport" in calls
+    assert "admit_transport" in calls
+    assert "unexpected_generic_append" not in calls
+    assert calls.count("enqueue") == 2
+    assert "admit" not in calls
+
+
+def test_saturated_bridge_fallback_persists_gap_before_close_through_real_fence(
+    tmp_path: Path,
+) -> None:
+    locations = resolve_capture_store_locations(
+        environ={"XDG_STATE_HOME": str(tmp_path / "state")},
+        home=tmp_path / "home",
+        platform="posix",
+    )
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    initialize_capture_store(locations.database_path)
+    bridge_profile = CaptureProfile.OPENCODE_PLUGIN_V1
+    bridge_digest = capture_capability_digest(capture_profile(bridge_profile))
+    bridge_changes = {
+        "adapter_profile": bridge_profile.value,
+        "capability_manifest_digest": bridge_digest,
+        "producer_sequence": None,
+        "sequence_authority": "unavailable",
+    }
+    start = authenticated_intake(
+        "session_started",
+        producer_index=1,
+        changes=bridge_changes,
+    )
+    middle = tuple(
+        authenticated_intake(
+            "turn_finished",
+            producer_index=index,
+            changes=bridge_changes,
+        )
+        for index in range(2, 1_000)
+    )
+    finish = authenticated_intake(
+        "session_finished",
+        producer_index=1_000,
+        changes=bridge_changes,
+    )
+    gap = authenticated_intake(
+        "controller_failed",
+        producer_index=1_001,
+        changes={
+            **bridge_changes,
+            "capture_disposition": "degraded",
+            "error_code": "gap_detected",
+            "failure_signature": None,
+        },
+    )
+    fallback = _bounded_transport_fallback((start, *middle, finish), gap)
+
+    with CaptureStore.open(
+        locations.database_path,
+        installation_key=INSTALLATION_KEY,
+        mode=CaptureStoreMode.MAINTENANCE,
+    ) as store:
+        registered = store.register_connection(
+            connection_id=CONNECTION_ID,
+            project_digest="8" * 64,
+            profile_id=bridge_profile,
+            capability_manifest_digest=bridge_digest,
+            host_version="1.18.3",
+        )
+        store.transition_connection(
+            CONNECTION_ID,
+            expected_state=registered.state,
+            target_state=CaptureConnectionState.ENABLED,
+        )
+        for intake in fallback:
+            spool.enqueue(intake)
+        drained = spool.drain(store)
+        snapshot = store.snapshot_session(CONNECTION_ID, start.session_id)
+
+    assert drained.admitted_events == 3
+    assert drained.remaining_events == 0
+    assert snapshot.event_count == 3
+    assert snapshot.state is CaptureSessionState.CLOSED
+    assert snapshot.coverage_degraded is True
+    assert tuple(item.event.intake.kind for item in snapshot.events[-2:]) == (
+        "controller_failed",
+        "session_finished",
+    )
+
+
+def test_bridge_transport_fence_never_overtakes_an_earlier_busy_fallback(
+    tmp_path: Path,
+) -> None:
+    locations = resolve_capture_store_locations(
+        environ={"XDG_STATE_HOME": str(tmp_path / "state")},
+        home=tmp_path / "home",
+        platform="posix",
+    )
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    initialize_capture_store(locations.database_path)
+    profile = CaptureProfile.OPENCODE_PLUGIN_V1
+    capability_digest = capture_capability_digest(capture_profile(profile))
+    changes = {
+        "adapter_profile": profile.value,
+        "capability_manifest_digest": capability_digest,
+        "producer_sequence": None,
+        "sequence_authority": "unavailable",
+    }
+    start = authenticated_intake(
+        "session_started",
+        producer_index=1,
+        changes=changes,
+    )
+    finish = authenticated_intake(
+        "session_finished",
+        producer_index=2,
+        changes=changes,
+    )
+    first = CaptureTransportChunk(
+        connection_id=CONNECTION_ID,
+        session_id=start.session_id,
+        batch_ref=capture_context_object.transport_batch_ref(b"earlier-busy-batch"),
+        chunk_index=0,
+        chunk_count=1,
+        chunk_digest=capture_context_object.transport_chunk_digest(b"earlier-busy-chunk"),
+    )
+    later = CaptureTransportChunk(
+        connection_id=CONNECTION_ID,
+        session_id=start.session_id,
+        batch_ref=capture_context_object.transport_batch_ref(b"later-terminal-batch"),
+        chunk_index=0,
+        chunk_count=1,
+        chunk_digest=capture_context_object.transport_chunk_digest(b"later-terminal-chunk"),
+    )
+    first_gap = _transport_gap_intake((start,), first, context=capture_context_object)
+    later_gap = _transport_gap_intake((start, finish), later, context=capture_context_object)
+    for intake in _bounded_transport_fallback((start,), first_gap):
+        spool.enqueue(intake)
+
+    with CaptureStore.open(
+        locations.database_path,
+        installation_key=INSTALLATION_KEY,
+        mode=CaptureStoreMode.MAINTENANCE,
+    ) as store:
+        registered = store.register_connection(
+            connection_id=CONNECTION_ID,
+            project_digest="8" * 64,
+            profile_id=profile,
+            capability_manifest_digest=capability_digest,
+            host_version="1.18.3",
+        )
+        store.transition_connection(
+            CONNECTION_ID,
+            expected_state=registered.state,
+            target_state=CaptureConnectionState.ENABLED,
+        )
+        queued = spool.admit_transport(
+            store,
+            later,
+            (start, finish),
+            _bounded_transport_fallback((start, finish), later_gap),
+        )
+        drained = spool.drain(store)
+        snapshot = store.snapshot_session(CONNECTION_ID, start.session_id)
+
+    assert len(queued) == 3
+    assert drained.remaining_events == 0
+    assert snapshot.state is CaptureSessionState.CLOSED
+    assert snapshot.event_count == 3
+    assert snapshot.transport_receipt_count == 0
+    assert snapshot.coverage_degraded is True
+    assert tuple(item.event.intake.kind for item in snapshot.events) == (
+        "session_started",
+        "controller_failed",
+        "session_finished",
+    )
+
+
+def test_closed_bridge_session_consumes_a_later_busy_fallback_as_gap_health(
+    tmp_path: Path,
+) -> None:
+    locations = resolve_capture_store_locations(
+        environ={"XDG_STATE_HOME": str(tmp_path / "state")},
+        home=tmp_path / "home",
+        platform="posix",
+    )
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    initialize_capture_store(locations.database_path)
+    profile = CaptureProfile.OPENCODE_PLUGIN_V1
+    capability_digest = capture_capability_digest(capture_profile(profile))
+    changes = {
+        "adapter_profile": profile.value,
+        "capability_manifest_digest": capability_digest,
+        "producer_sequence": None,
+        "sequence_authority": "unavailable",
+    }
+    start = authenticated_intake("session_started", producer_index=1, changes=changes)
+    finish = authenticated_intake("session_finished", producer_index=2, changes=changes)
+    closed_chunk = CaptureTransportChunk(
+        connection_id=CONNECTION_ID,
+        session_id=start.session_id,
+        batch_ref=capture_context_object.transport_batch_ref(b"closed-session-batch"),
+        chunk_index=0,
+        chunk_count=1,
+        chunk_digest=capture_context_object.transport_chunk_digest(b"closed-session-chunk"),
+    )
+    retried_chunk = CaptureTransportChunk(
+        connection_id=CONNECTION_ID,
+        session_id=start.session_id,
+        batch_ref=capture_context_object.transport_batch_ref(b"closed-session-retry-batch"),
+        chunk_index=0,
+        chunk_count=1,
+        chunk_digest=capture_context_object.transport_chunk_digest(b"closed-session-retry-chunk"),
+    )
+    gap = _transport_gap_intake((start,), retried_chunk, context=capture_context_object)
+
+    with CaptureStore.open(
+        locations.database_path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=100,
+        mode=CaptureStoreMode.MAINTENANCE,
+    ) as store:
+        registered = store.register_connection(
+            connection_id=CONNECTION_ID,
+            project_digest="8" * 64,
+            profile_id=profile,
+            capability_manifest_digest=capability_digest,
+            host_version="1.18.3",
+        )
+        store.transition_connection(
+            CONNECTION_ID,
+            expected_state=registered.state,
+            target_state=CaptureConnectionState.ENABLED,
+        )
+        store.append_transport_chunk(closed_chunk, (start, finish))
+
+        blocker = sqlite3.connect(locations.database_path, isolation_level=None, timeout=0.1)
+        blocker.execute("BEGIN IMMEDIATE")
+        try:
+            queued = spool.admit_transport(
+                store,
+                retried_chunk,
+                (start,),
+                _bounded_transport_fallback((start,), gap),
+            )
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+        drained = spool.drain(store)
+        snapshot = store.snapshot_session(CONNECTION_ID, start.session_id)
+
+    assert len(queued) == 2
+    assert drained.remaining_events == 0
+    assert spool.health().queued_events == 0
+    assert snapshot.state is CaptureSessionState.QUARANTINED
+    assert snapshot.event_count == 2
+    assert snapshot.transport_receipt_count == 1
+    assert snapshot.coverage_degraded is True
+    assert {item.code for item in snapshot.health} == {CaptureHealthCode.GAP_DETECTED}
+
+
+def test_bridge_fallback_short_circuits_a_large_valid_spool_backlog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locations = resolve_capture_store_locations(
+        environ={"XDG_STATE_HOME": str(tmp_path / "state")},
+        home=tmp_path / "home",
+        platform="posix",
+    )
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    profile = CaptureProfile.OPENCODE_PLUGIN_V1
+    capability_digest = capture_capability_digest(capture_profile(profile))
+    changes = {
+        "adapter_profile": profile.value,
+        "capability_manifest_digest": capability_digest,
+        "producer_sequence": None,
+        "sequence_authority": "unavailable",
+    }
+    for index in range(1, 34):
+        spool.enqueue(
+            authenticated_intake(
+                "turn_finished",
+                producer_index=index,
+                changes=changes,
+            )
+        )
+    start = authenticated_intake("session_started", producer_index=100, changes=changes)
+    descriptor = CaptureTransportChunk(
+        connection_id=CONNECTION_ID,
+        session_id=start.session_id,
+        batch_ref=capture_context_object.transport_batch_ref(b"large-spool-batch"),
+        chunk_index=0,
+        chunk_count=1,
+        chunk_digest=capture_context_object.transport_chunk_digest(b"large-spool-chunk"),
+    )
+    gap = _transport_gap_intake((start,), descriptor, context=capture_context_object)
+
+    class NeverTransportStore:
+        def append_transport_chunk(self, chunk: object, intakes: object) -> object:
+            del chunk, intakes
+            raise CaptureStoreBusyError()
+
+    def reject_sorted_path_inventory(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("bridge fast-drop built the sorted spool path inventory")
+
+    started = time.monotonic()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(CaptureSpool, "_spool_child_paths", reject_sorted_path_inventory)
+        receipts = spool.admit_transport(
+            NeverTransportStore(),
+            descriptor,
+            (start,),
+            _bounded_transport_fallback((start,), gap),
+        )
+    elapsed = time.monotonic() - started
+    health = spool.health()
+
+    assert elapsed < 0.5
+    assert tuple(receipt.disposition for receipt in receipts) == (
+        "dropped_quota",
+        "dropped_quota",
+    )
+    assert health.queued_events == 33
+    assert health.dropped_events == 2
+    assert health.coverage_degraded is True
+
+    with spool._locked() as directory_fd:
+        bridge_barrier_marker = spool._drop_state(directory_fd)[3]
+        assert bridge_barrier_marker is not None
+        barrier_path = locations.spool_directory / (f"{bridge_barrier_marker}.capture-session")
+        decoded_barrier = spool._decode_session_marker(barrier_path, directory_fd)
+        assert decoded_barrier is not None
+        spool._set_session_marker_state_locked(
+            decoded_barrier[0],
+            "pending",
+            directory_fd,
+        )
+    assert spool.health().dropped_events == 2
+
+    repeated_started = time.monotonic()
+    other_start: CaptureIntake | None = None
+    other_descriptor: CaptureTransportChunk | None = None
+    other_gap: CaptureIntake | None = None
+    for index in range(10):
+        session_native = f"fast-drop-session-{index}".encode()
+        other_start = authenticated_intake(
+            "session_started",
+            session_native=session_native,
+            producer_index=200 + index,
+            changes=changes,
+        )
+        other_descriptor = CaptureTransportChunk(
+            connection_id=CONNECTION_ID,
+            session_id=other_start.session_id,
+            batch_ref=capture_context_object.transport_batch_ref(
+                f"fast-drop-batch-{index}".encode()
+            ),
+            chunk_index=0,
+            chunk_count=1,
+            chunk_digest=capture_context_object.transport_chunk_digest(
+                f"fast-drop-chunk-{index}".encode()
+            ),
+        )
+        other_gap = _transport_gap_intake(
+            (other_start,),
+            other_descriptor,
+            context=capture_context_object,
+        )
+        repeated = spool.admit_transport(
+            NeverTransportStore(),
+            other_descriptor,
+            (other_start,),
+            _bounded_transport_fallback((other_start,), other_gap),
+        )
+        assert all(receipt.disposition == "dropped_quota" for receipt in repeated)
+
+    class RecordingHealthyStore:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def append_transport_chunk(self, chunk: object, intakes: object) -> object:
+            del chunk, intakes
+            self.calls += 1
+            return object()
+
+    assert other_start is not None
+    assert other_descriptor is not None
+    assert other_gap is not None
+    healthy_store = RecordingHealthyStore()
+    barrier_receipts = spool.admit_transport(
+        healthy_store,
+        other_descriptor,
+        (other_start,),
+        _bounded_transport_fallback((other_start,), other_gap),
+    )
+    repeated_elapsed = time.monotonic() - repeated_started
+    repeated_health = spool.health()
+    marker_count = len(tuple(locations.spool_directory.glob("*.capture-session")))
+
+    assert repeated_elapsed < 0.5
+    assert healthy_store.calls == 0
+    assert all(receipt.disposition == "dropped_quota" for receipt in barrier_receipts)
+    assert repeated_health.dropped_events == 24
+    assert marker_count == 1
+    with spool._locked() as directory_fd:
+        decoded_barrier = spool._decode_session_marker(barrier_path, directory_fd)
+        assert decoded_barrier is not None
+        assert decoded_barrier[1] == "acknowledged"
+
+    drained = spool.drain(_Store([]))
+    assert drained.remaining_events == 0
+    assert spool.health().queued_events == 0
+    assert len(tuple(locations.spool_directory.glob("*.capture-session"))) == 1
+
+    assert spool.enqueue(other_start).disposition == "queued"
+    assert spool.drain(_Store([])).remaining_events == 0
+    assert spool.health().queued_events == 0
+    assert len(tuple(locations.spool_directory.glob("*.capture-session"))) == 1
+
+    still_fenced = spool.admit_transport(
+        healthy_store,
+        other_descriptor,
+        (other_start,),
+        _bounded_transport_fallback((other_start,), other_gap),
+    )
+    assert healthy_store.calls == 0
+    assert all(receipt.disposition == "dropped_quota" for receipt in still_fenced)
+    assert spool.health().dropped_events == 26
+
+    with spool.maintenance() as maintenance:
+        assert maintenance.clear_drop_health_if_empty() is True
+    assert spool.health().coverage_degraded is False
+    assert tuple(locations.spool_directory.glob("*.capture-session")) == ()
+
+    admitted = spool.admit_transport(
+        healthy_store,
+        other_descriptor,
+        (other_start,),
+        _bounded_transport_fallback((other_start,), other_gap),
+    )
+    assert admitted == ()
+    assert healthy_store.calls == 1
+
+
+def test_bridge_quota_drop_survives_drain_as_a_transport_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(spool_module, "MAX_CAPTURE_SPOOL_EVENTS", 1)
+    locations = resolve_capture_store_locations(
+        environ={"XDG_STATE_HOME": str(tmp_path / "state")},
+        home=tmp_path / "home",
+        platform="posix",
+    )
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    profile = CaptureProfile.OPENCODE_PLUGIN_V1
+    changes = {
+        "adapter_profile": profile.value,
+        "capability_manifest_digest": capture_capability_digest(capture_profile(profile)),
+        "producer_sequence": None,
+        "sequence_authority": "unavailable",
+    }
+    unrelated = authenticated_intake(
+        "session_started",
+        session_native=b"bridge-quota-unrelated",
+        changes=changes,
+    )
+    start = authenticated_intake(
+        "session_started",
+        session_native=b"bridge-quota-target",
+        changes=changes,
+    )
+    descriptor = CaptureTransportChunk(
+        connection_id=CONNECTION_ID,
+        session_id=start.session_id,
+        batch_ref=capture_context_object.transport_batch_ref(b"bridge-quota-batch"),
+        chunk_index=0,
+        chunk_count=1,
+        chunk_digest=capture_context_object.transport_chunk_digest(b"bridge-quota-chunk"),
+    )
+    gap = _transport_gap_intake((start,), descriptor, context=capture_context_object)
+    assert spool.enqueue(unrelated).disposition == "queued"
+
+    class BusyStore:
+        def append_transport_chunk(self, chunk: object, intakes: object) -> object:
+            del chunk, intakes
+            raise CaptureStoreBusyError()
+
+    dropped = spool.admit_transport(
+        BusyStore(),
+        descriptor,
+        (start,),
+        _bounded_transport_fallback((start,), gap),
+    )
+    assert all(receipt.disposition == "dropped_quota" for receipt in dropped)
+    with spool._locked() as directory_fd:
+        assert spool._drop_state(directory_fd)[3] is not None
+
+    assert spool.drain(_Store([])).remaining_events == 0
+
+    class HealthyStore:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def append_transport_chunk(self, chunk: object, intakes: object) -> object:
+            del chunk, intakes
+            self.calls += 1
+            return object()
+
+    healthy = HealthyStore()
+    still_fenced = spool.admit_transport(
+        healthy,
+        descriptor,
+        (start,),
+        _bounded_transport_fallback((start,), gap),
+    )
+    assert healthy.calls == 0
+    assert all(receipt.disposition == "dropped_quota" for receipt in still_fenced)
+
+    with spool.maintenance() as maintenance:
+        assert maintenance.clear_drop_health_if_empty() is True
+    assert (
+        spool.admit_transport(
+            healthy,
+            descriptor,
+            (start,),
+            _bounded_transport_fallback((start,), gap),
+        )
+        == ()
+    )
+    assert healthy.calls == 1
 
 
 def test_spool_open_failure_marks_unavailable_without_direct_store_append() -> None:
@@ -865,6 +1580,7 @@ def test_packaged_hook_import_does_not_load_network_or_model_runtime() -> None:
         command,
         capture_output=True,
         check=False,
+        env={key: value for key, value in os.environ.items() if not key.startswith("COV_CORE_")},
         timeout=5,
     )
 

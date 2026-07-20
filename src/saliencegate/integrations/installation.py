@@ -37,6 +37,7 @@ from saliencegate.integrations.bootstrap import (
 )
 from saliencegate.integrations.config_files import (
     ConfigFileError,
+    OwnedConfigPlan,
     OwnedConfigReverseEdit,
     _owned_config_edit_matches_spec,
     delete_config_bytes,
@@ -166,7 +167,7 @@ class InstallationReceipt(_InstallationModel):
     capability_digest: Annotated[str, StringConstraints(pattern=_SHA256.pattern)] = Field(
         repr=False
     )
-    config_path: Path = Field(repr=False)
+    config_path: Path | None = Field(default=None, repr=False)
     bundle_path: Path | None = Field(default=None, repr=False)
     bootstrap_path: Path | None = Field(default=None, repr=False)
     launcher_path: Path = Field(repr=False)
@@ -178,7 +179,7 @@ class InstallationReceipt(_InstallationModel):
         repr=False,
     )
     launcher_digest: Annotated[str, StringConstraints(pattern=_SHA256.pattern)] = Field(repr=False)
-    config_edit: OwnedConfigReverseEdit = Field(repr=False)
+    config_edit: OwnedConfigReverseEdit | None = Field(default=None, repr=False)
     receipt_mac: Annotated[str, StringConstraints(pattern=_SHA256.pattern)] = Field(repr=False)
 
     @property
@@ -189,7 +190,6 @@ class InstallationReceipt(_InstallationModel):
         return ProviderInstallationKind.BRIDGE
 
     @field_validator(
-        "config_path",
         "launcher_path",
         "receipt_path",
         "journal_path",
@@ -199,31 +199,42 @@ class InstallationReceipt(_InstallationModel):
     def paths_are_absolute(cls, value: Path) -> Path:
         return _absolute_path(value)
 
-    @field_validator("bundle_path", "bootstrap_path")
+    @field_validator("config_path", "bundle_path", "bootstrap_path")
     @classmethod
     def optional_paths_are_absolute(cls, value: Path | None) -> Path | None:
         return None if value is None else _absolute_path(value)
 
     @model_validator(mode="after")
     def paths_and_digests_are_unambiguous(self) -> Self:
+        has_config = self.config_path is not None
+        if has_config != (self.config_edit is not None):
+            raise ValueError("installation receipt configuration binding is incomplete")
         bridge_values = (self.bundle_path, self.bootstrap_path, self.bundle_digest)
         if self.installation_kind is ProviderInstallationKind.BRIDGE:
             if any(value is None for value in bridge_values):
                 raise ValueError("installation receipt bridge binding is incomplete")
-        elif any(value is not None for value in bridge_values):
-            raise ValueError("command-hook receipt declares bridge assets")
+        else:
+            if any(value is not None for value in bridge_values):
+                raise ValueError("command-hook receipt declares bridge assets")
+            if not has_config:
+                raise ValueError("command-hook receipt requires configuration")
         paths = {
-            self.config_path,
             self.launcher_path,
             self.receipt_path,
             self.journal_path,
             self.lock_path,
         }
+        if self.config_path is not None:
+            paths.add(self.config_path)
         if self.bundle_path is not None:
             paths.add(self.bundle_path)
         if self.bootstrap_path is not None:
             paths.add(self.bootstrap_path)
-        expected_path_count = 7 if self.installation_kind is ProviderInstallationKind.BRIDGE else 5
+        expected_path_count = (
+            4
+            + (1 if self.config_path is not None else 0)
+            + (2 if self.installation_kind is ProviderInstallationKind.BRIDGE else 0)
+        )
         if len(paths) != expected_path_count or not (
             self.receipt_path.parent == self.journal_path.parent == self.lock_path.parent
         ):
@@ -648,6 +659,32 @@ def _load_receipt_optional(
         return None
     data = _read_private_optional(spec.receipt_path, maximum=MAX_INSTALLATION_RECEIPT_BYTES)
     return None if data is None else _decode_receipt(data, key)
+
+
+def inspect_installation_receipt(
+    path: Path,
+    installation_key: InstallationKey,
+) -> InstallationReceipt:
+    """Read one exact authenticated receipt without searching provider state."""
+
+    try:
+        checked_path = _absolute_path(path)
+        if type(installation_key) is not InstallationKey:
+            raise InstallationError()
+        data = _read_private_optional(
+            checked_path,
+            maximum=MAX_INSTALLATION_RECEIPT_BYTES,
+        )
+        if data is None:
+            raise InstallationError()
+        receipt = _decode_receipt(data, installation_key)
+        if receipt.receipt_path != checked_path:
+            raise InstallationError()
+        return receipt
+    except InstallationError:
+        raise
+    except Exception:
+        raise InstallationError() from None
 
 
 def _load_journal_optional(
@@ -1260,7 +1297,7 @@ def _make_receipt(
     *,
     state: InstallationState,
     launcher_digest: str,
-    config_edit: OwnedConfigReverseEdit,
+    config_edit: OwnedConfigReverseEdit | None,
 ) -> InstallationReceipt:
     return _seal_receipt(
         InstallationReceipt(
@@ -1414,10 +1451,12 @@ def _status(
 
 
 def _config_edit_matches_spec(
-    edit: OwnedConfigReverseEdit,
+    edit: OwnedConfigReverseEdit | None,
     spec: ProviderInstallationSpec,
 ) -> bool:
-    return _owned_config_edit_matches_spec(edit, spec.config)
+    if edit is None or spec.config is None:
+        return edit is None and spec.config is None and spec.config_path is None
+    return spec.config_path is not None and _owned_config_edit_matches_spec(edit, spec.config)
 
 
 def inspect_provider_installation(
@@ -1470,12 +1509,16 @@ def inspect_provider_installation(
             journal is not None and observed_lock_digest is None
         ):
             orphan_drift.append("lock")
-        try:
-            orphan_config = _current_config_for_plan(checked)
-            if orphan_config is not None and checked.config.marker.encode("ascii") in orphan_config:
+        if checked.config is not None:
+            try:
+                orphan_config = _current_config_for_plan(checked)
+                if (
+                    orphan_config is not None
+                    and checked.config.marker.encode("ascii") in orphan_config
+                ):
+                    orphan_drift.append("config")
+            except (ConfigFileError, InstallationError):
                 orphan_drift.append("config")
-        except (ConfigFileError, InstallationError):
-            orphan_drift.append("config")
         checked_bridge = _spec_bridge_assets(checked)
         if checked_bridge is not None:
             bundle_path, bootstrap_path, _bundle_bytes, _bundle_digest = checked_bridge
@@ -1506,17 +1549,22 @@ def inspect_provider_installation(
         drift.append("lock")
     if not _receipt_matches_spec(receipt, checked, key):
         drift.append("receipt")
-    current_config: bytes | None
-    try:
-        current_config = read_config_bytes(receipt.config_path)
-    except ConfigFileError:
-        current_config = None
-        drift.append("config")
-    marker = receipt.config_edit.marker.encode("ascii")
+    config_path = receipt.config_path
+    config_edit = receipt.config_edit
+    if (config_path is None) != (config_edit is None):
+        raise InstallationError()
+    current_config: bytes | None = None
+    marker: bytes | None = None
+    if config_path is not None and config_edit is not None:
+        try:
+            current_config = read_config_bytes(config_path)
+        except ConfigFileError:
+            drift.append("config")
+        marker = config_edit.marker.encode("ascii")
     checked_bridge = _spec_bridge_assets(checked)
     receipt_bridge = _receipt_bridge_assets(receipt)
     if receipt.state is InstallationState.DISABLED:
-        if current_config is not None and marker in current_config:
+        if current_config is not None and marker is not None and marker in current_config:
             drift.append("config")
         if checked_bridge is not None and receipt_bridge is not None:
             bundle_path, bootstrap_path, bundle_bytes, _bundle_digest = checked_bridge
@@ -1551,9 +1599,9 @@ def inspect_provider_installation(
                     drift.append("bootstrap")
             except Exception:
                 drift.append("bootstrap")
-        if (
+        if config_edit is not None and (
             current_config is None
-            or hashlib.sha256(current_config).hexdigest() != receipt.config_edit.installed_digest
+            or hashlib.sha256(current_config).hexdigest() != config_edit.installed_digest
         ):
             drift.append("config")
         try:
@@ -1572,6 +1620,10 @@ def inspect_provider_installation(
 
 
 def _current_config_for_plan(spec: ProviderInstallationSpec) -> bytes | None:
+    if spec.config_path is None:
+        if spec.config is not None:
+            raise InstallationError()
+        return None
     try:
         parent = spec.config_path.parent.lstat()
     except FileNotFoundError:
@@ -1822,7 +1874,12 @@ def _install_locked(
     launcher_digest = spec.launcher_digest
     current_launcher_digest = _launcher_digest_optional(spec.launcher_path)
     upgrade = False
-    config_write = True
+    has_config = spec.config_path is not None
+    if has_config != (spec.config is not None):
+        raise InstallationError()
+    config_write = has_config
+    config_edit: OwnedConfigReverseEdit | None = None
+    config_plan: OwnedConfigPlan | None = None
     if prior is not None:
         if not _receipt_matches_spec(prior, spec, key, generation=False):
             raise InstallationError()
@@ -1869,12 +1926,16 @@ def _install_locked(
                         encode_integration_bootstrap(_bootstrap_for(prior))
                     ).hexdigest()
                 )
-            if (
-                current is None
-                or hashlib.sha256(current).hexdigest() != prior.config_edit.installed_digest
-                or not _config_edit_matches_spec(prior.config_edit, spec)
-                or bridge_invalid
-            ):
+            config_invalid = not _config_edit_matches_spec(prior.config_edit, spec)
+            if prior.config_edit is not None:
+                config_invalid = (
+                    config_invalid
+                    or current is None
+                    or (hashlib.sha256(current).hexdigest() != prior.config_edit.installed_digest)
+                )
+            elif spec.config is not None:
+                config_invalid = True
+            if config_invalid or bridge_invalid:
                 raise InstallationError()
             upgrade = True
             config_write = False
@@ -1882,18 +1943,16 @@ def _install_locked(
         elif prior.state is InstallationState.DISABLED:
             if current_launcher_digest is not None:
                 raise InstallationError()
-            plan = plan_owned_config_install(current, spec.config)
-            config_edit = plan.reverse_edit
         else:
             raise InstallationError()
     else:
         if current_launcher_digest is not None:
             raise InstallationError()
-        plan = plan_owned_config_install(current, spec.config)
-        config_edit = plan.reverse_edit
     if config_write:
-        plan = plan_owned_config_install(current, spec.config)
-        config_edit = plan.reverse_edit
+        if spec.config is None:
+            raise InstallationError()
+        config_plan = plan_owned_config_install(current, spec.config)
+        config_edit = config_plan.reverse_edit
     target_bundle_digest: str | None = None
     target_bootstrap_digest: str | None = None
     if spec_bridge is not None:
@@ -1954,8 +2013,14 @@ def _install_locked(
         boundary.revalidate()
         _fault(fault_injector, "after_bootstrap_publish")
     if config_write:
+        if spec.config_path is None or config_plan is None:
+            raise InstallationError()
         boundary.revalidate()
-        publish_config_bytes(spec.config_path, expected=current, data=plan.installed_bytes)
+        publish_config_bytes(
+            spec.config_path,
+            expected=current,
+            data=config_plan.installed_bytes,
+        )
         boundary.revalidate()
     _fault(fault_injector, "after_config_publish")
     boundary.revalidate()
@@ -2016,7 +2081,9 @@ def install_provider(
             generation=False,
         ):
             raise InstallationError()
-        if prior is None or prior.state is InstallationState.DISABLED:
+        if (
+            prior is None or prior.state is InstallationState.DISABLED
+        ) and checked.config is not None:
             plan_owned_config_install(current, checked.config)
         if dry_run:
             return _status(
@@ -2026,8 +2093,7 @@ def install_provider(
                 state=InstallationState.PENDING,
                 would_write=(
                     checked.launcher_path,
-                    checked.config_path,
-                    *checked.project_local_paths[1:],
+                    *checked.project_local_paths,
                     checked.receipt_path,
                     checked.journal_path,
                 ),
@@ -2156,15 +2222,20 @@ def _recover_install(
             boundary.revalidate()
         elif bootstrap_digest != hashlib.sha256(expected_bootstrap).hexdigest():
             raise InstallationError()
-    current = _current_config_for_plan(spec)
-    current_digest = None if current is None else hashlib.sha256(current).hexdigest()
-    if current_digest != target.config_edit.installed_digest:
-        plan = plan_owned_config_install(current, spec.config)
-        if plan.reverse_edit != target.config_edit:
+    if not _config_edit_matches_spec(target.config_edit, spec):
+        raise InstallationError()
+    if target.config_edit is not None:
+        if spec.config is None or spec.config_path is None:
             raise InstallationError()
-        boundary.revalidate()
-        publish_config_bytes(spec.config_path, expected=current, data=plan.installed_bytes)
-        boundary.revalidate()
+        current = _current_config_for_plan(spec)
+        current_digest = None if current is None else hashlib.sha256(current).hexdigest()
+        if current_digest != target.config_edit.installed_digest:
+            plan = plan_owned_config_install(current, spec.config)
+            if plan.reverse_edit != target.config_edit:
+                raise InstallationError()
+            boundary.revalidate()
+            publish_config_bytes(spec.config_path, expected=current, data=plan.installed_bytes)
+            boundary.revalidate()
     _fault(fault_injector, "recovery_before_enabled_receipt")
     boundary.revalidate()
     if not enabled_receipt:
@@ -2220,35 +2291,50 @@ def _journal_for_uninstall(
     )
 
 
-def _plan_config_removal(
-    receipt: InstallationReceipt,
-) -> tuple[bytes | None, bytes | None, bool]:
-    current = read_config_bytes(receipt.config_path)
+_ConfigRemovalPlan = tuple[bytes | None, bytes | None, bool]
+
+
+def _plan_config_removal(receipt: InstallationReceipt) -> _ConfigRemovalPlan | None:
+    config_path = receipt.config_path
+    config_edit = receipt.config_edit
+    if config_path is None or config_edit is None:
+        if config_path is None and config_edit is None:
+            return None
+        raise InstallationError()
+    current = read_config_bytes(config_path)
     if current is None:
-        if receipt.config_edit.target_existed:
+        if config_edit.target_existed:
             raise InstallationError()
         return None, None, False
-    marker = receipt.config_edit.marker.encode("ascii")
+    marker = config_edit.marker.encode("ascii")
     if marker not in current:
         if (
-            receipt.config_edit.target_existed
-            and hashlib.sha256(current).hexdigest() == receipt.config_edit.preimage_digest
+            config_edit.target_existed
+            and hashlib.sha256(current).hexdigest() == config_edit.preimage_digest
         ):
             return current, current, False
-        if not receipt.config_edit.target_existed:
+        if not config_edit.target_existed:
             return current, current, False
         raise InstallationError()
-    restored = remove_owned_config_edit(current, receipt.config_edit)
+    restored = remove_owned_config_edit(current, config_edit)
     return current, restored, True
 
 
 def _apply_config_removal(
     receipt: InstallationReceipt,
-    plan: tuple[bytes | None, bytes | None, bool],
+    plan: _ConfigRemovalPlan | None,
 ) -> None:
+    config_path = receipt.config_path
+    config_edit = receipt.config_edit
+    if plan is None:
+        if config_path is None and config_edit is None:
+            return
+        raise InstallationError()
+    if config_path is None or config_edit is None:
+        raise InstallationError()
     current, restored, needs_write = plan
     if not needs_write:
-        observed = read_config_bytes(receipt.config_path)
+        observed = read_config_bytes(config_path)
         if (current is None and observed is not None) or (
             current is not None and (observed is None or not hmac.compare_digest(observed, current))
         ):
@@ -2257,9 +2343,9 @@ def _apply_config_removal(
     if current is None:
         raise InstallationError()
     if restored is None:
-        delete_config_bytes(receipt.config_path, expected=current)
+        delete_config_bytes(config_path, expected=current)
     else:
-        publish_config_bytes(receipt.config_path, expected=current, data=restored)
+        publish_config_bytes(config_path, expected=current, data=restored)
 
 
 def _remove_config_for_receipt(receipt: InstallationReceipt) -> None:
@@ -2627,6 +2713,7 @@ __all__ = [
     "derive_installation_identity",
     "ensure_private_installation_directory",
     "git_tracked_project_files",
+    "inspect_installation_receipt",
     "inspect_provider_installation",
     "install_provider",
     "recover_provider_installation",

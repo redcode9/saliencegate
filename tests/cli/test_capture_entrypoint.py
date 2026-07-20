@@ -186,7 +186,7 @@ def test_capture_command_failures_use_stable_content_free_exits(
     project = tmp_path / "fixture-secret-project"
     project.mkdir()
 
-    unavailable = run_cli("connect", "opencode", "--project", str(project))
+    unavailable = run_cli("connect", "pi", "--project", str(project))
     invalid = run_cli("delete", "--all", "--project", str(project))
     missing_report = run_cli("report", "--latest", "--json")
 

@@ -809,6 +809,9 @@ def _validate_project_hook_policy(
 
     try:
         config_path = spec.config_path
+        config = spec.config
+        if config_path is None or config is None:
+            raise ClaudeCodeIntegrationError()
         configured_home = environment.get("HOME")
         if configured_home is not None and type(configured_home) is not str:
             raise ClaudeCodeIntegrationError()
@@ -837,9 +840,9 @@ def _validate_project_hook_policy(
                 source = candidate
         if source is None:
             return
-        marker = spec.config.marker.encode("ascii")
+        marker = config.marker.encode("ascii")
         if marker not in source:
-            plan_owned_config_install(source, spec.config)
+            plan_owned_config_install(source, config)
             return
         if source.count(marker) != 1:
             raise ClaudeCodeIntegrationError()

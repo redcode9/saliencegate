@@ -63,6 +63,7 @@ packages = ["src/saliencegate"]
 artifacts = [
   "src/saliencegate/capture/migrations/*.sql",
   "src/saliencegate/integrations/fixtures/*.json",
+  "src/saliencegate/integrations/assets/*.js",
   "src/saliencegate/integrations/launchers/*",
   "src/saliencegate/integrations/profiles.json",
   "src/saliencegate/repository/migrations/*.sql",
@@ -71,13 +72,19 @@ artifacts = [
 
 [tool.hatch.build.targets.sdist]
 include = [
+  "/.node-version",
   "/CHANGELOG.md",
   "/CITATION.cff",
   "/CODE_OF_CONDUCT.md",
   "/CONTRIBUTING.md",
+  "/Makefile",
   "/README.md",
   "/SECURITY.md",
   "/benchmarks",
+  "/connectors/bridge-core",
+  "/connectors/opencode",
+  "/connectors/scripts",
+  "/connectors/tsconfig.json",
   "/docs/benchmarks",
   "/docs/assets",
   "/docs/package-description.md",
@@ -89,7 +96,10 @@ include = [
   "/src",
   "/tests",
   "/LICENSE",
+  "/package-lock.json",
+  "/package.json",
   "/pyproject.toml",
+  "/tsconfig.base.json",
   "/uv.lock",
 ]
 

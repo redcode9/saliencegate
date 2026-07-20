@@ -1,0 +1,9 @@
+{
+  "extends": "../tsconfig.base.json",
+  "include": [
+    "bridge-core/src/**/*.ts",
+    "bridge-core/test/**/*.ts",
+    "opencode/src/**/*.ts",
+    "opencode/test/**/*.ts"
+  ]
+}

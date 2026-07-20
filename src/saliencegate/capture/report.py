@@ -732,7 +732,9 @@ def build_capture_session_report(
             if type(item.event.intake) is CaptureControllerFailedIntake
         )
         gap_count = (
-            health_counts[CaptureHealthCode.GAP_DETECTED] + controller_failures["gap_detected"]
+            health_counts[CaptureHealthCode.GAP_DETECTED]
+            + controller_failures["gap_detected"]
+            + verified_snapshot.incomplete_transport_batch_count
         )
         overflow_count = (
             health_counts[CaptureHealthCode.SESSION_OVERFLOW] + controller_failures["overflow"]

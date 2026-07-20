@@ -145,6 +145,14 @@ from saliencegate.capture.store import (
     CaptureStoreMode,
     CaptureStoreStateError,
 )
+from saliencegate.capture.transport import (
+    MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION,
+    CaptureTransportChunk,
+    CaptureTransportDisposition,
+    CaptureTransportError,
+    CaptureTransportReceipt,
+    validate_capture_transport_chunk,
+)
 
 __all__ = [
     "CAPTURE_ADAPTER_PROTOCOL_VERSION",
@@ -155,6 +163,7 @@ __all__ = [
     "MAX_CAPTURE_NATIVE_BYTES",
     "MAX_CAPTURE_SPOOL_BYTES",
     "MAX_CAPTURE_SPOOL_EVENTS",
+    "MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION",
     "CapabilitySupport",
     "CaptureActionFinishedIntake",
     "CaptureActionStartedIntake",
@@ -236,6 +245,10 @@ __all__ = [
     "CaptureStoreStateError",
     "CaptureSubagentFinishedIntake",
     "CaptureSubagentStartedIntake",
+    "CaptureTransportChunk",
+    "CaptureTransportDisposition",
+    "CaptureTransportError",
+    "CaptureTransportReceipt",
     "CaptureTurnFinishedIntake",
     "CompatibilityStatus",
     "admit_capture_intake",
@@ -262,6 +275,7 @@ __all__ = [
     "validate_capture_capability_binding",
     "validate_capture_event",
     "validate_capture_intake",
+    "validate_capture_transport_chunk",
     "validated_capture_adapter",
     "verify_capture_intake_authentication",
     "verify_capture_normalization",

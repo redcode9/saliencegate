@@ -30,6 +30,10 @@ from saliencegate.capture.publication import authenticate_capture_intake
 from saliencegate.capture.schema import CaptureIntake, validate_capture_intake
 from saliencegate.capture.sessions import CaptureSessionSnapshot
 from saliencegate.capture.store import CaptureConnectionState
+from saliencegate.capture.transport import (
+    CaptureTransportChunk,
+    CaptureTransportDisposition,
+)
 from saliencegate.domain import EventType, SignalType, canonical_json
 from saliencegate.security import InstallationKey
 from saliencegate.signals import DetectionStatus
@@ -142,16 +146,47 @@ def _snapshot(
             expected_state=CaptureConnectionState.PENDING,
             target_state=CaptureConnectionState.ENABLED,
         )
-        session_id = None
+        intakes: list[CaptureIntake] = []
         for ordinal, spec in enumerate(specs, start=1):
             values = dict(spec)
             kind = values.pop("kind")
             assert type(kind) is str
             intake = _intake(profile_id, kind, ordinal=ordinal, **values)  # type: ignore[arg-type]
-            session_id = intake.session_id
-            store.append(intake)
-        assert session_id is not None
-        return store.snapshot_session(_CONNECTION, session_id)
+            intakes.append(intake)
+        assert intakes
+        session_id = intakes[0].session_id
+        assert all(intake.session_id == session_id for intake in intakes)
+        if profile_id in {
+            CaptureProfile.OPENCODE_PLUGIN_V1,
+            CaptureProfile.PI_EXTENSION_V1,
+        }:
+            context = CaptureDigestContext(INSTALLATION_KEY)
+            receipt = store.append_transport_chunk(
+                CaptureTransportChunk(
+                    connection_id=_CONNECTION,
+                    session_id=session_id,
+                    batch_ref=context.transport_batch_ref(b"normalization-batch"),
+                    chunk_index=0,
+                    chunk_count=1,
+                    chunk_digest=context.transport_chunk_digest(b"normalization-chunk"),
+                ),
+                tuple(intakes),
+            )
+            assert receipt.disposition is CaptureTransportDisposition.ADMITTED
+        else:
+            for intake in intakes:
+                store.append(intake)
+        snapshot = store.snapshot_session(_CONNECTION, session_id)
+        if profile_id in {
+            CaptureProfile.OPENCODE_PLUGIN_V1,
+            CaptureProfile.PI_EXTENSION_V1,
+        }:
+            assert snapshot.transport_receipt_count == 1
+        else:
+            assert snapshot.transport_receipt_count == 0
+        assert snapshot.incomplete_transport_batch_count == 0
+        assert snapshot.coverage_degraded is False
+        return snapshot
 
 
 def _diagnostic_codes(

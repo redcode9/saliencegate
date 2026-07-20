@@ -126,12 +126,16 @@ Claude supplies no admitted timestamp or sequence field. Correlation by `prompt_
 The plugin accepts `message.part.updated` only after checking
 `properties.part.type === "tool"`. For that event it consumes:
 
-- top-level `id` as a producer-event correlation input;
-- `properties.sessionID` and `properties.part.sessionID`, which must agree;
+- `properties.part.sessionID` as the native session identity;
 - `properties.part.type`, `callID`, `tool`, `state.status`, and `state.input`.
 
-`state.input` is canonicalized only to derive opaque action identity. The closed state machine has
-this authority:
+OpenCode's public `Event` union does not declare a top-level `id`, although the pinned runtime
+currently injects one. The plugin therefore treats `id` as optional producer-event correlation,
+never as sequence authority. The runtime can also add an outer `properties.sessionID`; when it is
+present the plugin checks that it agrees with `properties.part.sessionID`, but it is not required.
+
+`state.input` is critical and is canonicalized only to derive opaque action identity. An event
+without it is omitted and degrades coverage. The closed state machine has this authority:
 
 | `ToolPart.state.status` | Capture meaning |
 |---|---|
@@ -139,21 +143,56 @@ this authority:
 | `completed` | Provider-claimed structured success |
 | `error` | Provider-claimed structured failure |
 
-For `session.idle`, `session.compacted`, and `session.deleted`, only top-level `id` and
-`properties.sessionID` are consumed. `session.error` consumes those fields when its optional
-session ID is present; otherwise it can create only a content-free global health disposition.
-`dispose` has no payload and flushes already-reduced in-memory state.
+`session.idle` and `session.compacted` use their public `properties.sessionID` as native session
+identity. `session.deleted` instead uses the public `properties.info.id`; an outer runtime-added
+`properties.sessionID`, when present, is only a consistency check. Each of these session events may
+carry the same runtime-added optional top-level `id`. `session.error` has no critical identity: its
+`properties.sessionID` is optional; without one the bridge cannot attribute the failure and emits
+no session intake. `dispose` has no payload and flushes already-reduced in-memory state.
 
-`properties.time`, part and message IDs, `state.raw`, `state.output`, `state.error`,
-titles, metadata, attachments, `session.error.properties.error`, and
-`session.deleted.properties.info` are ignored. Non-tool part variants are rejected by their
-discriminant without traversing their content. The plugin must not call `session.messages()`,
-`session.get()`, or another history materializer; parent session metadata therefore remains
-unavailable in v1.
+Part and message IDs, the optional part delta, runtime-added event time, part metadata, and
+`state.raw`, `state.output`, `state.error`, `state.title`, `state.metadata`, `state.time`,
+`state.attachments`, and `state.compacted` are ignored. The structured `session.error` error and
+all `session.deleted.properties.info` fields except `info.id` are ignored too. Non-tool part
+variants are rejected by their discriminant without traversing their content. The plugin must not
+call `session.messages()`, `session.get()`, or another history materializer; child sessions remain
+separate by their native IDs, while parent-session metadata remains unavailable or ignored in v1.
 
-`callID` is exact per-action parent correlation but not authentication. OpenCode supplies no
-admitted causal sequence. Event and tool-state time fields are excluded; receipt order and time are
-local observation metadata only.
+`callID` is exact per-action parent correlation but not authentication. Neither the optional
+runtime event ID nor any event or tool-state time field supplies admitted causal sequence; receipt
+order and time are local observation metadata only.
+
+For each received transport batch, authenticated chunk receipts declare the batch length and each
+chunk's index. Once any chunk from a batch arrives, a missing first, middle, or final chunk is
+detectable as an incomplete batch. If every chunk in a batch is lost before receipt, the receiver
+has no batch record to inspect; absent a later successful flush carrying a content-free gap marker,
+that wholly unobserved batch cannot be detected. This is the explicit
+`fully_unobserved_transport_batch` coverage exclusion.
+
+Under bounded in-process pressure, the plugin may replace middle records with a content-free
+transport gap, but it reserves and schedules one terminal control per buffered session. If a
+launcher has already attempted a terminal-bearing batch and returns an ambiguous failure, the
+plugin does not replay that terminal under a fresh batch identity; the receiver's authenticated
+receipt state remains the only authority for resolving an attempted delivery.
+
+If atomic receipt admission finds the local store busy, the bounded fallback queues only the
+authenticated window start, one session-stable content-free gap marker, and an observed terminal
+close when present. It deliberately discards the failed chunk's middle evidence instead of
+reordering records whose provider sequence is unavailable. A later spool drain therefore preserves
+window validity while reporting degraded coverage; it never promotes fallback order into provider
+causal authority.
+
+If that fallback spool already has a large valid backlog, the provider-deadline path validates its
+closed filename inventory but does not authenticate and sort every queued record. It instead records
+the whole bounded fallback as quota-dropped behind one authenticated global degradation barrier.
+Later bridge chunks remain fenced from direct admission after an ordinary drain; lifecycle
+maintenance removes the barrier only after the queue is empty, so a dropped batch cannot be
+silently overtaken.
+
+The latency-sensitive hook open validates the store application and schema versions, checksummed
+migration history, and exact schema inventory before admitting a target. It does not run
+whole-database `quick_check` or foreign-key scans inside provider callbacks. Maintenance,
+migration, and read-only audit paths retain those full-data checks.
 
 ### Pi
 

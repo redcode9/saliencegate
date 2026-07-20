@@ -9,45 +9,45 @@
   <rect data-series="memory" aria-label="Memory backend measurement series" x="60" y="158" width="14" height="315" rx="7" fill="#315f6f"/>
   <text x="100" y="212" fill="#22211f" font-size="40" font-weight="700">Memory backend</text>
   <text x="100" y="258" fill="#22211f" font-size="28">Five durations (seconds)</text>
-  <text data-metric="memory.duration.1" x="100" y="304" fill="#22211f" font-size="30">4.66473575</text>
-  <text data-metric="memory.duration.2" x="370" y="304" fill="#22211f" font-size="30">4.729587833</text>
-  <text data-metric="memory.duration.3" x="640" y="304" fill="#22211f" font-size="30">4.57829925</text>
-  <text data-metric="memory.duration.4" x="910" y="304" fill="#22211f" font-size="30">4.719111875</text>
-  <text data-metric="memory.duration.5" x="1180" y="304" fill="#22211f" font-size="30">4.72002375</text>
+  <text data-metric="memory.duration.1" x="100" y="304" fill="#22211f" font-size="30">4.475258041</text>
+  <text data-metric="memory.duration.2" x="370" y="304" fill="#22211f" font-size="30">4.739888625</text>
+  <text data-metric="memory.duration.3" x="640" y="304" fill="#22211f" font-size="30">4.501317375</text>
+  <text data-metric="memory.duration.4" x="910" y="304" fill="#22211f" font-size="30">4.511588875</text>
+  <text data-metric="memory.duration.5" x="1180" y="304" fill="#22211f" font-size="30">4.544195208</text>
   <text x="100" y="362" fill="#22211f" font-size="28">Median seconds</text>
-  <text data-metric="memory.median" x="100" y="404" fill="#22211f" font-size="30" font-weight="700">4.719111875</text>
+  <text data-metric="memory.median" x="100" y="404" fill="#22211f" font-size="30" font-weight="700">4.511588875</text>
   <text x="430" y="362" fill="#22211f" font-size="28">Time budget (s)</text>
   <text data-metric="memory.time_budget" x="430" y="404" fill="#22211f" font-size="30" font-weight="700">5.0</text>
   <text x="760" y="362" fill="#22211f" font-size="28">Peak RSS (MiB)</text>
-  <text data-metric="memory.peak_rss" x="760" y="404" fill="#22211f" font-size="30" font-weight="700">185.40625</text>
+  <text data-metric="memory.peak_rss" x="760" y="404" fill="#22211f" font-size="30" font-weight="700">186.359375</text>
   <text x="1090" y="362" fill="#22211f" font-size="28">RSS budget (MiB)</text>
   <text data-metric="memory.rss_budget" x="1090" y="404" fill="#22211f" font-size="30" font-weight="700">512.0</text>
   <rect x="430" y="435" width="280" height="16" rx="8" fill="#c7c0b4"/>
-  <rect data-series="memory-time" aria-label="Memory median uses 4.719111875 of the 5 second budget" x="430" y="435" width="264" height="16" rx="8" fill="#315f6f"/>
+  <rect data-series="memory-time" aria-label="Memory median uses 4.511588875 of the 5 second budget" x="430" y="435" width="253" height="16" rx="8" fill="#315f6f"/>
   <rect x="1090" y="435" width="280" height="16" rx="8" fill="#c7c0b4"/>
-  <rect data-series="memory-rss" aria-label="Memory peak RSS uses 185.40625 of the 512 MiB budget" x="1090" y="435" width="101" height="16" rx="8" fill="#315f6f"/>
+  <rect data-series="memory-rss" aria-label="Memory peak RSS uses 186.359375 of the 512 MiB budget" x="1090" y="435" width="102" height="16" rx="8" fill="#315f6f"/>
 
   <rect data-surface="true" x="60" y="500" width="1480" height="315" rx="14" fill="#f1e0c6" stroke="#9b5c13" stroke-width="4"/>
   <rect data-series="sqlite" aria-label="SQLite backend measurement series" x="60" y="500" width="14" height="315" rx="7" fill="#9b5c13"/>
   <text x="100" y="554" fill="#22211f" font-size="40" font-weight="700">SQLite backend</text>
   <text x="100" y="600" fill="#22211f" font-size="28">Five durations (seconds)</text>
-  <text data-metric="sqlite.duration.1" x="100" y="646" fill="#22211f" font-size="30">7.427851125</text>
-  <text data-metric="sqlite.duration.2" x="370" y="646" fill="#22211f" font-size="30">7.412707417</text>
-  <text data-metric="sqlite.duration.3" x="640" y="646" fill="#22211f" font-size="30">7.398388584</text>
-  <text data-metric="sqlite.duration.4" x="910" y="646" fill="#22211f" font-size="30">7.370406125</text>
-  <text data-metric="sqlite.duration.5" x="1180" y="646" fill="#22211f" font-size="30">7.507945875</text>
+  <text data-metric="sqlite.duration.1" x="100" y="646" fill="#22211f" font-size="30">7.22261425</text>
+  <text data-metric="sqlite.duration.2" x="370" y="646" fill="#22211f" font-size="30">7.240622834</text>
+  <text data-metric="sqlite.duration.3" x="640" y="646" fill="#22211f" font-size="30">7.2408065</text>
+  <text data-metric="sqlite.duration.4" x="910" y="646" fill="#22211f" font-size="30">7.247394583</text>
+  <text data-metric="sqlite.duration.5" x="1180" y="646" fill="#22211f" font-size="30">7.238663542</text>
   <text x="100" y="704" fill="#22211f" font-size="28">Median seconds</text>
-  <text data-metric="sqlite.median" x="100" y="746" fill="#22211f" font-size="30" font-weight="700">7.412707417</text>
+  <text data-metric="sqlite.median" x="100" y="746" fill="#22211f" font-size="30" font-weight="700">7.240622834</text>
   <text x="430" y="704" fill="#22211f" font-size="28">Time budget (s)</text>
   <text data-metric="sqlite.time_budget" x="430" y="746" fill="#22211f" font-size="30" font-weight="700">15.0</text>
   <text x="760" y="704" fill="#22211f" font-size="28">Peak RSS (MiB)</text>
-  <text data-metric="sqlite.peak_rss" x="760" y="746" fill="#22211f" font-size="30" font-weight="700">213.921875</text>
+  <text data-metric="sqlite.peak_rss" x="760" y="746" fill="#22211f" font-size="30" font-weight="700">215.625</text>
   <text x="1090" y="704" fill="#22211f" font-size="28">RSS budget (MiB)</text>
   <text data-metric="sqlite.rss_budget" x="1090" y="746" fill="#22211f" font-size="30" font-weight="700">512.0</text>
   <rect x="430" y="777" width="280" height="16" rx="8" fill="#c7c0b4"/>
-  <rect data-series="sqlite-time" aria-label="SQLite median uses 7.412707417 of the 15 second budget" x="430" y="777" width="138" height="16" rx="8" fill="#9b5c13"/>
+  <rect data-series="sqlite-time" aria-label="SQLite median uses 7.240622834 of the 15 second budget" x="430" y="777" width="135" height="16" rx="8" fill="#9b5c13"/>
   <rect x="1090" y="777" width="280" height="16" rx="8" fill="#c7c0b4"/>
-  <rect data-series="sqlite-rss" aria-label="SQLite peak RSS uses 213.921875 of the 512 MiB budget" x="1090" y="777" width="117" height="16" rx="8" fill="#9b5c13"/>
+  <rect data-series="sqlite-rss" aria-label="SQLite peak RSS uses 215.625 of the 512 MiB budget" x="1090" y="777" width="118" height="16" rx="8" fill="#9b5c13"/>
 
   <rect data-surface="true" x="60" y="845" width="1480" height="225" rx="12" fill="#ffffff"/>
   <text x="90" y="890" fill="#22211f" font-size="28">Platform</text>

@@ -1,0 +1,9 @@
+{
+  "name": "@saliencegate/opencode-connector",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@saliencegate/bridge-core": "0.2.0"
+  }
+}

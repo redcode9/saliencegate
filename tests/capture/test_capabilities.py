@@ -179,35 +179,34 @@ _EVENTS: Final = {
     CaptureProfile.OPENCODE_PLUGIN_V1: {
         "message.part.updated": (
             (
-                "id",
                 "properties.part.callID",
                 "properties.part.sessionID",
+                "properties.part.state.input",
                 "properties.part.state.status",
                 "properties.part.tool",
                 "properties.part.type",
-                "properties.sessionID",
             ),
-            ("properties.part.state.input",),
+            ("id", "properties.sessionID"),
             "tool_state_discriminator",
         ),
         "session.idle": (
-            ("id", "properties.sessionID"),
-            (),
+            ("properties.sessionID",),
+            ("id",),
             "turn_closed",
         ),
         "session.error": (
-            ("id",),
-            ("properties.sessionID",),
+            (),
+            ("id", "properties.sessionID"),
             "controller_failure_when_session_correlated",
         ),
         "session.compacted": (
-            ("id", "properties.sessionID"),
-            (),
+            ("properties.sessionID",),
+            ("id",),
             "coverage_boundary",
         ),
         "session.deleted": (
+            ("properties.info.id",),
             ("id", "properties.sessionID"),
-            (),
             "window_closed",
         ),
         "dispose": ((), (), "flush_only"),
@@ -284,17 +283,26 @@ _IGNORED_FIELDS: Final = {
         "transcript_path",
     ),
     CaptureProfile.OPENCODE_PLUGIN_V1: (
-        "attachments",
-        "metadata",
+        "properties.delta",
+        "properties.error",
+        "properties.info.directory",
+        "properties.info.parentID",
+        "properties.info.projectID",
+        "properties.info.time",
+        "properties.info.title",
+        "properties.info.version",
         "properties.part.id",
         "properties.part.messageID",
+        "properties.part.metadata",
+        "properties.part.state.attachments",
+        "properties.part.state.compacted",
         "properties.part.state.error",
+        "properties.part.state.metadata",
         "properties.part.state.output",
         "properties.part.state.raw",
+        "properties.part.state.time",
+        "properties.part.state.title",
         "properties.time",
-        "session.deleted.properties.info",
-        "session.error.properties.error",
-        "titles",
     ),
     CaptureProfile.PI_EXTENSION_V1: (
         "compaction.entries",
@@ -393,7 +401,12 @@ _COVERAGE: Final = {
     ),
     CaptureProfile.OPENCODE_PLUGIN_V1: (
         ("message.part.updated:tool",),
-        ("history_materialization", "non_tool_parts", "parent_session_metadata"),
+        (
+            "fully_unobserved_transport_batch",
+            "history_materialization",
+            "non_tool_parts",
+            "parent_session_metadata",
+        ),
     ),
     CaptureProfile.PI_EXTENSION_V1: (
         ("observational_extension_callbacks",),
@@ -697,6 +710,85 @@ def test_claude_fixture_freezes_the_pinned_lifecycle_shapes_and_ignored_fields()
     }.items():
         authority = next(item for item in profile.events if item.event_name == event_name)
         assert set(fields) <= set(authority.ignored_fields)
+
+
+def test_opencode_fixture_freezes_pinned_tool_states_and_runtime_only_envelope_fields() -> None:
+    profile = capture_profile(CaptureProfile.OPENCODE_PLUGIN_V1)
+    fixture_bytes = (
+        resources.files("saliencegate.integrations").joinpath(profile.fixtures[0].path).read_bytes()
+    )
+    fixture_body = json.loads(fixture_bytes.decode("utf-8"))
+    events = fixture_body["events"]
+    tool_payloads = [
+        item["payload"] for item in events if item["event_name"] == "message.part.updated"
+    ]
+    lifecycle = {
+        item["event_name"]: item["payload"]
+        for item in events
+        if item["event_name"] != "message.part.updated"
+    }
+
+    assert fixture_body["provenance"] == "fully_synthetic_no_provider_or_model_call"
+    assert len(events) == 9
+    assert tuple(lifecycle) == (
+        "session.idle",
+        "session.error",
+        "session.compacted",
+        "session.deleted",
+        "dispose",
+    )
+    assert [payload["properties"]["part"]["state"]["status"] for payload in tool_payloads] == [
+        "pending",
+        "running",
+        "completed",
+        "error",
+    ]
+
+    pending, running, completed, failed = (
+        payload["properties"]["part"]["state"] for payload in tool_payloads
+    )
+    assert pending["raw"] == "synthetic-ignored-raw"
+    assert running["time"] == {"start": 2}
+    assert completed["output"] == "synthetic-ignored-output"
+    assert completed["title"] == "synthetic-ignored-title"
+    assert completed["metadata"] == {"synthetic": "ignored-completed-metadata"}
+    assert completed["time"] == {"end": 4, "start": 3}
+    assert completed["attachments"] == []
+    assert completed["compacted"] is False
+    assert failed["error"] == "synthetic-ignored-error"
+    assert failed["metadata"] == {"synthetic": "ignored-error-metadata"}
+    assert failed["time"] == {"end": 6, "start": 5}
+    assert all("input" in state for state in (pending, running, completed, failed))
+
+    for payload in tool_payloads:
+        part = payload["properties"]["part"]
+        assert set(("callID", "id", "messageID", "sessionID", "state", "tool", "type")) <= set(part)
+        assert part["sessionID"] == "synthetic-opencode-session"
+        assert payload["properties"]["sessionID"] == part["sessionID"]
+        assert payload["id"].startswith("synthetic-opencode-event-")
+
+    assert lifecycle["session.error"]["properties"]["error"] == {
+        "data": {"message": "synthetic-ignored-controller-error"},
+        "name": "UnknownError",
+    }
+    deleted = lifecycle["session.deleted"]["properties"]
+    assert deleted["sessionID"] == deleted["info"]["id"] == "synthetic-opencode-session"
+    assert deleted["info"] == {
+        "directory": "/synthetic/project",
+        "id": "synthetic-opencode-session",
+        "parentID": "synthetic-ignored-parent-session",
+        "projectID": "synthetic-opencode-project",
+        "time": {"created": 7, "updated": 8},
+        "title": "synthetic-ignored-session-title",
+        "version": "1.18.3",
+    }
+
+    authority = {item.event_name: item for item in profile.events}
+    assert "id" in authority["message.part.updated"].optional_fields
+    assert "properties.sessionID" in authority["message.part.updated"].optional_fields
+    assert "properties.part.state.input" in authority["message.part.updated"].critical_fields
+    assert authority["session.deleted"].critical_fields == ("properties.info.id",)
+    assert authority["dispose"].critical_fields == authority["dispose"].optional_fields == ()
 
 
 def test_binding_rejects_profile_and_manifest_digest_mismatch_without_value_leakage() -> None:

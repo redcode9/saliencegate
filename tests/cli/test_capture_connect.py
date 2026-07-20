@@ -93,6 +93,19 @@ def _command_hook_spec(tmp_path: Path, *, generation: int = 1) -> ProviderInstal
     return ProviderInstallationSpec.model_validate(payload)
 
 
+def _configless_bridge_spec(
+    tmp_path: Path,
+    *,
+    generation: int = 1,
+) -> ProviderInstallationSpec:
+    payload = _spec(tmp_path, generation=generation).model_dump(
+        mode="python",
+        warnings="error",
+    )
+    payload.update(config_path=None, config=None)
+    return ProviderInstallationSpec.model_validate(payload)
+
+
 def _environment(tmp_path: Path) -> dict[str, str]:
     return {
         "HOME": str(tmp_path / "home"),
@@ -150,6 +163,46 @@ def test_command_hook_connect_installs_only_config_and_private_launcher(tmp_path
         ProviderAlias.CODEX,
         spec.project_root,
         resolver=lambda alias, project: spec,
+    )
+
+
+def test_configless_bridge_connect_installs_only_auto_discovered_assets(
+    tmp_path: Path,
+) -> None:
+    spec = _configless_bridge_spec(tmp_path)
+    environment = _environment(tmp_path)
+
+    def resolver(alias: ProviderAlias, project: Path) -> ProviderInstallationSpec:
+        del alias, project
+        return spec
+
+    assert not project_provider_artifacts_present(
+        ProviderAlias.CODEX,
+        spec.project_root,
+        resolver=resolver,
+    )
+
+    report = run_connect(
+        provider="codex",
+        project=spec.project_root,
+        environ=environment,
+        spec_resolver=resolver,
+    )
+
+    assert report.capture_enabled is True
+    assert report.project_local_files == 2
+    assert report.git_tracked_files == 0
+    assert spec.config_path is None
+    assert spec.config is None
+    assert spec.project_local_paths == (spec.bundle_path, spec.bootstrap_path)
+    assert {path for path in spec.project_root.rglob("*") if path.is_file()} == {
+        spec.bundle_path,
+        spec.bootstrap_path,
+    }
+    assert project_provider_artifacts_present(
+        ProviderAlias.CODEX,
+        spec.project_root,
+        resolver=resolver,
     )
 
 

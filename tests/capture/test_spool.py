@@ -245,6 +245,41 @@ def test_read_only_audit_authenticates_queued_intakes_and_drop_health(
     assert health.last_drop_reason == "spool_quota"
 
 
+def test_legacy_v1_drop_health_is_read_and_upgraded_without_a_bridge_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locations = _locations(tmp_path)
+    spool = CaptureSpool.open(locations, INSTALLATION_KEY)
+    payload = canonical_json(
+        {
+            "schema_version": "capture-spool-health/v1",
+            "dropped_events": 1,
+            "last_drop_reason": "spool_incomplete",
+            "acknowledged_marker": "a" * 64,
+        }
+    )
+    tag = INSTALLATION_KEY._hmac_sha256(payload, domain=spool_module._HEALTH_DOMAIN)
+    health_path = locations.spool_directory / ".capture-spool-health"
+    health_path.write_bytes(b"\n".join((b"capture-spool-health/v1", tag.encode("ascii"), payload)))
+    health_path.chmod(0o600)
+
+    assert spool.health().dropped_events == 1
+    with spool._locked() as directory_fd:
+        assert spool._drop_state(directory_fd) == (
+            1,
+            "spool_incomplete",
+            "a" * 64,
+            None,
+        )
+
+    monkeypatch.setattr(spool_module, "MAX_CAPTURE_SPOOL_EVENTS", 0)
+    assert spool.enqueue(authenticated_intake("session_started")).disposition == "dropped_quota"
+    assert health_path.read_bytes().startswith(b"capture-spool-health/v2\n")
+    with spool._locked() as directory_fd:
+        assert spool._drop_state(directory_fd)[3] is None
+
+
 @pytest.mark.skipif(os.name != "posix", reason="private spool boundaries require POSIX")
 @pytest.mark.parametrize("mutation", ("entry", "marker", "health", "unexpected", "lock"))
 def test_read_only_audit_rejects_tampered_or_unexpected_spool_state_without_mutation(
@@ -294,7 +329,7 @@ def test_read_only_audit_detects_a_health_marker_created_during_its_snapshot(
     def create_health_after_absent_read(
         spool: CaptureSpool,
         directory_fd: int | None,
-    ) -> tuple[int, str | None, str | None, object | None]:
+    ) -> tuple[int, str | None, str | None, str | None, object | None]:
         state = real_drop_state(spool, directory_fd)
         spool._write_drop_state(1, "spool_quota", directory_fd)
         return state

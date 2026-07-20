@@ -115,13 +115,13 @@ module.
 
 | Backend | Observed median | Median budget | Maximum peak RSS | RSS budget | Result |
 |---|---:|---:|---:|---:|---|
-| In memory | 4.719111875 s | 5 s | 185.40625 MiB | 512 MiB | Passed |
-| SQLite | 7.412707417 s | 15 s | 213.921875 MiB | 512 MiB | Passed |
+| In memory | 4.511588875 s | 5 s | 186.359375 MiB | 512 MiB | Passed |
+| SQLite | 7.240622834 s | 15 s | 215.625 MiB | 512 MiB | Passed |
 
 The measurements came from one local machine: macOS 26.5.2 on arm64, 15 logical cores, 24 GiB of
 memory, and CPython 3.12.3. The runner image was unavailable and is recorded as `unspecified`. The
-non-gating 250-to-1,000 median-time ratios were 5.22237592275073 in memory and
-5.189276191671558 with SQLite; the v1 prefix digest is not claimed to scale linearly.
+non-gating 250-to-1,000 median-time ratios were 5.068874211620346 in memory and
+5.414591205673016 with SQLite; the v1 prefix digest is not claimed to scale linearly.
 
 The exact output is the [reference JSON](../benchmarks/shadow_trace/reference-macos-26.5.2-arm64-cpython-3.12.3.json).
 Its [evidence manifest](../benchmarks/shadow_trace/reference-macos-26.5.2-arm64-cpython-3.12.3.manifest.json)

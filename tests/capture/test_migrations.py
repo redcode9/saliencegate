@@ -7,7 +7,7 @@ import stat
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -34,6 +34,8 @@ EXPECTED_TABLES = frozenset(
         "capture_heads",
         "capture_health",
         "capture_sessions",
+        "capture_transport_heads",
+        "capture_transport_receipts",
         "connections",
         "deleted_sessions",
         "feedback_labels",
@@ -82,7 +84,7 @@ def initialized_store(tmp_path: Path) -> Path:
     path = tmp_path / "capture.sqlite3"
     receipt = initialize_capture_store(path)
     assert receipt.schema_version == LATEST_SCHEMA_VERSION
-    assert receipt.applied_versions == (1,)
+    assert receipt.applied_versions == (1, 2)
     assert repr(receipt) == "CaptureMigrationReceipt(<redacted>)"
     return path
 
@@ -91,11 +93,17 @@ def test_capture_migration_constants_and_packaged_resource_are_frozen() -> None:
     migrations = discover_capture_migrations()
 
     assert APPLICATION_ID == 0x53474350
-    assert LATEST_SCHEMA_VERSION == 1
-    assert tuple(migration.version for migration in migrations) == (1,)
-    assert tuple(migration.name for migration in migrations) == ("capture_store",)
-    assert migrations[0].checksum == hashlib.sha256(migrations[0].sql.encode("utf-8")).hexdigest()
-    assert len(migrations[0].checksum) == 64
+    assert LATEST_SCHEMA_VERSION == 2
+    assert tuple(migration.version for migration in migrations) == (1, 2)
+    assert tuple(migration.name for migration in migrations) == (
+        "capture_store",
+        "transport_receipts",
+    )
+    assert all(
+        migration.checksum == hashlib.sha256(migration.sql.encode("utf-8")).hexdigest()
+        for migration in migrations
+    )
+    assert all(len(migration.checksum) == 64 for migration in migrations)
     assert "PRAGMA application_id = 0x53474350;" in migrations[0].sql
     assert all(
         f"'{label}'" in migrations[0].sql
@@ -112,7 +120,7 @@ def test_capture_migration_constants_and_packaged_resource_are_frozen() -> None:
         ("0001_capture_store.sql", b"\xef\xbb\xbfSELECT 1;\n"),
         ("0001_capture_store.sql", b"CREATE TABLE incomplete("),
         ("0001_capture_store.sql", b"\xff"),
-        ("0002_noncontiguous.sql", b"SELECT 1;\n"),
+        ("0003_noncontiguous.sql", b"SELECT 1;\n"),
     ),
     ids=("bom", "incomplete-sql", "invalid-utf8", "noncontiguous"),
 )
@@ -141,9 +149,9 @@ def test_initialize_builds_exact_capture_schema_and_current_store_is_a_no_op(
     applied = initialize_capture_store(path, busy_timeout_ms=2_000)
     reapplied = initialize_capture_store(path, busy_timeout_ms=2_000)
 
-    assert (applied.schema_version, applied.applied_versions) == (1, (1,))
-    assert (reapplied.schema_version, reapplied.applied_versions) == (1, ())
-    migration = discover_capture_migrations()[0]
+    assert (applied.schema_version, applied.applied_versions) == (2, (1, 2))
+    assert (reapplied.schema_version, reapplied.applied_versions) == (2, ())
+    migrations = discover_capture_migrations()
     with _connect(path) as connection:
         assert _tables(connection) == EXPECTED_TABLES
         assert connection.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
@@ -154,9 +162,32 @@ def test_initialize_builds_exact_capture_schema_and_current_store_is_a_no_op(
         rows = connection.execute(
             "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [tuple(row) for row in rows] == [(1, "capture_store", migration.checksum)]
+        assert [tuple(row) for row in rows] == [
+            (migration.version, migration.name, migration.checksum) for migration in migrations
+        ]
         assert validate_capture_store_schema(connection) is None
         assert not connection.in_transaction
+
+
+def test_initialize_authenticates_and_upgrades_a_version_one_store(tmp_path: Path) -> None:
+    path = tmp_path / "capture-v1.sqlite3"
+    first = discover_capture_migrations()[0]
+    with sqlite3.connect(path, isolation_level=None) as connection:
+        for statement in migration_module._parse_statements(first.sql):
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, name, checksum) VALUES (?, ?, ?)",
+            (first.version, first.name, first.checksum),
+        )
+        connection.execute("PRAGMA user_version = 1")
+    path.chmod(0o600)
+
+    receipt = initialize_capture_store(path)
+
+    assert (receipt.schema_version, receipt.applied_versions) == (2, (2,))
+    with _connect(path) as connection:
+        assert _tables(connection) == EXPECTED_TABLES
+        assert validate_capture_store_schema(connection) is None
 
 
 @pytest.mark.parametrize("busy_timeout_ms", (True, 0, 60_001, 1.5))
@@ -336,7 +367,7 @@ def test_migration_history_cardinality_mismatch_is_refused(
             connection.execute(
                 """
                 INSERT INTO schema_migrations(version, name, checksum)
-                VALUES (2, 'unexpected', ?)
+                VALUES (3, 'unexpected', ?)
                 """,
                 ("e" * 64,),
             )
@@ -347,7 +378,7 @@ def test_migration_history_cardinality_mismatch_is_refused(
 
     _assert_content_free_error(captured.value, MIGRATION_INTEGRITY_MESSAGE, initialized_store)
     with _connect(initialized_store) as connection:
-        expected_count = 0 if history_shape == "missing" else 2
+        expected_count = 0 if history_shape == "missing" else 3
         assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == (
             expected_count
         )
@@ -481,7 +512,7 @@ def test_initialize_recovers_a_preexisting_empty_private_database(tmp_path: Path
 
     receipt = initialize_capture_store(path)
 
-    assert receipt.applied_versions == (1,)
+    assert receipt.applied_versions == (1, 2)
     with _connect(path) as connection:
         assert connection.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
         assert connection.execute("PRAGMA user_version").fetchone()[0] == LATEST_SCHEMA_VERSION
@@ -595,3 +626,46 @@ def test_runtime_open_validates_current_schema_without_invoking_initializer(
 
     with CaptureStore.open(initialized_store, installation_key=KEY):
         pass
+
+
+def test_hook_open_skips_full_data_pragmas_while_maintenance_retains_them(
+    initialized_store: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import saliencegate.capture.store as store_module
+    from saliencegate.capture.store import CaptureStore, CaptureStoreMode
+
+    original_connect = sqlite3.connect
+    statements: list[str] = []
+
+    def tracing_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(store_module.sqlite3, "connect", tracing_connect)
+
+    with CaptureStore.open(
+        initialized_store,
+        installation_key=KEY,
+        mode=CaptureStoreMode.HOOK,
+    ):
+        pass
+
+    hook_statements = tuple(statement.strip().casefold() for statement in statements)
+    assert hook_statements.count("pragma user_version") == 2
+    assert hook_statements.count("pragma application_id") == 2
+    assert "pragma quick_check" not in hook_statements
+    assert "pragma foreign_key_check" not in hook_statements
+
+    statements.clear()
+    with CaptureStore.open(
+        initialized_store,
+        installation_key=KEY,
+        mode=CaptureStoreMode.MAINTENANCE,
+    ):
+        pass
+
+    maintenance_statements = tuple(statement.strip().casefold() for statement in statements)
+    assert maintenance_statements.count("pragma quick_check") == 2
+    assert maintenance_statements.count("pragma foreign_key_check") == 2

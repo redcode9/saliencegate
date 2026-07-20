@@ -10,6 +10,7 @@ from saliencegate.capture import (
     sessions,
     spool,
     store,
+    transport,
 )
 
 
@@ -19,6 +20,9 @@ def test_capture_root_exports_the_stable_store_contract() -> None:
         "MAX_CAPTURE_EVENTS_PER_SESSION": store.MAX_CAPTURE_EVENTS_PER_SESSION,
         "MAX_CAPTURE_SPOOL_BYTES": spool.MAX_CAPTURE_SPOOL_BYTES,
         "MAX_CAPTURE_SPOOL_EVENTS": spool.MAX_CAPTURE_SPOOL_EVENTS,
+        "MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION": (
+            transport.MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION
+        ),
         "CaptureAdmissionSource": store.CaptureAdmissionSource,
         "CaptureAppendDisposition": store.CaptureAppendDisposition,
         "CaptureAppendReceipt": store.CaptureAppendReceipt,
@@ -70,6 +74,10 @@ def test_capture_root_exports_the_stable_store_contract() -> None:
         "CaptureStoreLocations": locations.CaptureStoreLocations,
         "CaptureStoreMode": store.CaptureStoreMode,
         "CaptureStoreStateError": store.CaptureStoreStateError,
+        "CaptureTransportChunk": transport.CaptureTransportChunk,
+        "CaptureTransportDisposition": transport.CaptureTransportDisposition,
+        "CaptureTransportError": transport.CaptureTransportError,
+        "CaptureTransportReceipt": transport.CaptureTransportReceipt,
         "admit_capture_intake": spool.admit_capture_intake,
         "authenticate_capture_intake": publication.authenticate_capture_intake,
         "build_capture_session_report": report.build_capture_session_report,
@@ -84,6 +92,7 @@ def test_capture_root_exports_the_stable_store_contract() -> None:
         "verify_capture_normalization": normalization.verify_capture_normalization,
         "verify_capture_session_snapshot": sessions.verify_capture_session_snapshot,
         "verify_capture_spool_observation": spool.verify_capture_spool_observation,
+        "validate_capture_transport_chunk": transport.validate_capture_transport_chunk,
     }
 
     assert len(public_capture.__all__) == len(set(public_capture.__all__))

@@ -945,7 +945,7 @@ def test_open_rejects_capture_session_row_tag_tampering_without_repair(
         connection.close()
 
     tampered_rows = _database_rows(path)
-    assert tampered_rows["capture_sessions"][0][-1] == "0" * 64
+    assert tampered_rows["capture_sessions"][0][-3] == "0" * 64
     _assert_open_rejected_without_repair(path, tampered_rows)
 
 

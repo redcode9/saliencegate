@@ -1,0 +1,26 @@
+{
+  "name": "saliencegate-connectors",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@10.9.3",
+  "engines": {
+    "node": "22.19.0",
+    "npm": "10.9.3"
+  },
+  "workspaces": [
+    "connectors/bridge-core",
+    "connectors/opencode"
+  ],
+  "scripts": {
+    "connector:typecheck": "tsc --project connectors/tsconfig.json --noEmit",
+    "connector:test": "npm run connector:typecheck && node --test connectors/bridge-core/test/*.test.ts connectors/opencode/test/*.test.ts",
+    "connector:build": "node connectors/scripts/build-opencode.mjs",
+    "connector:build:check": "node connectors/scripts/build-opencode.mjs --check"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.0",
+    "esbuild": "0.28.1",
+    "typescript": "5.8.2"
+  }
+}

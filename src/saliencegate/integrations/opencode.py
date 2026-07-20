@@ -1,0 +1,1038 @@
+"""Passive, content-free OpenCode bridge capture adapter."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from importlib import resources
+from pathlib import Path
+from typing import TYPE_CHECKING, Final
+
+from saliencegate.capture.adapters import (
+    CAPTURE_ADAPTER_PROTOCOL_VERSION,
+    CaptureAdapterCapabilities,
+)
+from saliencegate.capture.capabilities import (
+    CaptureProfile,
+    capture_capability_digest,
+    capture_profile,
+)
+from saliencegate.capture.identities import CaptureDigestContext
+from saliencegate.capture.locations import resolve_capture_store_locations
+from saliencegate.capture.publication import authenticate_capture_intake
+from saliencegate.capture.schema import (
+    CAPTURE_NATIVE_JSON_LIMITS,
+    CaptureIntake,
+    read_bounded_json,
+    validate_capture_intake,
+)
+from saliencegate.capture.transport import (
+    MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION,
+    CaptureTransportChunk,
+)
+from saliencegate.domain import canonical_json
+from saliencegate.integrations.bootstrap import (
+    IntegrationBootstrap,
+    decode_integration_bootstrap,
+)
+from saliencegate.integrations.registry import (
+    ProviderInstallationKind,
+    ProviderInstallationSpec,
+)
+
+if TYPE_CHECKING:
+    from saliencegate.integrations.hook import CaptureHookDependencies
+
+OPENCODE_HOST_VERSION: Final = "1.18.3"
+OPENCODE_PROFILE: Final = CaptureProfile.OPENCODE_PLUGIN_V1
+OPENCODE_BOOTSTRAP_REFERENCE: Final = "./saliencegate.bootstrap.json"
+
+_CONNECTION_ID: Final = re.compile(r"^[a-z0-9][a-z0-9._:-]{11,127}$")
+_SHA256: Final = re.compile(r"^[0-9a-f]{64}$")
+_ZERO_TAG: Final = "0" * 64
+_MAX_REDUCED_EVENTS_PER_CHUNK: Final = 999
+_MAX_TEXT_BYTES: Final = CAPTURE_NATIVE_JSON_LIMITS.max_string_bytes
+_MAX_SESSION_ID_BYTES: Final = 256 * 1_024
+_MAX_EVENT_ID_BYTES: Final = 16 * 1_024
+_MAX_CALL_ID_BYTES: Final = 16 * 1_024
+_MAX_TOOL_NAME_BYTES: Final = 1 * 1_024
+_HOOK_STORE_BUSY_TIMEOUT_MS: Final = 100
+
+
+class OpenCodeIntegrationError(ValueError):
+    """An OpenCode boundary failed without disclosing provider-owned values."""
+
+    __slots__ = ()
+
+    def __init__(self) -> None:
+        super().__init__("OpenCode capture integration is invalid")
+
+
+def _exact_text(value: object, *, maximum: int = _MAX_TEXT_BYTES) -> str | None:
+    if type(value) is not str:
+        return None
+    try:
+        size = len(value.encode("utf-8", errors="strict"))
+    except UnicodeError:
+        return None
+    return value if 1 <= size <= maximum else None
+
+
+def _exact_keys(
+    value: object,
+    *,
+    required: frozenset[str],
+    optional: frozenset[str] = frozenset(),
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise OpenCodeIntegrationError()
+    keys = frozenset(value)
+    if not required <= keys or keys - required - optional:
+        raise OpenCodeIntegrationError()
+    if any(type(key) is not str for key in value):
+        raise OpenCodeIntegrationError()
+    return value
+
+
+def _canonical_batch(source: bytes) -> Mapping[str, object]:
+    try:
+        return read_bounded_json(source, limits=CAPTURE_NATIVE_JSON_LIMITS)
+    except OpenCodeIntegrationError:
+        raise
+    except Exception:
+        raise OpenCodeIntegrationError() from None
+
+
+def _bootstrap_from_document(value: object) -> IntegrationBootstrap:
+    try:
+        mapping = _exact_keys(
+            value,
+            required=frozenset(
+                {
+                    "schema_version",
+                    "profile",
+                    "connection_id",
+                    "launcher_path",
+                    "capability_digest",
+                    "bundle_digest",
+                    "receipt_mac",
+                }
+            ),
+        )
+        return decode_integration_bootstrap(canonical_json(mapping))
+    except OpenCodeIntegrationError:
+        raise
+    except Exception:
+        raise OpenCodeIntegrationError() from None
+
+
+@dataclass(frozen=True, slots=True)
+class _OpenCodeBatch:
+    source: bytes
+    document: Mapping[str, object]
+    bootstrap: IntegrationBootstrap
+    batch_id: str
+    session_id: str
+    chunk_index: int
+    chunk_count: int
+    events: tuple[object, ...]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _OpenCodeHookRuntime:
+    key: object
+    locations: object
+    spec: ProviderInstallationSpec
+    bootstrap: IntegrationBootstrap
+    registration: object
+    installation: object
+    connection: object
+
+
+def _parse_batch(source: bytes) -> _OpenCodeBatch:
+    document = _canonical_batch(source)
+    _exact_keys(
+        document,
+        required=frozenset(
+            {
+                "schema_version",
+                "bootstrap",
+                "batch_id",
+                "session_id",
+                "chunk_index",
+                "chunk_count",
+                "events",
+            }
+        ),
+    )
+    if document["schema_version"] != "capture-batch/v1":
+        raise OpenCodeIntegrationError()
+    batch_id = _exact_text(document["batch_id"], maximum=64)
+    session_id = _exact_text(document["session_id"], maximum=_MAX_SESSION_ID_BYTES)
+    chunk_index = document["chunk_index"]
+    chunk_count = document["chunk_count"]
+    events = document["events"]
+    if (
+        batch_id is None
+        or _SHA256.fullmatch(batch_id) is None
+        or session_id is None
+        or type(chunk_index) is not int
+        or type(chunk_count) is not int
+        or not 0 <= chunk_index < chunk_count <= MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION
+        or type(events) is not tuple
+        or len(events) > _MAX_REDUCED_EVENTS_PER_CHUNK
+    ):
+        raise OpenCodeIntegrationError()
+    return _OpenCodeBatch(
+        source=source,
+        document=document,
+        bootstrap=_bootstrap_from_document(document["bootstrap"]),
+        batch_id=batch_id,
+        session_id=session_id,
+        chunk_index=chunk_index,
+        chunk_count=chunk_count,
+        events=events,
+    )
+
+
+def _correlation_preimage(
+    *,
+    kind: str,
+    session_id: str,
+    identifier: str | None = None,
+    batch_id: str | None = None,
+    chunk_index: int | None = None,
+    event_index: int | None = None,
+) -> bytes:
+    body: dict[str, object] = {
+        "schema_version": "opencode-capture-correlation/v1",
+        "kind": kind,
+        "session_id": session_id,
+    }
+    if identifier is not None:
+        body["identifier"] = identifier
+    if batch_id is not None:
+        body["batch_id"] = batch_id
+    if chunk_index is not None:
+        body["chunk_index"] = chunk_index
+    if event_index is not None:
+        body["event_index"] = event_index
+    return canonical_json(body)
+
+
+def _tool_class(tool_name: str) -> str:
+    normalized = tool_name.casefold()
+    if normalized in {"bash", "shell", "terminal"}:
+        return "shell"
+    if normalized in {"apply_patch", "edit", "write", "multiedit"}:
+        return "file_write"
+    if normalized in {"read", "view_image"}:
+        return "file_read"
+    if normalized in {"grep", "glob", "search", "codesearch"}:
+        return "search"
+    if normalized in {"fetch", "webfetch", "websearch"}:
+        return "network"
+    if normalized in {"agent", "task", "subagent"}:
+        return "subagent"
+    return "other"
+
+
+class OpenCodeCaptureAdapter:
+    """Reduce one runtime-produced OpenCode batch into authenticated intake."""
+
+    __slots__ = (
+        "_bootstrap",
+        "_capability_digest",
+        "_connection_id",
+        "_host_version",
+        "_project_root",
+    )
+
+    def __init__(
+        self,
+        *,
+        connection_id: str,
+        bootstrap: IntegrationBootstrap,
+        project_root: Path,
+        host_version: str = OPENCODE_HOST_VERSION,
+    ) -> None:
+        try:
+            if (
+                type(connection_id) is not str
+                or _CONNECTION_ID.fullmatch(connection_id) is None
+                or type(bootstrap) is not IntegrationBootstrap
+                or bootstrap.profile is not OPENCODE_PROFILE
+                or bootstrap.connection_id != connection_id
+                or not isinstance(project_root, Path)
+                or not project_root.is_absolute()
+                or ".." in project_root.parts
+                or type(host_version) is not str
+                or host_version != OPENCODE_HOST_VERSION
+            ):
+                raise OpenCodeIntegrationError()
+            capability_digest = capture_capability_digest(capture_profile(OPENCODE_PROFILE))
+            if bootstrap.capability_digest != capability_digest:
+                raise OpenCodeIntegrationError()
+            self._connection_id = connection_id
+            self._bootstrap = bootstrap
+            self._project_root = project_root
+            self._host_version = host_version
+            self._capability_digest = capability_digest
+        except OpenCodeIntegrationError:
+            raise
+        except Exception:
+            raise OpenCodeIntegrationError() from None
+
+    def __repr__(self) -> str:
+        return "OpenCodeCaptureAdapter(<redacted>)"
+
+    __str__ = __repr__
+
+    def capabilities(self) -> CaptureAdapterCapabilities:
+        try:
+            return CaptureAdapterCapabilities(
+                protocol_version=CAPTURE_ADAPTER_PROTOCOL_VERSION,
+                profile_id=OPENCODE_PROFILE,
+                capability_digest=self._capability_digest,
+                host_version=self._host_version,
+            )
+        except Exception:
+            raise OpenCodeIntegrationError() from None
+
+    def _common(
+        self,
+        *,
+        context: CaptureDigestContext,
+        batch: _OpenCodeBatch,
+        kind: str,
+        event_index: int | None = None,
+        event_id: str | None = None,
+        identifier: str | None = None,
+        disposition: str = "captured",
+        session_stable: bool = False,
+    ) -> dict[str, object]:
+        producer_identifier = event_id if event_id is not None else identifier
+        return {
+            "schema_version": "capture-intake/v1",
+            "adapter_profile": OPENCODE_PROFILE.value,
+            "capability_manifest_digest": self._capability_digest,
+            "connection_id": self._connection_id,
+            "session_id": context.session_id(batch.session_id.encode("utf-8")),
+            "producer_event_digest": context.producer_event(
+                _correlation_preimage(
+                    kind=kind,
+                    session_id=batch.session_id,
+                    identifier=producer_identifier,
+                    batch_id=(None if event_id is not None or session_stable else batch.batch_id),
+                    chunk_index=(
+                        None if event_id is not None or session_stable else batch.chunk_index
+                    ),
+                    event_index=(None if event_id is not None or session_stable else event_index),
+                )
+            ),
+            "intake_tag": _ZERO_TAG,
+            "occurred_at": None,
+            "timestamp_authority": "unavailable",
+            "producer_sequence": None,
+            "sequence_authority": "unavailable",
+            "capture_disposition": disposition,
+        }
+
+    @staticmethod
+    def _authenticated(
+        values: Mapping[str, object],
+        *,
+        context: CaptureDigestContext,
+    ) -> CaptureIntake:
+        return authenticate_capture_intake(
+            validate_capture_intake(dict(values)),
+            context=context,
+        )
+
+    def _event_intake(
+        self,
+        value: object,
+        *,
+        batch: _OpenCodeBatch,
+        event_index: int,
+        context: CaptureDigestContext,
+    ) -> CaptureIntake:
+        if not isinstance(value, Mapping) or any(type(key) is not str for key in value):
+            raise OpenCodeIntegrationError()
+        event = value
+        kind = _exact_text(event.get("kind"), maximum=64)
+        if kind is None:
+            raise OpenCodeIntegrationError()
+
+        if kind == "oversize":
+            _exact_keys(event, required=frozenset({"kind", "reason", "session_id"}))
+            if event["reason"] != "event_limit":
+                raise OpenCodeIntegrationError()
+            common = self._common(
+                context=context,
+                batch=batch,
+                kind="oversize:event_limit",
+                event_index=event_index,
+                disposition="degraded",
+            )
+            common.update(kind="controller_failed", error_code="overflow", failure_signature=None)
+            return self._authenticated(common, context=context)
+
+        optional_event_id = frozenset({"event_id"})
+        if kind == "tool_started":
+            event = _exact_keys(
+                event,
+                required=frozenset({"kind", "session_id", "call_id", "tool", "identity_authority"}),
+                optional=optional_event_id | {"input"},
+            )
+            call_id = _exact_text(event["call_id"], maximum=_MAX_CALL_ID_BYTES)
+            tool = _exact_text(event["tool"], maximum=_MAX_TOOL_NAME_BYTES)
+            authority = event["identity_authority"]
+            has_input = "input" in event
+            if (
+                call_id is None
+                or tool is None
+                or authority not in {"exact", "unavailable"}
+                or (authority == "exact") is not has_input
+            ):
+                raise OpenCodeIntegrationError()
+            event_id = (
+                None
+                if "event_id" not in event
+                else _exact_text(event["event_id"], maximum=_MAX_EVENT_ID_BYTES)
+            )
+            if "event_id" in event and event_id is None:
+                raise OpenCodeIntegrationError()
+            call_material = _correlation_preimage(
+                kind="tool_call",
+                session_id=batch.session_id,
+                identifier=call_id,
+            )
+            common = self._common(
+                context=context,
+                batch=batch,
+                kind="tool_started",
+                event_index=event_index,
+                event_id=event_id,
+                identifier=f"{call_id}:started",
+            )
+            common.update(
+                kind="action_started",
+                call_ref=context.call_ref(call_material),
+                action_digest=(
+                    context.action_identity(
+                        canonical_json(
+                            {
+                                "schema_version": "opencode-action-identity/v1",
+                                "tool": tool,
+                                "input": event["input"],
+                            }
+                        )
+                    )
+                    if authority == "exact"
+                    else context.unavailable_action_identity(call_material)
+                ),
+                workspace_digest=context.workspace_identity(os.fsencode(self._project_root)),
+                environment_digest=context.environment_identity(
+                    canonical_json(
+                        {
+                            "schema_version": "opencode-capture-environment/v1",
+                            "profile": OPENCODE_PROFILE.value,
+                            "host_version": self._host_version,
+                        }
+                    )
+                ),
+                tool_class=_tool_class(tool),
+                identity_authority=authority,
+            )
+            return self._authenticated(common, context=context)
+
+        if kind == "tool_finished":
+            event = _exact_keys(
+                event,
+                required=frozenset({"kind", "session_id", "call_id", "outcome"}),
+                optional=optional_event_id,
+            )
+            call_id = _exact_text(event["call_id"], maximum=_MAX_CALL_ID_BYTES)
+            outcome = event["outcome"]
+            if call_id is None or outcome not in {"succeeded", "failed"}:
+                raise OpenCodeIntegrationError()
+            event_id = (
+                None
+                if "event_id" not in event
+                else _exact_text(event["event_id"], maximum=_MAX_EVENT_ID_BYTES)
+            )
+            if "event_id" in event and event_id is None:
+                raise OpenCodeIntegrationError()
+            common = self._common(
+                context=context,
+                batch=batch,
+                kind="tool_finished",
+                event_index=event_index,
+                event_id=event_id,
+                identifier=f"{call_id}:finished:{outcome}",
+            )
+            common.update(
+                kind="action_finished",
+                call_ref=context.call_ref(
+                    _correlation_preimage(
+                        kind="tool_call",
+                        session_id=batch.session_id,
+                        identifier=call_id,
+                    )
+                ),
+                outcome_status=outcome,
+                outcome_authority="producer_claimed_structured",
+                exit_status=None,
+                error_code=None if outcome == "succeeded" else "tool_error",
+                failure_signature=None,
+            )
+            return self._authenticated(common, context=context)
+
+        if kind == "coverage_degraded":
+            event = _exact_keys(
+                event,
+                required=frozenset({"kind", "session_id", "reason"}),
+            )
+            reason = event["reason"]
+            if reason not in {
+                "invalid_transition",
+                "missing_field",
+                "overflow",
+                "transport_gap",
+            }:
+                raise OpenCodeIntegrationError()
+            common = self._common(
+                context=context,
+                batch=batch,
+                kind=f"coverage_degraded:{reason}",
+                event_index=event_index,
+                identifier="transport_gap" if reason == "transport_gap" else None,
+                disposition="degraded",
+                session_stable=reason == "transport_gap",
+            )
+            common.update(
+                kind="controller_failed",
+                error_code=(
+                    "overflow"
+                    if reason == "overflow"
+                    else "gap_detected"
+                    if reason == "transport_gap"
+                    else "invalid_transition"
+                ),
+                failure_signature=None,
+            )
+            return self._authenticated(common, context=context)
+
+        event = _exact_keys(
+            event,
+            required=frozenset({"kind", "session_id"}),
+            optional=optional_event_id,
+        )
+        if kind not in {
+            "turn_finished",
+            "controller_failed",
+            "coverage_boundary",
+            "session_finished",
+        }:
+            raise OpenCodeIntegrationError()
+        event_id = (
+            None
+            if "event_id" not in event
+            else _exact_text(event["event_id"], maximum=_MAX_EVENT_ID_BYTES)
+        )
+        if "event_id" in event and event_id is None:
+            raise OpenCodeIntegrationError()
+        common = self._common(
+            context=context,
+            batch=batch,
+            kind=kind,
+            event_index=event_index,
+            event_id=event_id,
+        )
+        if kind == "turn_finished":
+            common.update(
+                kind="turn_finished",
+                turn_id=context.turn_id(
+                    _correlation_preimage(
+                        kind="turn",
+                        session_id=batch.session_id,
+                        identifier=event_id,
+                        batch_id=None if event_id is not None else batch.batch_id,
+                        chunk_index=None if event_id is not None else batch.chunk_index,
+                        event_index=None if event_id is not None else event_index,
+                    )
+                ),
+            )
+        elif kind == "controller_failed":
+            common.update(
+                kind="controller_failed",
+                error_code="provider_callback_failed",
+                failure_signature=None,
+            )
+        elif kind == "coverage_boundary":
+            common["capture_disposition"] = "coverage_boundary"
+            common.update(
+                kind="turn_finished",
+                turn_id=context.turn_id(
+                    _correlation_preimage(
+                        kind="coverage_boundary",
+                        session_id=batch.session_id,
+                        identifier=event_id,
+                        batch_id=None if event_id is not None else batch.batch_id,
+                        chunk_index=None if event_id is not None else batch.chunk_index,
+                        event_index=None if event_id is not None else event_index,
+                    )
+                ),
+            )
+        else:
+            common["kind"] = "session_finished"
+        return self._authenticated(common, context=context)
+
+    @staticmethod
+    def _validate_event_session(value: object, session_id: str) -> None:
+        if not isinstance(value, Mapping) or any(type(key) is not str for key in value):
+            raise OpenCodeIntegrationError()
+        event = value
+        if _exact_text(event.get("session_id"), maximum=_MAX_SESSION_ID_BYTES) != session_id:
+            raise OpenCodeIntegrationError()
+
+    def _validated_batch(self, source: bytes) -> _OpenCodeBatch:
+        batch = _parse_batch(source)
+        if batch.bootstrap != self._bootstrap:
+            raise OpenCodeIntegrationError()
+        for event in batch.events:
+            self._validate_event_session(event, batch.session_id)
+        return batch
+
+    def transport_chunk(
+        self,
+        source: bytes,
+        *,
+        context: CaptureDigestContext,
+    ) -> CaptureTransportChunk:
+        """Commit only receiver-keyed coordinates for one canonical chunk."""
+
+        try:
+            if type(context) is not CaptureDigestContext:
+                raise OpenCodeIntegrationError()
+            batch = self._validated_batch(source)
+            return CaptureTransportChunk(
+                connection_id=self._connection_id,
+                session_id=context.session_id(batch.session_id.encode("utf-8")),
+                batch_ref=context.transport_batch_ref(batch.batch_id.encode("ascii")),
+                chunk_index=batch.chunk_index,
+                chunk_count=batch.chunk_count,
+                chunk_digest=context.transport_chunk_digest(source),
+            )
+        except OpenCodeIntegrationError:
+            raise
+        except Exception:
+            raise OpenCodeIntegrationError() from None
+
+    def adapt_bytes(
+        self,
+        source: bytes,
+        *,
+        context: CaptureDigestContext,
+    ) -> tuple[CaptureIntake, ...]:
+        """Reduce one canonical bridge chunk; raw bytes never leave this call."""
+
+        try:
+            if type(context) is not CaptureDigestContext:
+                raise OpenCodeIntegrationError()
+            batch = self._validated_batch(source)
+            started = self._common(
+                context=context,
+                batch=batch,
+                kind="session_started",
+                identifier="window",
+                session_stable=True,
+            )
+            started["kind"] = "session_started"
+            intakes = [self._authenticated(started, context=context)]
+            intakes.extend(
+                self._event_intake(
+                    event,
+                    batch=batch,
+                    event_index=index,
+                    context=context,
+                )
+                for index, event in enumerate(batch.events)
+            )
+            if len(intakes) > MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION:
+                raise OpenCodeIntegrationError()
+            return tuple(intakes)
+        except OpenCodeIntegrationError:
+            raise
+        except Exception:
+            raise OpenCodeIntegrationError() from None
+
+
+def _bundle_bytes() -> bytes:
+    try:
+        data = (
+            resources.files("saliencegate.integrations")
+            .joinpath("assets")
+            .joinpath("opencode-plugin.js")
+            .read_bytes()
+        )
+        if not data:
+            raise OpenCodeIntegrationError()
+        return data
+    except OpenCodeIntegrationError:
+        raise
+    except Exception:
+        raise OpenCodeIntegrationError() from None
+
+
+def provider_installation_spec(
+    project: Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+    host_version: str = OPENCODE_HOST_VERSION,
+) -> ProviderInstallationSpec:
+    """Describe one configless project-local OpenCode plugin installation."""
+
+    try:
+        if (
+            not isinstance(project, Path)
+            or not project.is_absolute()
+            or ".." in project.parts
+            or not project.is_dir()
+            or project.is_symlink()
+            or host_version != OPENCODE_HOST_VERSION
+        ):
+            raise OpenCodeIntegrationError()
+        environment = os.environ if environ is None else environ
+        if not isinstance(environment, Mapping) or any(
+            type(key) is not str or type(value) is not str for key, value in environment.items()
+        ):
+            raise OpenCodeIntegrationError()
+        configured_home = environment.get("HOME")
+        home = Path.home() if configured_home is None else Path(configured_home)
+        locations = resolve_capture_store_locations(environ=environment, home=home)
+        project_locator = hashlib.sha256(
+            canonical_json(
+                {
+                    "schema_version": "opencode-installation-location/v1",
+                    "project_root": os.fspath(project),
+                }
+            )
+        ).hexdigest()
+        operational = locations.state_directory / "integrations" / project_locator / "opencode"
+        plugin_directory = project / ".opencode" / "plugins"
+        launcher = operational / ("capture-hook.cmd" if os.name == "nt" else "capture-hook")
+        placeholder = (
+            b"@exit /b 0\r\n"
+            if os.name == "nt"  # pragma: no cover - exercised by native Windows R01
+            else b"#!/bin/sh\nexit 0\n"
+        )
+        return ProviderInstallationSpec(
+            installation_kind=ProviderInstallationKind.BRIDGE,
+            provider_id="opencode",
+            profile=OPENCODE_PROFILE,
+            host_version=host_version,
+            project_root=project,
+            config_path=None,
+            config=None,
+            bundle_path=plugin_directory / "saliencegate.js",
+            bootstrap_path=plugin_directory / "saliencegate.bootstrap.json",
+            receipt_path=operational / "receipt.json",
+            journal_path=operational / "journal.json",
+            lock_path=operational / "install.lock",
+            launcher_path=launcher,
+            capability_digest=capture_capability_digest(capture_profile(OPENCODE_PROFILE)),
+            bundle_bytes=_bundle_bytes(),
+            launcher_bytes=placeholder,
+            bootstrap_relative_reference=OPENCODE_BOOTSTRAP_REFERENCE,
+            generation=1,
+        )
+    except OpenCodeIntegrationError:
+        raise
+    except Exception:
+        raise OpenCodeIntegrationError() from None
+
+
+def build_capture_hook_dependencies(
+    source: bytes,
+    *,
+    connection_id: str,
+    environ: Mapping[str, str] | None = None,
+    capture_executable: str | os.PathLike[str] | Path | None = None,
+) -> CaptureHookDependencies:
+    """Authenticate an installed OpenCode runtime before admitting one batch."""
+
+    try:
+        from saliencegate.capture.connections import CaptureConnectionSummary
+        from saliencegate.capture.health import CaptureHealthCode
+        from saliencegate.capture.locations import CaptureStoreLocations
+        from saliencegate.capture.spool import CaptureSpool
+        from saliencegate.capture.store import (
+            CaptureConnectionState,
+            CaptureStore,
+            CaptureStoreMode,
+        )
+        from saliencegate.commands.capture.connect import materialize_provider_launcher
+        from saliencegate.integrations.bootstrap import inspect_integration_bootstrap
+        from saliencegate.integrations.hook import CaptureHookDependencies
+        from saliencegate.integrations.installation import (
+            InstallationReceipt,
+            InstallationState,
+            InstallationStatus,
+            derive_installation_identity,
+            inspect_installation_receipt,
+            inspect_provider_installation,
+        )
+        from saliencegate.integrations.registry import (
+            BUILTIN_PROVIDER_REGISTRY,
+            ProviderAlias,
+            ProviderRegistration,
+        )
+        from saliencegate.security import InstallationKey, load_installation_key
+
+        if (
+            type(source) is not bytes
+            or type(connection_id) is not str
+            or _CONNECTION_ID.fullmatch(connection_id) is None
+            or (environ is not None and not isinstance(environ, Mapping))
+        ):
+            raise OpenCodeIntegrationError()
+        environment = dict(os.environ if environ is None else environ)
+        if any(
+            type(key) is not str or type(value) is not str for key, value in environment.items()
+        ):
+            raise OpenCodeIntegrationError()
+        batch = _parse_batch(source)
+        if (
+            batch.bootstrap.profile is not OPENCODE_PROFILE
+            or batch.bootstrap.connection_id != connection_id
+        ):
+            raise OpenCodeIntegrationError()
+        key = load_installation_key(environ=environment)
+        receipt_path = batch.bootstrap.launcher_path.parent / "receipt.json"
+        receipt = inspect_installation_receipt(receipt_path, key)
+        bundle_path = receipt.bundle_path
+        bootstrap_path = receipt.bootstrap_path
+        if (
+            receipt.state is not InstallationState.ENABLED
+            or receipt.provider_id != "opencode"
+            or receipt.profile is not OPENCODE_PROFILE
+            or receipt.host_version != OPENCODE_HOST_VERSION
+            or receipt.connection_id != connection_id
+            or receipt.launcher_path != batch.bootstrap.launcher_path
+            or receipt.receipt_mac != batch.bootstrap.receipt_mac
+            or receipt.capability_digest != batch.bootstrap.capability_digest
+            or receipt.bundle_digest != batch.bootstrap.bundle_digest
+            or bundle_path is None
+            or bootstrap_path is None
+            or bundle_path.name != "saliencegate.js"
+            or bundle_path.parent.name != "plugins"
+            or bundle_path.parent.parent.name != ".opencode"
+        ):
+            raise OpenCodeIntegrationError()
+        project = bundle_path.parent.parent.parent
+        if bootstrap_path != bundle_path.parent / "saliencegate.bootstrap.json":
+            raise OpenCodeIntegrationError()
+        spec = provider_installation_spec(
+            project,
+            environ=environment,
+            host_version=receipt.host_version,
+        )
+        spec = materialize_provider_launcher(
+            spec,
+            key,
+            capture_executable=capture_executable,
+        )
+        identity = derive_installation_identity(spec, key)
+        if (
+            spec.receipt_path != receipt_path
+            or identity.connection_id != connection_id
+            or identity.project_digest != receipt.project_digest
+        ):
+            raise OpenCodeIntegrationError()
+        registration = BUILTIN_PROVIDER_REGISTRY.resolve(
+            ProviderAlias.OPENCODE,
+            require_available=True,
+        )
+        if (
+            registration.profile is not OPENCODE_PROFILE
+            or registration.host_version != OPENCODE_HOST_VERSION
+        ):
+            raise OpenCodeIntegrationError()
+        configured_home = environment.get("HOME")
+        home = Path.home() if configured_home is None else Path(configured_home)
+        locations = resolve_capture_store_locations(environ=environment, home=home)
+        with CaptureStore.open(
+            locations.database_path,
+            installation_key=key,
+            busy_timeout_ms=_HOOK_STORE_BUSY_TIMEOUT_MS,
+            mode=CaptureStoreMode.HOOK,
+        ) as store:
+            connection = store.get_connection(connection_id)
+        installation = inspect_provider_installation(spec, key)
+        installed_bootstrap = inspect_integration_bootstrap(bootstrap_path)
+        if (
+            installation.state is not InstallationState.ENABLED
+            or not installation.installed
+            or installation.drift
+            or installation.connection_id != connection_id
+            or installed_bootstrap != batch.bootstrap
+            or connection.state is not CaptureConnectionState.ENABLED
+            or connection.project_digest != identity.project_digest
+            or connection.profile_id is not OPENCODE_PROFILE
+            or connection.capability_manifest_digest != spec.capability_digest
+            or connection.host_version != spec.host_version
+        ):
+            raise OpenCodeIntegrationError()
+        runtime = _OpenCodeHookRuntime(
+            key=key,
+            locations=locations,
+            spec=spec,
+            bootstrap=installed_bootstrap,
+            registration=registration,
+            installation=installation,
+            connection=connection,
+        )
+
+        def checked_runtime(value: object) -> _OpenCodeHookRuntime:
+            if value is not runtime:
+                raise OpenCodeIntegrationError()
+            return runtime
+
+        def validate_registry(profile: CaptureProfile) -> object:
+            if profile is not OPENCODE_PROFILE:
+                raise OpenCodeIntegrationError()
+            return registration
+
+        def validate_receipt(
+            profile: CaptureProfile,
+            candidate_connection_id: str,
+            candidate_registry: object,
+        ) -> object:
+            if (
+                profile is not OPENCODE_PROFILE
+                or candidate_connection_id != connection_id
+                or candidate_registry is not registration
+            ):
+                raise OpenCodeIntegrationError()
+            return installation
+
+        def validate_connection(
+            profile: CaptureProfile,
+            candidate_connection_id: str,
+            candidate_registry: object,
+            candidate_receipt: object,
+        ) -> object:
+            if (
+                profile is not OPENCODE_PROFILE
+                or candidate_connection_id != connection_id
+                or candidate_registry is not registration
+                or candidate_receipt is not installation
+            ):
+                raise OpenCodeIntegrationError()
+            return runtime
+
+        def load_context(candidate: object) -> CaptureDigestContext:
+            selected = checked_runtime(candidate)
+            if type(selected.key) is not InstallationKey:
+                raise OpenCodeIntegrationError()
+            return CaptureDigestContext(selected.key)
+
+        def resolve_adapter(candidate: object) -> OpenCodeCaptureAdapter:
+            selected = checked_runtime(candidate)
+            if (
+                type(selected.connection) is not CaptureConnectionSummary
+                or type(selected.bootstrap) is not IntegrationBootstrap
+            ):
+                raise OpenCodeIntegrationError()
+            return OpenCodeCaptureAdapter(
+                connection_id=selected.connection.connection_id,
+                bootstrap=selected.bootstrap,
+                project_root=selected.spec.project_root,
+                host_version=selected.connection.host_version,
+            )
+
+        def open_store(candidate: object) -> CaptureStore:
+            selected = checked_runtime(candidate)
+            if (
+                type(selected.key) is not InstallationKey
+                or type(selected.locations) is not CaptureStoreLocations
+            ):
+                raise OpenCodeIntegrationError()
+            return CaptureStore.open(
+                selected.locations.database_path,
+                installation_key=selected.key,
+                busy_timeout_ms=_HOOK_STORE_BUSY_TIMEOUT_MS,
+                mode=CaptureStoreMode.HOOK,
+            )
+
+        def open_spool(candidate: object) -> CaptureSpool:
+            selected = checked_runtime(candidate)
+            if (
+                type(selected.key) is not InstallationKey
+                or type(selected.locations) is not CaptureStoreLocations
+            ):
+                raise OpenCodeIntegrationError()
+            return CaptureSpool.open(selected.locations, selected.key)
+
+        pseudonymous_session_id = CaptureDigestContext(key).session_id(
+            batch.session_id.encode("utf-8")
+        )
+
+        def mark_health(candidate: object, code: CaptureHealthCode) -> None:
+            selected = checked_runtime(candidate)
+            if (
+                type(code) is not CaptureHealthCode
+                or type(selected.key) is not InstallationKey
+                or type(selected.locations) is not CaptureStoreLocations
+                or type(selected.connection) is not CaptureConnectionSummary
+            ):
+                raise OpenCodeIntegrationError()
+            with CaptureStore.open(
+                selected.locations.database_path,
+                installation_key=selected.key,
+                busy_timeout_ms=_HOOK_STORE_BUSY_TIMEOUT_MS,
+                mode=CaptureStoreMode.HOOK,
+            ) as health_store:
+                health_store.mark_session_health(
+                    selected.connection.connection_id,
+                    pseudonymous_session_id,
+                    code,
+                )
+
+        if (
+            type(registration) is not ProviderRegistration
+            or type(receipt) is not InstallationReceipt
+            or type(installation) is not InstallationStatus
+            or type(connection) is not CaptureConnectionSummary
+        ):
+            raise OpenCodeIntegrationError()
+        return CaptureHookDependencies(
+            validate_registry=validate_registry,
+            validate_receipt=validate_receipt,
+            validate_connection=validate_connection,
+            load_context=load_context,
+            resolve_adapter=resolve_adapter,
+            open_store=open_store,
+            open_spool=open_spool,
+            mark_health=mark_health,
+        )
+    except OpenCodeIntegrationError:
+        raise
+    except Exception:
+        raise OpenCodeIntegrationError() from None
+
+
+__all__ = [
+    "OPENCODE_BOOTSTRAP_REFERENCE",
+    "OPENCODE_HOST_VERSION",
+    "OPENCODE_PROFILE",
+    "OpenCodeCaptureAdapter",
+    "OpenCodeIntegrationError",
+    "build_capture_hook_dependencies",
+    "provider_installation_spec",
+]

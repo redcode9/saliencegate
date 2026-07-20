@@ -29,6 +29,8 @@ _DOMAINS = {
     "failure_signature": b"saliencegate:capture:failure-signature:v1",
     "subagent_id": b"saliencegate:capture:subagent-id:v1",
     "turn_id": b"saliencegate:capture:turn-id:v1",
+    "transport_batch_ref": b"saliencegate:capture:transport-batch-ref:v1",
+    "transport_chunk_digest": b"saliencegate:capture:transport-chunk-digest:v1",
     "integrity_tag": b"saliencegate:capture:integrity-tag:v1",
 }
 
@@ -107,6 +109,16 @@ class CaptureDigestContext:
 
     def turn_id(self, value: bytes) -> str:
         return self._derive("turn_id", value)
+
+    def transport_batch_ref(self, value: bytes) -> str:
+        """Pseudonymize one bridge-local batch identifier."""
+
+        return self._derive("transport_batch_ref", value)
+
+    def transport_chunk_digest(self, value: bytes) -> str:
+        """Key the exact canonical bytes of one bounded bridge chunk."""
+
+        return self._derive("transport_chunk_digest", value)
 
     def integrity_tag(self, value: bytes) -> str:
         return self._derive("integrity_tag", value)

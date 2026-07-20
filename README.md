@@ -114,8 +114,8 @@ uv --cache-dir /private/tmp/saliencegate-uv-cache run --python 3.12.3 --locked \
   python scripts/benchmark_shadow_trace.py --assert-budgets
 ```
 
-On that one macOS machine, five isolated 1,000-record runs produced medians of 4.719111875 seconds
-for memory and 7.412707417 seconds for SQLite, within budgets of 5 and 15 seconds. Peak RSS stayed
+On that one macOS machine, five isolated 1,000-record runs produced medians of 4.511588875 seconds
+for memory and 7.240622834 seconds for SQLite, within budgets of 5 and 15 seconds. Peak RSS stayed
 within the 512 MiB budget. These numbers are a reproducible local reference, not a cross-machine,
 provider-latency, or agent-quality claim.
 

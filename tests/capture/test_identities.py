@@ -27,6 +27,8 @@ DOMAINS = {
     "failure_signature": b"saliencegate:capture:failure-signature:v1",
     "subagent_id": b"saliencegate:capture:subagent-id:v1",
     "turn_id": b"saliencegate:capture:turn-id:v1",
+    "transport_batch_ref": b"saliencegate:capture:transport-batch-ref:v1",
+    "transport_chunk_digest": b"saliencegate:capture:transport-chunk-digest:v1",
     "integrity_tag": b"saliencegate:capture:integrity-tag:v1",
 }
 

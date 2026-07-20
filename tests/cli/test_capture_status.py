@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 from tests.capture.store_support import INSTALLATION_KEY, authenticated_intake, register_connection
-from tests.cli.test_capture_connect import _command_hook_spec
+from tests.cli.test_capture_connect import _command_hook_spec, _configless_bridge_spec
 
 from saliencegate.capture import (
     CaptureConnectionState,
@@ -202,6 +202,43 @@ def test_status_does_not_require_bridge_assets_for_command_hook_installation(
     assert report.providers[0].drift == ()
     assert CaptureStatusDrift.BUNDLE not in report.providers[0].drift
     assert CaptureStatusDrift.BOOTSTRAP not in report.providers[0].drift
+
+
+def test_status_accepts_configless_bridge_and_reports_only_asset_drift(tmp_path: Path) -> None:
+    spec = _configless_bridge_spec(tmp_path)
+    environment = _environment(tmp_path)
+
+    def resolver(alias: ProviderAlias, project: Path) -> ProviderInstallationSpec:
+        del alias, project
+        return spec
+
+    run_connect(
+        provider="codex",
+        project=spec.project_root,
+        environ=environment,
+        spec_resolver=resolver,
+    )
+
+    healthy = run_status(
+        provider="codex",
+        project=spec.project_root,
+        environ=environment,
+        spec_resolver=resolver,
+    )
+    assert healthy.providers[0].status is CaptureOperationalStatus.INSTALLED_NOT_OBSERVED
+    assert healthy.providers[0].drift == ()
+
+    spec.bundle_path.unlink()
+    drifted = run_status(
+        provider="codex",
+        project=spec.project_root,
+        environ=environment,
+        spec_resolver=resolver,
+    )
+
+    assert drifted.providers[0].status is CaptureOperationalStatus.DRIFTED
+    assert drifted.providers[0].drift == (CaptureStatusDrift.BUNDLE,)
+    assert CaptureStatusDrift.CONFIG not in drifted.providers[0].drift
 
 
 def test_status_without_capture_is_read_only_and_reports_all_providers(tmp_path: Path) -> None:

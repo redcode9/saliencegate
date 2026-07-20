@@ -33,6 +33,7 @@ from saliencegate.capture.identities import CaptureDigestContext
 from saliencegate.capture.locations import _capture_spool_boundary_digest
 from saliencegate.capture.migrations import (
     CaptureMigrationError,
+    _validate_capture_store_schema_metadata,
     validate_capture_store_schema,
 )
 from saliencegate.capture.publication import verify_capture_intake_authentication
@@ -42,6 +43,13 @@ from saliencegate.capture.schema import (
     canonical_capture_event,
     canonical_capture_intake,
     load_capture_event,
+)
+from saliencegate.capture.transport import (
+    MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION,
+    CaptureTransportChunk,
+    CaptureTransportDisposition,
+    CaptureTransportReceipt,
+    validate_capture_transport_chunk,
 )
 from saliencegate.domain import canonical_json
 from saliencegate.domain.records import ComponentIdentifier, Sha256Digest
@@ -79,6 +87,12 @@ _HOST_VERSION = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){1,3}$")
 _PROJECT_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _HUMAN_SESSION_ID = re.compile(r"^[a-z2-7]{12,52}$")
 _MAX_CAPTURE_QUERY_RESULTS: Final = 1_000
+_TRANSPORT_PROFILES: Final = frozenset(
+    (
+        CaptureProfile.OPENCODE_PLUGIN_V1.value,
+        CaptureProfile.PI_EXTENSION_V1.value,
+    )
+)
 
 
 class CaptureStoreError(RuntimeError):
@@ -222,6 +236,9 @@ class _CaptureStoreIntegrity:
         "session": b"saliencegate:capture-store:session:v1",
         "event": b"saliencegate:capture-store:event:v1",
         "head": b"saliencegate:capture-store:head:v1",
+        "transport_receipt": b"saliencegate:capture-store:transport-receipt:v1",
+        "transport_head": b"saliencegate:capture-store:transport-head:v1",
+        "transport_intake_set": b"saliencegate:capture-store:transport-intake-set:v1",
         "health_id": b"saliencegate:capture-store:health-id:v1",
         "health": b"saliencegate:capture-store:health:v1",
         "health_set": b"saliencegate:capture-store:health-set:v1",
@@ -284,7 +301,7 @@ def _connection_material(row: sqlite3.Row | dict[str, object]) -> dict[str, obje
 
 
 def _session_material(row: sqlite3.Row | dict[str, object]) -> dict[str, object]:
-    return {
+    material: dict[str, object] = {
         "schema_version": "capture-session-integrity/v1",
         "connection_id": row["connection_id"],
         "session_id": row["session_id"],
@@ -299,6 +316,11 @@ def _session_material(row: sqlite3.Row | dict[str, object]) -> dict[str, object]
         "updated_at": row["updated_at"],
         "closed_at": row["closed_at"],
     }
+    if row["transport_required"] == 1:
+        material["schema_version"] = "capture-session-integrity/v2"
+        material["transport_required"] = 1
+        material["transport_head_tag"] = row["transport_head_tag"]
+    return material
 
 
 def _event_material(
@@ -340,6 +362,43 @@ def _head_material(
         "session_id": session_id,
         "receipt_count": receipt_count,
         "head_event_tag": head_event_tag,
+    }
+
+
+def _transport_receipt_material(
+    row: sqlite3.Row | dict[str, object],
+) -> dict[str, object]:
+    return {
+        "schema_version": "capture-transport-receipt-integrity/v1",
+        "connection_id": row["connection_id"],
+        "session_id": row["session_id"],
+        "transport_ordinal": row["transport_ordinal"],
+        "batch_ref": row["batch_ref"],
+        "chunk_index": row["chunk_index"],
+        "chunk_count": row["chunk_count"],
+        "chunk_digest": row["chunk_digest"],
+        "intake_count": row["intake_count"],
+        "intake_set_digest": row["intake_set_digest"],
+        "post_event_count": row["post_event_count"],
+        "post_head_event_tag": row["post_head_event_tag"],
+        "previous_receipt_tag": row["previous_receipt_tag"],
+        "admitted_at": row["admitted_at"],
+    }
+
+
+def _transport_head_material(
+    *,
+    connection_id: str,
+    session_id: str,
+    receipt_count: int,
+    head_receipt_tag: str | None,
+) -> dict[str, object]:
+    return {
+        "schema_version": "capture-transport-head-integrity/v1",
+        "connection_id": connection_id,
+        "session_id": session_id,
+        "receipt_count": receipt_count,
+        "head_receipt_tag": head_receipt_tag,
     }
 
 
@@ -431,6 +490,11 @@ class CaptureStore:
         authorization: StableFileAuthorization | WindowsSQLiteAuthorization | None = None
         connection: sqlite3.Connection | None = None
         opened = False
+        validate_schema = (
+            _validate_capture_store_schema_metadata
+            if mode is CaptureStoreMode.HOOK
+            else validate_capture_store_schema
+        )
         try:
             raw_path = os.fspath(path)
             if type(raw_path) is not str or not raw_path:
@@ -453,7 +517,7 @@ class CaptureStore:
                     uri=True,
                 )
                 try:
-                    validate_capture_store_schema(preflight)
+                    validate_schema(preflight)
                 finally:
                     preflight.close()
                 database_authorization.revalidate()
@@ -478,7 +542,7 @@ class CaptureStore:
                     uri=True,
                 )
                 try:
-                    validate_capture_store_schema(preflight)
+                    validate_schema(preflight)
                 finally:
                     preflight.close()
                 location.revalidate()
@@ -496,7 +560,7 @@ class CaptureStore:
             )
             connection.row_factory = sqlite3.Row
             authorization._revalidate_before_sqlite_statements()
-            validate_capture_store_schema(connection)
+            validate_schema(connection)
             cls._configure_connection(connection, busy_timeout_ms=busy_timeout_ms)
             authorization.revalidate()
             instance = cls.__new__(cls)
@@ -510,12 +574,12 @@ class CaptureStore:
             instance._fault_injector = _fault_injector
             instance._verified_append_heads = {}
             instance._verified_data_version = instance._database_data_version()
-            # The hook is a latency-sensitive append-only caller.  It authenticates
-            # the complete target chain on first observation and after any peer
-            # commit, then verifies the authenticated tip for same-connection
-            # extensions.  A whole-database audit here would make each provider
-            # callback scale with all retained capture history.  Maintenance callers
-            # retain the fail-closed full audit before use.
+            # The hook is a latency-sensitive append-only caller.  Its open path has
+            # already validated schema identity, migration history, and inventory
+            # without scanning retained rows.  It authenticates the complete target
+            # chain on first observation and after any peer commit, then verifies the
+            # authenticated tip for same-connection extensions.  Maintenance callers
+            # retain the fail-closed whole-database checks and full audit before use.
             if mode is CaptureStoreMode.MAINTENANCE:
                 instance._verify_all_state()
             opened = True
@@ -664,7 +728,7 @@ class CaptureStore:
         connection.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
         connection.execute("PRAGMA trusted_schema = OFF")
         connection.execute("PRAGMA temp_store = MEMORY")
-        journal = connection.execute("PRAGMA journal_mode = WAL").fetchone()
+        journal = connection.execute("PRAGMA journal_mode").fetchone()
         connection.execute("PRAGMA synchronous = FULL")
         if (
             journal is None
@@ -1353,6 +1417,19 @@ class CaptureStore:
         ).fetchone()
         if row is None:
             return None
+        if (
+            type(row["transport_required"]) is not int
+            or row["transport_required"] not in (0, 1)
+            or (row["transport_required"] == 0 and row["transport_head_tag"] is not None)
+            or (
+                row["transport_required"] == 1
+                and (
+                    type(row["transport_head_tag"]) is not str
+                    or _PROJECT_DIGEST.fullmatch(row["transport_head_tag"]) is None
+                )
+            )
+        ):
+            raise CaptureStoreIntegrityError()
         expected = self._integrity.tag("session", _session_material(row))
         if type(row["row_tag"]) is not str or not hmac.compare_digest(row["row_tag"], expected):
             raise CaptureStoreIntegrityError()
@@ -1380,6 +1457,225 @@ class CaptureStore:
         if type(row["head_tag"]) is not str or not hmac.compare_digest(row["head_tag"], expected):
             raise CaptureStoreIntegrityError()
         return cast(sqlite3.Row, row)
+
+    def _create_transport_head(
+        self,
+        connection_id: str,
+        session_id: str,
+        *,
+        profile_id: str,
+    ) -> None:
+        if profile_id not in _TRANSPORT_PROFILES:
+            return
+        head_tag = self._transport_head_tag(
+            connection_id,
+            session_id,
+            receipt_count=0,
+            head_receipt_tag=None,
+        )
+        self._connection.execute(
+            """
+            INSERT INTO capture_transport_heads(
+                connection_id, session_id, receipt_count,
+                head_receipt_tag, head_tag
+            ) VALUES (?, ?, 0, NULL, ?)
+            """,
+            (connection_id, session_id, head_tag),
+        )
+
+    def _transport_head_tag(
+        self,
+        connection_id: str,
+        session_id: str,
+        *,
+        receipt_count: int,
+        head_receipt_tag: str | None,
+    ) -> str:
+        return self._integrity.tag(
+            "transport_head",
+            _transport_head_material(
+                connection_id=connection_id,
+                session_id=session_id,
+                receipt_count=receipt_count,
+                head_receipt_tag=head_receipt_tag,
+            ),
+        )
+
+    def _transport_head_row(
+        self,
+        connection_id: str,
+        session_id: str,
+    ) -> sqlite3.Row | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM capture_transport_heads
+            WHERE connection_id = ? AND session_id = ?
+            """,
+            (connection_id, session_id),
+        ).fetchone()
+        if row is None:
+            return None
+        expected = self._integrity.tag(
+            "transport_head",
+            _transport_head_material(
+                connection_id=connection_id,
+                session_id=session_id,
+                receipt_count=row["receipt_count"],
+                head_receipt_tag=row["head_receipt_tag"],
+            ),
+        )
+        if type(row["head_tag"]) is not str or not hmac.compare_digest(row["head_tag"], expected):
+            raise CaptureStoreIntegrityError()
+        return cast(sqlite3.Row, row)
+
+    def _load_verified_transport_receipt(self, row: sqlite3.Row) -> sqlite3.Row:
+        try:
+            expected = self._integrity.tag(
+                "transport_receipt",
+                _transport_receipt_material(row),
+            )
+            if (
+                type(row["connection_id"]) is not str
+                or type(row["session_id"]) is not str
+                or type(row["transport_ordinal"]) is not int
+                or type(row["batch_ref"]) is not str
+                or type(row["chunk_index"]) is not int
+                or type(row["chunk_count"]) is not int
+                or type(row["chunk_digest"]) is not str
+                or type(row["intake_count"]) is not int
+                or type(row["intake_set_digest"]) is not str
+                or type(row["post_event_count"]) is not int
+                or (
+                    row["post_head_event_tag"] is not None
+                    and type(row["post_head_event_tag"]) is not str
+                )
+                or (
+                    row["previous_receipt_tag"] is not None
+                    and type(row["previous_receipt_tag"]) is not str
+                )
+                or type(row["receipt_tag"]) is not str
+                or type(row["admitted_at"]) is not str
+                or not hmac.compare_digest(row["receipt_tag"], expected)
+            ):
+                raise CaptureStoreIntegrityError()
+        except Exception:
+            raise CaptureStoreIntegrityError() from None
+        return row
+
+    def _verify_transport_chain(
+        self,
+        connection_id: str,
+        session_id: str,
+        *,
+        allow_pending_event_tail: bool = False,
+    ) -> tuple[tuple[sqlite3.Row, ...], int, sqlite3.Row | None]:
+        if type(allow_pending_event_tail) is not bool:
+            raise CaptureStoreError()
+        transport_profile = self._connection_row(connection_id)["profile_id"] in _TRANSPORT_PROFILES
+        session = self._session_row(connection_id, session_id)
+        if session is None:
+            raise CaptureStoreIntegrityError()
+        transport_required = session["transport_required"] == 1
+        head = self._transport_head_row(connection_id, session_id)
+        rows = self._connection.execute(
+            """
+            SELECT * FROM capture_transport_receipts
+            WHERE connection_id = ? AND session_id = ?
+            ORDER BY transport_ordinal
+            """,
+            (connection_id, session_id),
+        ).fetchall()
+        if not transport_profile:
+            if transport_required or rows or head is not None:
+                raise CaptureStoreIntegrityError()
+            return (), 0, None
+        if not transport_required:
+            if rows or head is not None:
+                raise CaptureStoreIntegrityError()
+            # Version-one stores may contain bridge sessions that predate the
+            # receiver-owned transport ledger. Their v1 session tag binds this
+            # state until the first v2 transport attempt upgrades it atomically.
+            return (), 0, None
+        if head is None:
+            raise CaptureStoreIntegrityError()
+        if not hmac.compare_digest(session["transport_head_tag"], head["head_tag"]):
+            raise CaptureStoreIntegrityError()
+        event_rows = self._connection.execute(
+            """
+            SELECT * FROM capture_events
+            WHERE connection_id = ? AND session_id = ?
+            ORDER BY receipt_ordinal
+            """,
+            (connection_id, session_id),
+        ).fetchall()
+        event_tags: list[str] = []
+        event_sources: list[str] = []
+        for ordinal, event_row in enumerate(event_rows, start=1):
+            event = self._load_verified_event(event_row)
+            if event.receipt_ordinal != ordinal or event.event_tag != event_row["event_tag"]:
+                raise CaptureStoreIntegrityError()
+            event_tags.append(event.event_tag)
+            event_sources.append(event_row["admission_source"])
+        verified: list[sqlite3.Row] = []
+        previous: str | None = None
+        previous_event_count = 0
+        chunk_counts: dict[str, int] = {}
+        chunk_indices: dict[str, set[int]] = {}
+        for ordinal, candidate in enumerate(rows, start=1):
+            row = self._load_verified_transport_receipt(candidate)
+            batch_ref = row["batch_ref"]
+            chunk_count = row["chunk_count"]
+            if (
+                row["connection_id"] != connection_id
+                or row["session_id"] != session_id
+                or row["transport_ordinal"] != ordinal
+                or row["previous_receipt_tag"] != previous
+                or row["chunk_index"] >= chunk_count
+                or chunk_counts.setdefault(batch_ref, chunk_count) != chunk_count
+                or row["post_event_count"] < previous_event_count
+                or row["post_event_count"] > len(event_tags)
+                or (
+                    None
+                    if row["post_event_count"] == 0
+                    else event_tags[row["post_event_count"] - 1]
+                )
+                != row["post_head_event_tag"]
+            ):
+                raise CaptureStoreIntegrityError()
+            indices = chunk_indices.setdefault(batch_ref, set())
+            if row["chunk_index"] in indices:
+                raise CaptureStoreIntegrityError()
+            indices.add(row["chunk_index"])
+            previous = row["receipt_tag"]
+            previous_event_count = row["post_event_count"]
+            verified.append(row)
+        if len(verified) != head["receipt_count"] or previous != head["head_receipt_tag"]:
+            raise CaptureStoreIntegrityError()
+        if previous_event_count != len(event_tags) and not allow_pending_event_tail:
+            unreceipted_sources = event_sources[previous_event_count:]
+            if not bool(session["coverage_degraded"]) or any(
+                source != CaptureAdmissionSource.SPOOL_DRAIN.value for source in unreceipted_sources
+            ):
+                raise CaptureStoreIntegrityError()
+        incomplete = sum(
+            len(indices) != chunk_counts[batch_ref] for batch_ref, indices in chunk_indices.items()
+        )
+        return tuple(verified), incomplete, head
+
+    def _transport_intake_set_digest(self, intakes: tuple[CaptureIntake, ...]) -> str:
+        return self._integrity.tag(
+            "transport_intake_set",
+            {
+                "schema_version": "capture-transport-intake-set-integrity/v1",
+                "intakes": [
+                    {
+                        "producer_event_digest": intake.producer_event_digest,
+                        "intake_tag": intake.intake_tag,
+                    }
+                    for intake in intakes
+                ],
+            },
+        )
 
     def _tombstone_row(self, connection_id: str, session_id: str) -> sqlite3.Row | None:
         row = self._connection.execute(
@@ -1598,12 +1894,19 @@ class CaptureStore:
         session_id: str,
         session: sqlite3.Row,
         head: sqlite3.Row,
+        *,
+        allow_pending_transport_tail: bool = False,
     ) -> tuple[CaptureEvent, ...]:
         events, _health = self._verify_chain_rows(
             connection_id,
             session_id,
             session,
             head,
+        )
+        self._verify_transport_chain(
+            connection_id,
+            session_id,
+            allow_pending_event_tail=allow_pending_transport_tail,
         )
         return tuple(event for event, _row in events)
 
@@ -2185,16 +2488,36 @@ class CaptureStore:
                 deleted_tombstones=deleted_tombstones,
             )
 
-    def _create_session(self, intake: CaptureIntake) -> sqlite3.Row:
+    def _create_session(
+        self,
+        intake: CaptureIntake,
+        *,
+        force_coverage_degraded: bool = False,
+    ) -> sqlite3.Row:
         timestamp = _now()
+        transport_required = intake.adapter_profile in _TRANSPORT_PROFILES
+        transport_head_tag = (
+            self._transport_head_tag(
+                intake.connection_id,
+                intake.session_id,
+                receipt_count=0,
+                head_receipt_tag=None,
+            )
+            if transport_required
+            else None
+        )
         material: dict[str, object] = {
             "connection_id": intake.connection_id,
             "session_id": intake.session_id,
             "human_id": self._human_session_id(intake.connection_id, intake.session_id),
             "state": CaptureSessionState.OPEN.value,
             "event_count": 0,
-            "coverage_degraded": int(intake.capture_disposition != "captured"),
+            "coverage_degraded": int(
+                force_coverage_degraded or intake.capture_disposition != "captured"
+            ),
             "unattributed_drop": 0,
+            "transport_required": int(transport_required),
+            "transport_head_tag": transport_head_tag,
             "health_marker_count": 0,
             "health_set_digest": self._health_set_digest(()),
             "opened_at": timestamp,
@@ -2206,9 +2529,10 @@ class CaptureStore:
             """
             INSERT INTO capture_sessions(
                 connection_id, session_id, human_id, state, event_count,
-                coverage_degraded, unattributed_drop, health_marker_count,
-                health_set_digest, opened_at, updated_at, closed_at, row_tag
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                coverage_degraded, unattributed_drop, transport_required,
+                transport_head_tag, health_marker_count, health_set_digest,
+                opened_at, updated_at, closed_at, row_tag
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (*material.values(), row_tag),
         )
@@ -2229,6 +2553,11 @@ class CaptureStore:
             """,
             (intake.connection_id, intake.session_id, head_tag),
         )
+        self._create_transport_head(
+            intake.connection_id,
+            intake.session_id,
+            profile_id=intake.adapter_profile,
+        )
         row = self._session_row(intake.connection_id, intake.session_id)
         if row is None:
             raise CaptureStoreIntegrityError()
@@ -2238,6 +2567,18 @@ class CaptureStore:
         """Create a content-free quarantine when a callback cannot form evidence."""
 
         timestamp = _now()
+        connection = self._connection_row(connection_id)
+        transport_required = connection["profile_id"] in _TRANSPORT_PROFILES
+        transport_head_tag = (
+            self._transport_head_tag(
+                connection_id,
+                session_id,
+                receipt_count=0,
+                head_receipt_tag=None,
+            )
+            if transport_required
+            else None
+        )
         material: dict[str, object] = {
             "connection_id": connection_id,
             "session_id": session_id,
@@ -2246,6 +2587,8 @@ class CaptureStore:
             "event_count": 0,
             "coverage_degraded": 1,
             "unattributed_drop": 0,
+            "transport_required": int(transport_required),
+            "transport_head_tag": transport_head_tag,
             "health_marker_count": 0,
             "health_set_digest": self._health_set_digest(()),
             "opened_at": timestamp,
@@ -2257,9 +2600,10 @@ class CaptureStore:
             """
             INSERT INTO capture_sessions(
                 connection_id, session_id, human_id, state, event_count,
-                coverage_degraded, unattributed_drop, health_marker_count,
-                health_set_digest, opened_at, updated_at, closed_at, row_tag
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                coverage_degraded, unattributed_drop, transport_required,
+                transport_head_tag, health_marker_count, health_set_digest,
+                opened_at, updated_at, closed_at, row_tag
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (*material.values(), row_tag),
         )
@@ -2280,6 +2624,11 @@ class CaptureStore:
             """,
             (connection_id, session_id, head_tag),
         )
+        self._create_transport_head(
+            connection_id,
+            session_id,
+            profile_id=connection["profile_id"],
+        )
         row = self._session_row(connection_id, session_id)
         if row is None:
             raise CaptureStoreIntegrityError()
@@ -2292,11 +2641,17 @@ class CaptureStore:
         state: CaptureSessionState,
         event_count: int,
         coverage_degraded: bool,
+        transport_required: bool | None = None,
+        transport_head_tag: str | None = None,
     ) -> sqlite3.Row:
         material = dict(row)
         material["state"] = state.value
         material["event_count"] = event_count
         material["coverage_degraded"] = int(coverage_degraded)
+        if transport_required is not None:
+            material["transport_required"] = int(transport_required)
+        if transport_head_tag is not None:
+            material["transport_head_tag"] = transport_head_tag
         material["updated_at"] = _now()
         material["closed_at"] = (
             material["updated_at"] if state is CaptureSessionState.CLOSED else None
@@ -2306,13 +2661,16 @@ class CaptureStore:
             """
             UPDATE capture_sessions
             SET state = ?, event_count = ?, coverage_degraded = ?,
-                updated_at = ?, closed_at = ?, row_tag = ?
+                transport_required = ?, transport_head_tag = ?, updated_at = ?,
+                closed_at = ?, row_tag = ?
             WHERE connection_id = ? AND session_id = ?
             """,
             (
                 material["state"],
                 material["event_count"],
                 material["coverage_degraded"],
+                material["transport_required"],
+                material["transport_head_tag"],
                 material["updated_at"],
                 material["closed_at"],
                 row_tag,
@@ -2325,6 +2683,21 @@ class CaptureStore:
         updated = self._session_row(material["connection_id"], material["session_id"])
         if updated is None:
             raise CaptureStoreIntegrityError()
+        return updated
+
+    def _mark_transport_fallback_session(self, row: sqlite3.Row) -> sqlite3.Row:
+        """Make a receipt-less bridge path's coverage loss durable."""
+
+        connection = self._connection_row(row["connection_id"])
+        if connection["profile_id"] not in _TRANSPORT_PROFILES:
+            raise CaptureStoreIntegrityError()
+        updated = self._update_session(
+            row,
+            state=CaptureSessionState(row["state"]),
+            event_count=row["event_count"],
+            coverage_degraded=True,
+        )
+        self._verify_transport_chain(row["connection_id"], row["session_id"])
         return updated
 
     def _record_health(
@@ -2497,6 +2870,307 @@ class CaptureStore:
             event_count=session["event_count"],
         )
 
+    def _append_authenticated_in_transaction(
+        self,
+        authenticated: CaptureIntake,
+        canonical_intake: bytes,
+        *,
+        source: CaptureAdmissionSource,
+        transport_bound: bool = False,
+    ) -> CaptureAppendReceipt:
+        """Extend one event chain inside the caller-owned write transaction."""
+
+        connection = self._connection_row(authenticated.connection_id)
+        if (
+            connection["profile_id"] != authenticated.adapter_profile
+            or connection["capability_manifest_digest"] != authenticated.capability_manifest_digest
+        ):
+            raise CaptureStoreStateError()
+        if connection["state"] == CaptureConnectionState.DELETING.value:
+            raise CaptureStoreStateError()
+        transport_profile = connection["profile_id"] in _TRANSPORT_PROFILES
+        if transport_profile and source is CaptureAdmissionSource.DIRECT and not transport_bound:
+            raise CaptureStoreStateError()
+        transport_fallback = (
+            transport_profile
+            and source is CaptureAdmissionSource.SPOOL_DRAIN
+            and not transport_bound
+        )
+        allowed_states = (
+            {CaptureConnectionState.ENABLED.value}
+            if source is CaptureAdmissionSource.DIRECT
+            else {
+                CaptureConnectionState.ENABLED.value,
+                CaptureConnectionState.DRAINING.value,
+                CaptureConnectionState.DISABLED.value,
+            }
+        )
+        incoming_session = self._append_session_row(
+            authenticated.connection_id,
+            authenticated.session_id,
+        )
+        existing_row = self._connection.execute(
+            """
+            SELECT * FROM capture_events
+            WHERE connection_id = ? AND producer_event_digest = ?
+            """,
+            (
+                authenticated.connection_id,
+                authenticated.producer_event_digest,
+            ),
+        ).fetchone()
+        if existing_row is not None:
+            existing = self._load_verified_event(existing_row)
+            existing_session = self._append_session_row(
+                existing.intake.connection_id,
+                existing.intake.session_id,
+            )
+            if existing_session is None:
+                raise CaptureStoreIntegrityError()
+            existing_head = self._head_row(
+                existing.intake.connection_id,
+                existing.intake.session_id,
+            )
+            self._verify_chain(
+                existing.intake.connection_id,
+                existing.intake.session_id,
+                existing_session,
+                existing_head,
+                allow_pending_transport_tail=transport_bound,
+            )
+            if canonical_capture_intake(existing.intake) == canonical_intake:
+                if transport_fallback:
+                    existing_session = self._mark_transport_fallback_session(existing_session)
+                return self._replay_receipt(existing, existing_session)
+            if connection["state"] not in allowed_states:
+                raise CaptureStoreStateError()
+            affected = {(authenticated.connection_id, authenticated.session_id)}
+            affected.add((existing.intake.connection_id, existing.intake.session_id))
+            for affected_connection, affected_session_id in affected:
+                session = self._append_session_row(
+                    affected_connection,
+                    affected_session_id,
+                )
+                if session is None:
+                    if (affected_connection, affected_session_id) != (
+                        authenticated.connection_id,
+                        authenticated.session_id,
+                    ):
+                        raise CaptureStoreIntegrityError()
+                    session = self._create_session(
+                        authenticated,
+                        force_coverage_degraded=transport_fallback,
+                    )
+                elif (
+                    affected_connection,
+                    affected_session_id,
+                ) != (
+                    existing.intake.connection_id,
+                    existing.intake.session_id,
+                ):
+                    affected_head = self._head_row(
+                        affected_connection,
+                        affected_session_id,
+                    )
+                    self._verify_append_commitment(
+                        affected_connection,
+                        affected_session_id,
+                        session,
+                        affected_head,
+                    )
+                self._update_session(
+                    session,
+                    state=CaptureSessionState.QUARANTINED,
+                    event_count=session["event_count"],
+                    coverage_degraded=True,
+                )
+                self._record_health(
+                    connection_id=affected_connection,
+                    session_id=affected_session_id,
+                    code=CaptureHealthCode.PRODUCER_COLLISION,
+                )
+            incoming_session = self._session_row(
+                authenticated.connection_id,
+                authenticated.session_id,
+            )
+            event_count = 0 if incoming_session is None else incoming_session["event_count"]
+            return CaptureAppendReceipt(
+                disposition=CaptureAppendDisposition.QUARANTINED,
+                connection_id=authenticated.connection_id,
+                session_id=authenticated.session_id,
+                producer_event_digest=authenticated.producer_event_digest,
+                receipt_ordinal=None,
+                previous_event_tag=None,
+                event_tag=None,
+                session_state=CaptureSessionState.QUARANTINED,
+                event_count=event_count,
+            )
+        if connection["state"] not in allowed_states:
+            raise CaptureStoreStateError()
+        session = incoming_session
+        if session is None:
+            if authenticated.kind != "session_started":
+                raise CaptureStoreStateError()
+            session = self._create_session(
+                authenticated,
+                force_coverage_degraded=transport_fallback,
+            )
+        elif transport_fallback and session["state"] in {
+            CaptureSessionState.CLOSED.value,
+            CaptureSessionState.QUARANTINED.value,
+        }:
+            session = self._quarantine_transport_session(
+                authenticated.connection_id,
+                authenticated.session_id,
+                code=CaptureHealthCode.GAP_DETECTED,
+            )
+            return CaptureAppendReceipt(
+                disposition=CaptureAppendDisposition.QUARANTINED,
+                connection_id=authenticated.connection_id,
+                session_id=authenticated.session_id,
+                producer_event_digest=authenticated.producer_event_digest,
+                receipt_ordinal=None,
+                previous_event_tag=None,
+                event_tag=None,
+                session_state=CaptureSessionState.QUARANTINED,
+                event_count=session["event_count"],
+            )
+        elif (
+            session["state"] != CaptureSessionState.OPEN.value
+            or authenticated.kind == "session_started"
+        ):
+            raise CaptureStoreStateError()
+        head = self._head_row(authenticated.connection_id, authenticated.session_id)
+        self._verify_append_commitment(
+            authenticated.connection_id,
+            authenticated.session_id,
+            session,
+            head,
+        )
+        if transport_fallback:
+            session = self._mark_transport_fallback_session(session)
+        self._fault("after_session_insert_or_load")
+        if head["receipt_count"] >= MAX_CAPTURE_EVENTS_PER_SESSION:
+            session = self._update_session(
+                session,
+                state=CaptureSessionState.QUARANTINED,
+                event_count=session["event_count"],
+                coverage_degraded=True,
+            )
+            self._record_health(
+                connection_id=authenticated.connection_id,
+                session_id=authenticated.session_id,
+                code=CaptureHealthCode.SESSION_OVERFLOW,
+            )
+            return CaptureAppendReceipt(
+                disposition=CaptureAppendDisposition.OVERFLOW,
+                connection_id=authenticated.connection_id,
+                session_id=authenticated.session_id,
+                producer_event_digest=authenticated.producer_event_digest,
+                receipt_ordinal=None,
+                previous_event_tag=None,
+                event_tag=None,
+                session_state=CaptureSessionState.QUARANTINED,
+                event_count=session["event_count"],
+            )
+        ordinal = head["receipt_count"] + 1
+        previous = head["head_event_tag"]
+        admitted_at = _now()
+        event_tag = self._integrity.tag(
+            "event",
+            _event_material(
+                connection_id=authenticated.connection_id,
+                session_id=authenticated.session_id,
+                receipt_ordinal=ordinal,
+                producer_event_digest=authenticated.producer_event_digest,
+                event_kind=authenticated.kind,
+                previous_event_tag=previous,
+                admission_source=source.value,
+                admitted_at=admitted_at,
+                intake=authenticated,
+            ),
+        )
+        event = CaptureEvent(
+            receipt_ordinal=ordinal,
+            previous_event_tag=previous,
+            event_tag=event_tag,
+            intake=authenticated,
+        )
+        event_bytes = canonical_capture_event(event)
+        self._connection.execute(
+            """
+            INSERT INTO capture_events(
+                connection_id, session_id, receipt_ordinal,
+                producer_event_digest, event_kind, event_json,
+                previous_event_tag, event_tag, admission_source, admitted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                authenticated.connection_id,
+                authenticated.session_id,
+                ordinal,
+                authenticated.producer_event_digest,
+                authenticated.kind,
+                event_bytes,
+                previous,
+                event_tag,
+                source.value,
+                admitted_at,
+            ),
+        )
+        self._fault("after_event_insert")
+        head_tag = self._integrity.tag(
+            "head",
+            _head_material(
+                connection_id=authenticated.connection_id,
+                session_id=authenticated.session_id,
+                receipt_count=ordinal,
+                head_event_tag=event_tag,
+            ),
+        )
+        self._connection.execute(
+            """
+            UPDATE capture_heads
+            SET receipt_count = ?, head_event_tag = ?, head_tag = ?
+            WHERE connection_id = ? AND session_id = ?
+            """,
+            (
+                ordinal,
+                event_tag,
+                head_tag,
+                authenticated.connection_id,
+                authenticated.session_id,
+            ),
+        )
+        self._fault("after_head_write")
+        next_state = (
+            CaptureSessionState.CLOSED
+            if authenticated.kind == "session_finished"
+            else CaptureSessionState.OPEN
+        )
+        session = self._update_session(
+            session,
+            state=next_state,
+            event_count=ordinal,
+            coverage_degraded=(
+                bool(session["coverage_degraded"])
+                or authenticated.capture_disposition != "captured"
+                or transport_fallback
+            ),
+        )
+        self._fault("after_session_health_write")
+        return CaptureAppendReceipt(
+            disposition=CaptureAppendDisposition.ADMITTED,
+            connection_id=authenticated.connection_id,
+            session_id=authenticated.session_id,
+            producer_event_digest=authenticated.producer_event_digest,
+            receipt_ordinal=ordinal,
+            previous_event_tag=previous,
+            event_tag=event_tag,
+            session_state=CaptureSessionState(session["state"]),
+            event_count=session["event_count"],
+        )
+
     def append(
         self,
         intake: CaptureIntake,
@@ -2521,271 +3195,614 @@ class CaptureStore:
             self._revalidate_boundary()
             self._begin_immediate()
             try:
-                connection = self._connection_row(authenticated.connection_id)
-                if (
-                    connection["profile_id"] != authenticated.adapter_profile
-                    or connection["capability_manifest_digest"]
-                    != authenticated.capability_manifest_digest
-                ):
-                    raise CaptureStoreStateError()
-                if connection["state"] == CaptureConnectionState.DELETING.value:
-                    raise CaptureStoreStateError()
-                allowed_states = (
-                    {CaptureConnectionState.ENABLED.value}
-                    if source is CaptureAdmissionSource.DIRECT
-                    else {
-                        CaptureConnectionState.ENABLED.value,
-                        CaptureConnectionState.DRAINING.value,
-                        CaptureConnectionState.DISABLED.value,
-                    }
+                receipt = self._append_authenticated_in_transaction(
+                    authenticated,
+                    canonical_intake,
+                    source=source,
                 )
-                incoming_session = self._append_session_row(
-                    authenticated.connection_id,
-                    authenticated.session_id,
-                )
-                existing_row = self._connection.execute(
-                    """
-                    SELECT * FROM capture_events
-                    WHERE connection_id = ? AND producer_event_digest = ?
-                    """,
-                    (
-                        authenticated.connection_id,
-                        authenticated.producer_event_digest,
-                    ),
-                ).fetchone()
-                if existing_row is not None:
-                    existing = self._load_verified_event(existing_row)
-                    existing_session = self._append_session_row(
-                        existing.intake.connection_id,
-                        existing.intake.session_id,
-                    )
-                    if existing_session is None:
-                        raise CaptureStoreIntegrityError()
-                    existing_head = self._head_row(
-                        existing.intake.connection_id,
-                        existing.intake.session_id,
-                    )
-                    self._verify_chain(
-                        existing.intake.connection_id,
-                        existing.intake.session_id,
-                        existing_session,
-                        existing_head,
-                    )
-                    if canonical_capture_intake(existing.intake) == canonical_intake:
-                        self._connection.rollback()
-                        self._revalidate_boundary()
-                        return self._replay_receipt(existing, existing_session)
-                    if connection["state"] not in allowed_states:
-                        raise CaptureStoreStateError()
-                    affected = {(authenticated.connection_id, authenticated.session_id)}
-                    affected.add((existing.intake.connection_id, existing.intake.session_id))
-                    for affected_connection, affected_session_id in affected:
-                        session = self._append_session_row(
-                            affected_connection,
-                            affected_session_id,
-                        )
-                        if session is None:
-                            if (affected_connection, affected_session_id) != (
-                                authenticated.connection_id,
-                                authenticated.session_id,
-                            ):
-                                raise CaptureStoreIntegrityError()
-                            session = self._create_session(authenticated)
-                        elif (
-                            affected_connection,
-                            affected_session_id,
-                        ) != (
-                            existing.intake.connection_id,
-                            existing.intake.session_id,
-                        ):
-                            affected_head = self._head_row(
-                                affected_connection,
-                                affected_session_id,
-                            )
-                            self._verify_append_commitment(
-                                affected_connection,
-                                affected_session_id,
-                                session,
-                                affected_head,
-                            )
-                        self._update_session(
-                            session,
-                            state=CaptureSessionState.QUARANTINED,
-                            event_count=session["event_count"],
-                            coverage_degraded=True,
-                        )
-                        self._record_health(
-                            connection_id=affected_connection,
-                            session_id=affected_session_id,
-                            code=CaptureHealthCode.PRODUCER_COLLISION,
-                        )
-                    incoming_session = self._session_row(
-                        authenticated.connection_id,
-                        authenticated.session_id,
-                    )
-                    event_count = 0 if incoming_session is None else incoming_session["event_count"]
+                if receipt.disposition is CaptureAppendDisposition.REPLAYED:
+                    self._connection.rollback()
+                else:
+                    if receipt.disposition is CaptureAppendDisposition.ADMITTED:
+                        self._fault("before_commit")
                     self._connection.commit()
-                    self._revalidate_boundary()
-                    return CaptureAppendReceipt(
-                        disposition=CaptureAppendDisposition.QUARANTINED,
-                        connection_id=authenticated.connection_id,
-                        session_id=authenticated.session_id,
-                        producer_event_digest=authenticated.producer_event_digest,
-                        receipt_ordinal=None,
-                        previous_event_tag=None,
-                        event_tag=None,
-                        session_state=CaptureSessionState.QUARANTINED,
-                        event_count=event_count,
-                    )
-                if connection["state"] not in allowed_states:
-                    raise CaptureStoreStateError()
-                session = incoming_session
-                if session is None:
-                    if authenticated.kind != "session_started":
-                        raise CaptureStoreStateError()
-                    session = self._create_session(authenticated)
-                elif (
-                    session["state"] != CaptureSessionState.OPEN.value
-                    or authenticated.kind == "session_started"
-                ):
-                    raise CaptureStoreStateError()
-                head = self._head_row(authenticated.connection_id, authenticated.session_id)
-                self._verify_append_commitment(
-                    authenticated.connection_id,
-                    authenticated.session_id,
-                    session,
-                    head,
-                )
-                self._fault("after_session_insert_or_load")
-                if head["receipt_count"] >= MAX_CAPTURE_EVENTS_PER_SESSION:
-                    session = self._update_session(
-                        session,
-                        state=CaptureSessionState.QUARANTINED,
-                        event_count=session["event_count"],
-                        coverage_degraded=True,
-                    )
-                    self._record_health(
-                        connection_id=authenticated.connection_id,
-                        session_id=authenticated.session_id,
-                        code=CaptureHealthCode.SESSION_OVERFLOW,
-                    )
-                    self._connection.commit()
-                    self._revalidate_boundary()
-                    return CaptureAppendReceipt(
-                        disposition=CaptureAppendDisposition.OVERFLOW,
-                        connection_id=authenticated.connection_id,
-                        session_id=authenticated.session_id,
-                        producer_event_digest=authenticated.producer_event_digest,
-                        receipt_ordinal=None,
-                        previous_event_tag=None,
-                        event_tag=None,
-                        session_state=CaptureSessionState.QUARANTINED,
-                        event_count=session["event_count"],
-                    )
-                ordinal = head["receipt_count"] + 1
-                previous = head["head_event_tag"]
-                admitted_at = _now()
-                event_tag = self._integrity.tag(
-                    "event",
-                    _event_material(
-                        connection_id=authenticated.connection_id,
-                        session_id=authenticated.session_id,
-                        receipt_ordinal=ordinal,
-                        producer_event_digest=authenticated.producer_event_digest,
-                        event_kind=authenticated.kind,
-                        previous_event_tag=previous,
-                        admission_source=source.value,
-                        admitted_at=admitted_at,
-                        intake=authenticated,
-                    ),
-                )
-                event = CaptureEvent(
-                    receipt_ordinal=ordinal,
-                    previous_event_tag=previous,
-                    event_tag=event_tag,
-                    intake=authenticated,
-                )
-                event_bytes = canonical_capture_event(event)
-                self._connection.execute(
-                    """
-                    INSERT INTO capture_events(
-                        connection_id, session_id, receipt_ordinal,
-                        producer_event_digest, event_kind, event_json,
-                        previous_event_tag, event_tag, admission_source, admitted_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        authenticated.connection_id,
-                        authenticated.session_id,
-                        ordinal,
-                        authenticated.producer_event_digest,
-                        authenticated.kind,
-                        event_bytes,
-                        previous,
-                        event_tag,
-                        source.value,
-                        admitted_at,
-                    ),
-                )
-                self._fault("after_event_insert")
-                head_tag = self._integrity.tag(
-                    "head",
-                    _head_material(
-                        connection_id=authenticated.connection_id,
-                        session_id=authenticated.session_id,
-                        receipt_count=ordinal,
-                        head_event_tag=event_tag,
-                    ),
-                )
-                self._connection.execute(
-                    """
-                    UPDATE capture_heads
-                    SET receipt_count = ?, head_event_tag = ?, head_tag = ?
-                    WHERE connection_id = ? AND session_id = ?
-                    """,
-                    (
-                        ordinal,
-                        event_tag,
-                        head_tag,
-                        authenticated.connection_id,
-                        authenticated.session_id,
-                    ),
-                )
-                self._fault("after_head_write")
-                next_state = (
-                    CaptureSessionState.CLOSED
-                    if authenticated.kind == "session_finished"
-                    else CaptureSessionState.OPEN
-                )
-                session = self._update_session(
-                    session,
-                    state=next_state,
-                    event_count=ordinal,
-                    coverage_degraded=(
-                        bool(session["coverage_degraded"])
-                        or authenticated.capture_disposition != "captured"
-                    ),
-                )
-                self._fault("after_session_health_write")
-                self._fault("before_commit")
-                self._verified_append_heads[
-                    (authenticated.connection_id, authenticated.session_id)
-                ] = (ordinal, event_tag)
-                self._connection.commit()
-                self._fault("after_commit")
+                    if receipt.disposition is CaptureAppendDisposition.ADMITTED:
+                        assert receipt.receipt_ordinal is not None
+                        self._verified_append_heads[
+                            (authenticated.connection_id, authenticated.session_id)
+                        ] = (receipt.receipt_ordinal, receipt.event_tag)
+                        self._fault("after_commit")
             except BaseException:
                 self._rollback()
                 raise
             self._revalidate_boundary()
-            return CaptureAppendReceipt(
-                disposition=CaptureAppendDisposition.ADMITTED,
-                connection_id=authenticated.connection_id,
-                session_id=authenticated.session_id,
-                producer_event_digest=authenticated.producer_event_digest,
-                receipt_ordinal=ordinal,
-                previous_event_tag=previous,
-                event_tag=event_tag,
-                session_state=CaptureSessionState(session["state"]),
+            return receipt
+
+    def _quarantine_transport_session(
+        self,
+        connection_id: str,
+        session_id: str,
+        *,
+        code: CaptureHealthCode,
+    ) -> sqlite3.Row:
+        session = self._append_session_row(connection_id, session_id)
+        if session is None:
+            session = self._create_degraded_session(connection_id, session_id)
+        else:
+            head = self._head_row(connection_id, session_id)
+            self._verify_append_commitment(connection_id, session_id, session, head)
+            if (
+                session["state"] != CaptureSessionState.QUARANTINED.value
+                or session["coverage_degraded"] != 1
+            ):
+                session = self._update_session(
+                    session,
+                    state=CaptureSessionState.QUARANTINED,
+                    event_count=session["event_count"],
+                    coverage_degraded=True,
+                )
+        health = self._verify_health_set(connection_id, session_id, session)
+        if not any(row["code"] == code.value for row in health):
+            self._record_health(
+                connection_id=connection_id,
+                session_id=session_id,
+                code=code,
+            )
+        updated = self._session_row(connection_id, session_id)
+        if updated is None:
+            raise CaptureStoreIntegrityError()
+        return updated
+
+    def _transport_failure_receipt(
+        self,
+        descriptor: CaptureTransportChunk,
+        *,
+        disposition: CaptureTransportDisposition,
+        intake_count: int,
+        session: sqlite3.Row,
+    ) -> CaptureTransportReceipt:
+        _rows, incomplete, _head = self._verify_transport_chain(
+            descriptor.connection_id,
+            descriptor.session_id,
+        )
+        return CaptureTransportReceipt(
+            disposition=disposition,
+            connection_id=descriptor.connection_id,
+            session_id=descriptor.session_id,
+            batch_ref=descriptor.batch_ref,
+            chunk_index=descriptor.chunk_index,
+            chunk_count=descriptor.chunk_count,
+            intake_count=intake_count,
+            transport_ordinal=None,
+            previous_receipt_tag=None,
+            receipt_tag=None,
+            incomplete_batch_count=incomplete,
+            event_count=session["event_count"],
+        )
+
+    def append_transport_chunk(
+        self,
+        chunk: CaptureTransportChunk,
+        intakes: tuple[CaptureIntake, ...],
+    ) -> CaptureTransportReceipt:
+        """Atomically admit one pseudonymized intake set and its transport receipt."""
+
+        self._ensure_open()
+        try:
+            descriptor = validate_capture_transport_chunk(chunk)
+            if (
+                type(intakes) is not tuple
+                or len(intakes) > MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION
+            ):
+                raise CaptureStoreError()
+            authenticated = tuple(
+                verify_capture_intake_authentication(intake, context=self._context)
+                for intake in intakes
+            )
+            canonical = tuple(canonical_capture_intake(intake) for intake in authenticated)
+            if any(
+                intake.connection_id != descriptor.connection_id
+                or intake.session_id != descriptor.session_id
+                for intake in authenticated
+            ):
+                raise CaptureStoreStateError()
+            intake_set_digest = self._transport_intake_set_digest(authenticated)
+        except CaptureStoreError:
+            raise
+        except Exception:
+            raise CaptureStoreIntegrityError() from None
+
+        with self._lock:
+            self._ensure_open()
+            self._revalidate_boundary()
+            self._begin_immediate()
+            try:
+                connection = self._connection_row(descriptor.connection_id)
+                if (
+                    connection["profile_id"] not in _TRANSPORT_PROFILES
+                    or connection["state"] != CaptureConnectionState.ENABLED.value
+                    or any(
+                        intake.adapter_profile != connection["profile_id"]
+                        or intake.capability_manifest_digest
+                        != connection["capability_manifest_digest"]
+                        for intake in authenticated
+                    )
+                ):
+                    raise CaptureStoreStateError()
+
+                existing_candidate = self._connection.execute(
+                    """
+                    SELECT * FROM capture_transport_receipts
+                    WHERE connection_id = ? AND batch_ref = ? AND chunk_index = ?
+                    """,
+                    (
+                        descriptor.connection_id,
+                        descriptor.batch_ref,
+                        descriptor.chunk_index,
+                    ),
+                ).fetchone()
+                if existing_candidate is not None:
+                    existing_rows, incomplete, _existing_head = self._verify_transport_chain(
+                        existing_candidate["connection_id"],
+                        existing_candidate["session_id"],
+                    )
+                    existing = next(
+                        row
+                        for row in existing_rows
+                        if row["batch_ref"] == descriptor.batch_ref
+                        and row["chunk_index"] == descriptor.chunk_index
+                    )
+                    if (
+                        existing["session_id"] == descriptor.session_id
+                        and existing["chunk_count"] == descriptor.chunk_count
+                        and hmac.compare_digest(existing["chunk_digest"], descriptor.chunk_digest)
+                        and existing["intake_count"] == len(authenticated)
+                        and hmac.compare_digest(existing["intake_set_digest"], intake_set_digest)
+                    ):
+                        session = self._session_row(
+                            descriptor.connection_id,
+                            descriptor.session_id,
+                        )
+                        if session is None:
+                            raise CaptureStoreIntegrityError()
+                        event_head = self._head_row(
+                            descriptor.connection_id,
+                            descriptor.session_id,
+                        )
+                        verified_events = self._verify_chain(
+                            descriptor.connection_id,
+                            descriptor.session_id,
+                            session,
+                            event_head,
+                        )
+                        events_by_digest = {
+                            event.intake.producer_event_digest: event for event in verified_events
+                        }
+                        if any(
+                            (existing_event := events_by_digest.get(intake.producer_event_digest))
+                            is None
+                            or canonical_capture_intake(existing_event.intake) != encoded
+                            for intake, encoded in zip(authenticated, canonical, strict=True)
+                        ):
+                            raise CaptureStoreIntegrityError()
+                        self._connection.rollback()
+                        self._revalidate_boundary()
+                        return CaptureTransportReceipt(
+                            disposition=CaptureTransportDisposition.REPLAYED,
+                            connection_id=descriptor.connection_id,
+                            session_id=descriptor.session_id,
+                            batch_ref=descriptor.batch_ref,
+                            chunk_index=descriptor.chunk_index,
+                            chunk_count=descriptor.chunk_count,
+                            intake_count=len(authenticated),
+                            transport_ordinal=existing["transport_ordinal"],
+                            previous_receipt_tag=existing["previous_receipt_tag"],
+                            receipt_tag=existing["receipt_tag"],
+                            incomplete_batch_count=incomplete,
+                            event_count=session["event_count"],
+                        )
+                    affected = {
+                        (existing["connection_id"], existing["session_id"]),
+                        (descriptor.connection_id, descriptor.session_id),
+                    }
+                    incoming_session: sqlite3.Row | None = None
+                    for affected_connection, affected_session in sorted(affected):
+                        quarantined = self._quarantine_transport_session(
+                            affected_connection,
+                            affected_session,
+                            code=CaptureHealthCode.PRODUCER_COLLISION,
+                        )
+                        if (affected_connection, affected_session) == (
+                            descriptor.connection_id,
+                            descriptor.session_id,
+                        ):
+                            incoming_session = quarantined
+                    if incoming_session is None:
+                        raise CaptureStoreIntegrityError()
+                    receipt = self._transport_failure_receipt(
+                        descriptor,
+                        disposition=CaptureTransportDisposition.QUARANTINED,
+                        intake_count=len(authenticated),
+                        session=incoming_session,
+                    )
+                    self._connection.commit()
+                    self._revalidate_boundary()
+                    return receipt
+
+                batch_candidates = self._connection.execute(
+                    """
+                    SELECT connection_id, session_id, chunk_count
+                    FROM capture_transport_receipts
+                    WHERE connection_id = ? AND batch_ref = ?
+                    ORDER BY transport_ordinal
+                    """,
+                    (descriptor.connection_id, descriptor.batch_ref),
+                ).fetchall()
+                if batch_candidates:
+                    candidate_sessions = {
+                        (row["connection_id"], row["session_id"]) for row in batch_candidates
+                    }
+                    for candidate_connection, candidate_session in sorted(candidate_sessions):
+                        self._verify_transport_chain(
+                            candidate_connection,
+                            candidate_session,
+                        )
+                    if any(
+                        row["session_id"] != descriptor.session_id
+                        or row["chunk_count"] != descriptor.chunk_count
+                        for row in batch_candidates
+                    ):
+                        affected = candidate_sessions | {
+                            (descriptor.connection_id, descriptor.session_id)
+                        }
+                        incoming_quarantined: sqlite3.Row | None = None
+                        for affected_connection, affected_session in sorted(affected):
+                            quarantined = self._quarantine_transport_session(
+                                affected_connection,
+                                affected_session,
+                                code=CaptureHealthCode.PRODUCER_COLLISION,
+                            )
+                            if (affected_connection, affected_session) == (
+                                descriptor.connection_id,
+                                descriptor.session_id,
+                            ):
+                                incoming_quarantined = quarantined
+                        if incoming_quarantined is None:
+                            raise CaptureStoreIntegrityError()
+                        receipt = self._transport_failure_receipt(
+                            descriptor,
+                            disposition=CaptureTransportDisposition.QUARANTINED,
+                            intake_count=len(authenticated),
+                            session=incoming_quarantined,
+                        )
+                        self._connection.commit()
+                        self._revalidate_boundary()
+                        return receipt
+
+                existing_session = self._append_session_row(
+                    descriptor.connection_id,
+                    descriptor.session_id,
+                )
+                if existing_session is not None:
+                    event_head = self._head_row(
+                        descriptor.connection_id,
+                        descriptor.session_id,
+                    )
+                    self._verify_append_commitment(
+                        descriptor.connection_id,
+                        descriptor.session_id,
+                        existing_session,
+                        event_head,
+                    )
+                    if existing_session["state"] != CaptureSessionState.OPEN.value:
+                        health = self._verify_health_set(
+                            descriptor.connection_id,
+                            descriptor.session_id,
+                            existing_session,
+                        )
+                        if existing_session["state"] == CaptureSessionState.QUARANTINED.value:
+                            health_codes = {row["code"] for row in health}
+                            disposition = (
+                                CaptureTransportDisposition.OVERFLOW
+                                if CaptureHealthCode.SESSION_OVERFLOW.value in health_codes
+                                else CaptureTransportDisposition.QUARANTINED
+                            )
+                            receipt = self._transport_failure_receipt(
+                                descriptor,
+                                disposition=disposition,
+                                intake_count=len(authenticated),
+                                session=existing_session,
+                            )
+                            self._connection.rollback()
+                            self._revalidate_boundary()
+                            return receipt
+                        session = self._quarantine_transport_session(
+                            descriptor.connection_id,
+                            descriptor.session_id,
+                            code=CaptureHealthCode.PRODUCER_COLLISION,
+                        )
+                        receipt = self._transport_failure_receipt(
+                            descriptor,
+                            disposition=CaptureTransportDisposition.QUARANTINED,
+                            intake_count=len(authenticated),
+                            session=session,
+                        )
+                        self._connection.commit()
+                        self._revalidate_boundary()
+                        return receipt
+                    _rows, _incomplete, existing_transport_head = self._verify_transport_chain(
+                        descriptor.connection_id,
+                        descriptor.session_id,
+                    )
+                    if existing_transport_head is None:
+                        empty_transport_head_tag = self._transport_head_tag(
+                            descriptor.connection_id,
+                            descriptor.session_id,
+                            receipt_count=0,
+                            head_receipt_tag=None,
+                        )
+                        existing_session = self._update_session(
+                            existing_session,
+                            state=CaptureSessionState.OPEN,
+                            event_count=existing_session["event_count"],
+                            coverage_degraded=True,
+                            transport_required=True,
+                            transport_head_tag=empty_transport_head_tag,
+                        )
+                        self._create_transport_head(
+                            descriptor.connection_id,
+                            descriptor.session_id,
+                            profile_id=connection["profile_id"],
+                        )
+                        _rows, _incomplete, existing_transport_head = self._verify_transport_chain(
+                            descriptor.connection_id,
+                            descriptor.session_id,
+                            allow_pending_event_tail=True,
+                        )
+                    if existing_transport_head is None:
+                        raise CaptureStoreIntegrityError()
+                    if (
+                        existing_transport_head["receipt_count"]
+                        >= MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION
+                    ):
+                        session = self._quarantine_transport_session(
+                            descriptor.connection_id,
+                            descriptor.session_id,
+                            code=CaptureHealthCode.SESSION_OVERFLOW,
+                        )
+                        receipt = self._transport_failure_receipt(
+                            descriptor,
+                            disposition=CaptureTransportDisposition.OVERFLOW,
+                            intake_count=len(authenticated),
+                            session=session,
+                        )
+                        self._connection.commit()
+                        self._revalidate_boundary()
+                        return receipt
+                elif not authenticated or authenticated[0].kind != "session_started":
+                    raise CaptureStoreStateError()
+
+                self._connection.execute("SAVEPOINT capture_transport_intakes")
+                for intake, encoded in zip(authenticated, canonical, strict=True):
+                    prior_collision = self._connection.execute(
+                        """
+                        SELECT connection_id, session_id
+                        FROM capture_events
+                        WHERE connection_id = ? AND producer_event_digest = ?
+                        """,
+                        (intake.connection_id, intake.producer_event_digest),
+                    ).fetchone()
+                    appended = self._append_authenticated_in_transaction(
+                        intake,
+                        encoded,
+                        source=CaptureAdmissionSource.DIRECT,
+                        transport_bound=True,
+                    )
+                    if appended.disposition is CaptureAppendDisposition.ADMITTED:
+                        assert appended.receipt_ordinal is not None
+                        self._verified_append_heads[
+                            (descriptor.connection_id, descriptor.session_id)
+                        ] = (appended.receipt_ordinal, appended.event_tag)
+                    if appended.disposition not in {
+                        CaptureAppendDisposition.ADMITTED,
+                        CaptureAppendDisposition.REPLAYED,
+                    }:
+                        self._connection.execute("ROLLBACK TO capture_transport_intakes")
+                        self._connection.execute("RELEASE capture_transport_intakes")
+                        code = (
+                            CaptureHealthCode.SESSION_OVERFLOW
+                            if appended.disposition is CaptureAppendDisposition.OVERFLOW
+                            else CaptureHealthCode.PRODUCER_COLLISION
+                        )
+                        affected = {(descriptor.connection_id, descriptor.session_id)}
+                        if (
+                            appended.disposition is CaptureAppendDisposition.QUARANTINED
+                            and prior_collision is not None
+                        ):
+                            affected.add(
+                                (
+                                    prior_collision["connection_id"],
+                                    prior_collision["session_id"],
+                                )
+                            )
+                        incoming_quarantine: sqlite3.Row | None = None
+                        for affected_connection, affected_session in sorted(affected):
+                            quarantined = self._quarantine_transport_session(
+                                affected_connection,
+                                affected_session,
+                                code=code,
+                            )
+                            if (affected_connection, affected_session) == (
+                                descriptor.connection_id,
+                                descriptor.session_id,
+                            ):
+                                incoming_quarantine = quarantined
+                        if incoming_quarantine is None:
+                            raise CaptureStoreIntegrityError()
+                        session = incoming_quarantine
+                        disposition = (
+                            CaptureTransportDisposition.OVERFLOW
+                            if appended.disposition is CaptureAppendDisposition.OVERFLOW
+                            else CaptureTransportDisposition.QUARANTINED
+                        )
+                        receipt = self._transport_failure_receipt(
+                            descriptor,
+                            disposition=disposition,
+                            intake_count=len(authenticated),
+                            session=session,
+                        )
+                        self._connection.commit()
+                        self._revalidate_boundary()
+                        return receipt
+                session = self._session_row(
+                    descriptor.connection_id,
+                    descriptor.session_id,
+                )
+                if session is None:
+                    raise CaptureStoreIntegrityError()
+                transport_rows, _incomplete, transport_head = self._verify_transport_chain(
+                    descriptor.connection_id,
+                    descriptor.session_id,
+                    allow_pending_event_tail=True,
+                )
+                if transport_head is None:
+                    raise CaptureStoreIntegrityError()
+                if transport_head["receipt_count"] >= MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION:
+                    self._connection.execute("ROLLBACK TO capture_transport_intakes")
+                    self._connection.execute("RELEASE capture_transport_intakes")
+                    session = self._quarantine_transport_session(
+                        descriptor.connection_id,
+                        descriptor.session_id,
+                        code=CaptureHealthCode.SESSION_OVERFLOW,
+                    )
+                    receipt = self._transport_failure_receipt(
+                        descriptor,
+                        disposition=CaptureTransportDisposition.OVERFLOW,
+                        intake_count=len(authenticated),
+                        session=session,
+                    )
+                    self._connection.commit()
+                    self._revalidate_boundary()
+                    return receipt
+                self._connection.execute("RELEASE capture_transport_intakes")
+                self._fault("transport_after_intake_admission")
+                ordinal = transport_head["receipt_count"] + 1
+                previous = transport_head["head_receipt_tag"]
+                event_head = self._head_row(
+                    descriptor.connection_id,
+                    descriptor.session_id,
+                )
+                admitted_at = _now()
+                material: dict[str, object] = {
+                    "connection_id": descriptor.connection_id,
+                    "session_id": descriptor.session_id,
+                    "transport_ordinal": ordinal,
+                    "batch_ref": descriptor.batch_ref,
+                    "chunk_index": descriptor.chunk_index,
+                    "chunk_count": descriptor.chunk_count,
+                    "chunk_digest": descriptor.chunk_digest,
+                    "intake_count": len(authenticated),
+                    "intake_set_digest": intake_set_digest,
+                    "post_event_count": session["event_count"],
+                    "post_head_event_tag": event_head["head_event_tag"],
+                    "previous_receipt_tag": previous,
+                    "admitted_at": admitted_at,
+                }
+                receipt_tag = self._integrity.tag(
+                    "transport_receipt",
+                    _transport_receipt_material(material),
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO capture_transport_receipts(
+                        connection_id, session_id, transport_ordinal,
+                        batch_ref, chunk_index, chunk_count, chunk_digest,
+                        intake_count, intake_set_digest, post_event_count,
+                        post_head_event_tag, previous_receipt_tag, receipt_tag,
+                        admitted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        descriptor.connection_id,
+                        descriptor.session_id,
+                        ordinal,
+                        descriptor.batch_ref,
+                        descriptor.chunk_index,
+                        descriptor.chunk_count,
+                        descriptor.chunk_digest,
+                        len(authenticated),
+                        intake_set_digest,
+                        session["event_count"],
+                        event_head["head_event_tag"],
+                        previous,
+                        receipt_tag,
+                        admitted_at,
+                    ),
+                )
+                self._fault("transport_after_receipt_insert")
+                transport_head_tag = self._transport_head_tag(
+                    descriptor.connection_id,
+                    descriptor.session_id,
+                    receipt_count=ordinal,
+                    head_receipt_tag=receipt_tag,
+                )
+                updated = self._connection.execute(
+                    """
+                    UPDATE capture_transport_heads
+                    SET receipt_count = ?, head_receipt_tag = ?, head_tag = ?
+                    WHERE connection_id = ? AND session_id = ?
+                    """,
+                    (
+                        ordinal,
+                        receipt_tag,
+                        transport_head_tag,
+                        descriptor.connection_id,
+                        descriptor.session_id,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise CaptureStoreIntegrityError()
+                session = self._update_session(
+                    session,
+                    state=CaptureSessionState(session["state"]),
+                    event_count=session["event_count"],
+                    coverage_degraded=bool(session["coverage_degraded"]),
+                    transport_head_tag=transport_head_tag,
+                )
+                self._fault("transport_after_head_write")
+                _verified_rows, incomplete, _verified_head = self._verify_transport_chain(
+                    descriptor.connection_id,
+                    descriptor.session_id,
+                )
+                if len(_verified_rows) != len(transport_rows) + 1:
+                    raise CaptureStoreIntegrityError()
+                self._fault("transport_before_commit")
+                self._connection.commit()
+                event_head = self._head_row(
+                    descriptor.connection_id,
+                    descriptor.session_id,
+                )
+                self._verified_append_heads[(descriptor.connection_id, descriptor.session_id)] = (
+                    event_head["receipt_count"],
+                    event_head["head_event_tag"],
+                )
+                self._fault("transport_after_commit")
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return CaptureTransportReceipt(
+                disposition=CaptureTransportDisposition.ADMITTED,
+                connection_id=descriptor.connection_id,
+                session_id=descriptor.session_id,
+                batch_ref=descriptor.batch_ref,
+                chunk_index=descriptor.chunk_index,
+                chunk_count=descriptor.chunk_count,
+                intake_count=len(authenticated),
+                transport_ordinal=ordinal,
+                previous_receipt_tag=previous,
+                receipt_tag=receipt_tag,
+                incomplete_batch_count=incomplete,
                 event_count=session["event_count"],
             )
 
@@ -2871,6 +3888,9 @@ class CaptureStore:
                     session,
                     head,
                 )
+                transport_rows, incomplete_transport_batches, transport_head = (
+                    self._verify_transport_chain(connection_id, session_id)
+                )
 
                 # Re-read the authenticated commitments in the same transaction.
                 # A peer may have committed a newer revision, but this reader must
@@ -2883,6 +3903,11 @@ class CaptureStore:
                     session_id,
                     session,
                 )
+                (
+                    checked_transport_rows,
+                    checked_incomplete_transport_batches,
+                    checked_transport_head,
+                ) = self._verify_transport_chain(connection_id, session_id)
                 if (
                     checked_session is None
                     or checked_connection["row_tag"] != connection["row_tag"]
@@ -2890,10 +3915,28 @@ class CaptureStore:
                     or checked_head["head_tag"] != head["head_tag"]
                     or tuple((row["marker_id"], row["row_tag"]) for row in checked_health)
                     != tuple((row["marker_id"], row["row_tag"]) for row in health_rows)
+                    or checked_incomplete_transport_batches != incomplete_transport_batches
+                    or tuple(
+                        (row["transport_ordinal"], row["receipt_tag"])
+                        for row in checked_transport_rows
+                    )
+                    != tuple(
+                        (row["transport_ordinal"], row["receipt_tag"]) for row in transport_rows
+                    )
+                    or (
+                        None
+                        if checked_transport_head is None
+                        else checked_transport_head["head_tag"]
+                    )
+                    != (None if transport_head is None else transport_head["head_tag"])
                 ):
                     raise CaptureStoreIntegrityError()
 
                 profile_id = CaptureProfile(connection["profile_id"])
+                legacy_transport = (
+                    connection["profile_id"] in _TRANSPORT_PROFILES
+                    and session["transport_required"] == 0
+                )
                 validate_capture_capability_binding(
                     profile_id,
                     connection["capability_manifest_digest"],
@@ -2910,7 +3953,13 @@ class CaptureStore:
                     human_id=session["human_id"],
                     state=CaptureSessionState(session["state"]),
                     event_count=session["event_count"],
-                    coverage_degraded=bool(session["coverage_degraded"]),
+                    transport_receipt_count=len(transport_rows),
+                    incomplete_transport_batch_count=incomplete_transport_batches,
+                    coverage_degraded=(
+                        bool(session["coverage_degraded"])
+                        or incomplete_transport_batches > 0
+                        or legacy_transport
+                    ),
                     unattributed_drop=bool(session["unattributed_drop"]),
                     opened_at=_stored_timestamp(session["opened_at"]),
                     updated_at=_stored_timestamp(session["updated_at"]),

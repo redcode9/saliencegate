@@ -139,7 +139,7 @@ class ProviderInstallationSpec(_RegistryModel):
         StringConstraints(min_length=1, max_length=64, pattern=_HOST_VERSION.pattern),
     ]
     project_root: Path
-    config_path: Path
+    config_path: Path | None = None
     bundle_path: Path | None = None
     bootstrap_path: Path | None = None
     receipt_path: Path
@@ -166,12 +166,11 @@ class ProviderInstallationSpec(_RegistryModel):
         ]
         | None
     ) = None
-    config: OwnedConfigSpec
+    config: OwnedConfigSpec | None = None
     generation: Annotated[int, Field(ge=1, le=1_000_000)] = 1
 
     @field_validator(
         "project_root",
-        "config_path",
         "receipt_path",
         "journal_path",
         "lock_path",
@@ -181,13 +180,16 @@ class ProviderInstallationSpec(_RegistryModel):
     def paths_are_exact_and_absolute(cls, value: Path) -> Path:
         return _exact_absolute_path(value)
 
-    @field_validator("bundle_path", "bootstrap_path")
+    @field_validator("config_path", "bundle_path", "bootstrap_path")
     @classmethod
     def optional_paths_are_exact_and_absolute(cls, value: Path | None) -> Path | None:
         return None if value is None else _exact_absolute_path(value)
 
     @model_validator(mode="after")
     def paths_and_bundle_contract_are_closed(self) -> Self:
+        has_config = self.config_path is not None
+        if has_config != (self.config is not None):
+            raise ValueError("integration configuration binding is incomplete")
         bridge_values = (
             self.bundle_path,
             self.bootstrap_path,
@@ -197,8 +199,11 @@ class ProviderInstallationSpec(_RegistryModel):
         if self.installation_kind is ProviderInstallationKind.BRIDGE:
             if any(value is None for value in bridge_values):
                 raise ValueError("integration bridge asset binding is incomplete")
-        elif any(value is not None for value in bridge_values):
-            raise ValueError("command-hook integration declares bridge assets")
+        else:
+            if any(value is not None for value in bridge_values):
+                raise ValueError("command-hook integration declares bridge assets")
+            if not has_config:
+                raise ValueError("command-hook integration requires configuration")
 
         project_files = self.project_local_paths
         try:
@@ -266,10 +271,13 @@ class ProviderInstallationSpec(_RegistryModel):
     @property
     def project_local_paths(self) -> tuple[Path, ...]:
         if self.installation_kind is ProviderInstallationKind.COMMAND_HOOK:
+            if self.config_path is None:
+                raise ValueError("command-hook integration requires configuration")
             return (self.config_path,)
         if self.bundle_path is None or self.bootstrap_path is None:
             raise ValueError("integration bridge asset binding is incomplete")
-        return (self.config_path, self.bundle_path, self.bootstrap_path)
+        config_paths = () if self.config_path is None else (self.config_path,)
+        return (*config_paths, self.bundle_path, self.bootstrap_path)
 
     @property
     def bundle_digest(self) -> str | None:
@@ -301,6 +309,7 @@ BUILTIN_PROVIDER_REGISTRY = ProviderRegistry(
             profile=CaptureProfile.OPENCODE_PLUGIN_V1,
             host_name="OpenCode",
             host_version="1.18.3",
+            available=True,
         ),
         ProviderRegistration(
             alias=ProviderAlias.PI,

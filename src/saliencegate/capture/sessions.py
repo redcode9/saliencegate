@@ -24,6 +24,7 @@ from saliencegate.capture.store import (
     CaptureConnectionState,
     CaptureSessionState,
 )
+from saliencegate.capture.transport import MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION
 from saliencegate.domain import canonical_json
 from saliencegate.domain.records import (
     ComponentIdentifier,
@@ -117,6 +118,14 @@ class CaptureSessionSnapshot(_CaptureSnapshotModel):
         int,
         Field(ge=0, le=MAX_CAPTURE_EVENTS_PER_SESSION),
     ]
+    transport_receipt_count: Annotated[
+        int,
+        Field(ge=0, le=MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION),
+    ] = 0
+    incomplete_transport_batch_count: Annotated[
+        int,
+        Field(ge=0, le=MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION),
+    ] = 0
     coverage_degraded: bool
     unattributed_drop: bool
     opened_at: Annotated[UtcDatetime, Field(repr=False)]
@@ -154,6 +163,8 @@ class CaptureSessionSnapshot(_CaptureSnapshotModel):
             or (self.state is CaptureSessionState.CLOSED and final_kind != "session_finished")
             or (self.state is CaptureSessionState.OPEN and has_session_finished)
             or ((bool(self.health) or self.unattributed_drop) and not self.coverage_degraded)
+            or self.incomplete_transport_batch_count > self.transport_receipt_count
+            or (self.incomplete_transport_batch_count > 0 and not self.coverage_degraded)
         ):
             raise ValueError("capture session snapshot commitments are inconsistent")
         previous_tag: str | None = None

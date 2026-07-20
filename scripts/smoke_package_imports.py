@@ -21,6 +21,11 @@ if tuple((migration.version, migration.name, migration.checksum) for migration i
         "capture_store",
         "b829f4b21bc4859ab352a1ed8513672686622edda2f5bc248a7dc195b4677a77",
     ),
+    (
+        2,
+        "transport_receipts",
+        "aecc36dde4533ee6b86bccde783a2c73dd2881e4bd0beccec9ceb136a1ee2c42",
+    ),
 ):
     raise RuntimeError("capture migration resources are incomplete")
 

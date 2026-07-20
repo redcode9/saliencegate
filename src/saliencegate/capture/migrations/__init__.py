@@ -28,7 +28,7 @@ from saliencegate.security.windows import (
 )
 
 APPLICATION_ID: Final = 0x53474350  # "SGCP"
-LATEST_SCHEMA_VERSION: Final = 1
+LATEST_SCHEMA_VERSION: Final = 2
 
 _MIGRATION_NAME = re.compile(r"^(?P<version>[0-9]{4})_(?P<name>[a-z][a-z0-9_]*)\.sql$")
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
@@ -210,9 +210,11 @@ def _expected_schema_inventory(
         connection.close()
 
 
-def validate_capture_store_schema(connection: sqlite3.Connection) -> None:
-    """Read-only validation of the current closed capture schema."""
-
+def _validate_capture_store_metadata_state(
+    connection: sqlite3.Connection,
+    *,
+    require_current: bool,
+) -> None:
     if type(connection) is not sqlite3.Connection or connection.in_transaction:
         raise CaptureMigrationError()
     try:
@@ -221,19 +223,13 @@ def validate_capture_store_schema(connection: sqlite3.Connection) -> None:
         if version > LATEST_SCHEMA_VERSION:
             raise CaptureSchemaTooNewError()
         if (
-            version != LATEST_SCHEMA_VERSION
+            version == 0
+            or (require_current and version != LATEST_SCHEMA_VERSION)
             or _pragma_integer(connection, "application_id") != APPLICATION_ID
         ):
             raise CaptureMigrationIntegrityError()
         _verify_history(connection, migrations, version)
-        quick_check = connection.execute("PRAGMA quick_check").fetchall()
-        if (
-            len(quick_check) != 1
-            or tuple(quick_check[0]) != ("ok",)
-            or connection.execute("PRAGMA foreign_key_check").fetchone()
-        ):
-            raise CaptureMigrationIntegrityError()
-        if _schema_inventory(connection) != _expected_schema_inventory(migrations):
+        if _schema_inventory(connection) != _expected_schema_inventory(migrations[:version]):
             raise CaptureMigrationIntegrityError()
     except (CaptureMigrationError, CaptureMigrationIntegrityError, CaptureSchemaTooNewError):
         raise
@@ -241,6 +237,40 @@ def validate_capture_store_schema(connection: sqlite3.Connection) -> None:
         raise CaptureMigrationIntegrityError() from None
     except Exception:
         raise CaptureMigrationError() from None
+
+
+def _validate_capture_store_data_state(connection: sqlite3.Connection) -> None:
+    """Run whole-database checks for initialization, migration, maintenance, and audit."""
+
+    if type(connection) is not sqlite3.Connection or connection.in_transaction:
+        raise CaptureMigrationError()
+    try:
+        quick_check = connection.execute("PRAGMA quick_check").fetchall()
+        if (
+            len(quick_check) != 1
+            or tuple(quick_check[0]) != ("ok",)
+            or connection.execute("PRAGMA foreign_key_check").fetchone()
+        ):
+            raise CaptureMigrationIntegrityError()
+    except CaptureMigrationIntegrityError:
+        raise
+    except sqlite3.Error:
+        raise CaptureMigrationIntegrityError() from None
+    except Exception:
+        raise CaptureMigrationError() from None
+
+
+def _validate_capture_store_schema_metadata(connection: sqlite3.Connection) -> None:
+    """Validate the exact current schema contract without scanning retained data."""
+
+    _validate_capture_store_metadata_state(connection, require_current=True)
+
+
+def validate_capture_store_schema(connection: sqlite3.Connection) -> None:
+    """Validate the current closed schema and all retained database pages."""
+
+    _validate_capture_store_schema_metadata(connection)
+    _validate_capture_store_data_state(connection)
 
 
 def apply_capture_migrations(connection: sqlite3.Connection) -> tuple[CaptureMigration, ...]:
@@ -314,7 +344,8 @@ def _preflight_existing_store(
             if application_id not in (0, APPLICATION_ID) or _has_user_schema_objects(connection):
                 raise CaptureMigrationIntegrityError()
         else:
-            validate_capture_store_schema(connection)
+            _validate_capture_store_metadata_state(connection, require_current=False)
+            _validate_capture_store_data_state(connection)
     finally:
         if connection is not None:
             connection.close()
@@ -341,7 +372,8 @@ def _preflight_existing_windows_store(
             if application_id not in (0, APPLICATION_ID) or _has_user_schema_objects(connection):
                 raise CaptureMigrationIntegrityError()
         else:
-            validate_capture_store_schema(connection)
+            _validate_capture_store_metadata_state(connection, require_current=False)
+            _validate_capture_store_data_state(connection)
         authorization.revalidate()
     finally:
         if connection is not None:

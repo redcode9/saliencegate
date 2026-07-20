@@ -4,7 +4,12 @@ import json
 from pathlib import Path, PureWindowsPath
 
 import pytest
-from tests.cli.test_capture_connect import _command_hook_spec, _environment, _spec
+from tests.cli.test_capture_connect import (
+    _command_hook_spec,
+    _configless_bridge_spec,
+    _environment,
+    _spec,
+)
 
 import saliencegate.commands.capture.disconnect as disconnect_module
 from saliencegate.capture import (
@@ -186,6 +191,39 @@ def test_disconnect_reconstructs_command_hook_without_receipt_bound_bundle(
     assert spec.receipt_path.is_file()
     assert spec.bundle_path is None
     assert spec.bootstrap_path is None
+
+
+def test_disconnect_reconstructs_configless_bridge_without_owned_config(
+    tmp_path: Path,
+) -> None:
+    spec = _configless_bridge_spec(tmp_path)
+    environment = _environment(tmp_path)
+
+    def resolver(alias: ProviderAlias, project: Path) -> ProviderInstallationSpec:
+        del alias, project
+        return spec
+
+    run_connect(
+        provider="codex",
+        project=spec.project_root,
+        environ=environment,
+        spec_resolver=resolver,
+    )
+
+    report = run_disconnect(
+        provider="codex",
+        project=spec.project_root,
+        environ=environment,
+        spec_resolver=resolver,
+    )
+
+    assert report.disposition == "uninstalled"
+    assert spec.config_path is None
+    assert spec.config is None
+    assert not spec.bundle_path.exists()
+    assert not spec.bootstrap_path.exists()
+    assert not spec.launcher_path.exists()
+    assert spec.receipt_path.is_file()
 
 
 def test_disconnect_is_idempotent_after_completed_uninstall(tmp_path: Path) -> None:

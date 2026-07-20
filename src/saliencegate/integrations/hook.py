@@ -64,6 +64,8 @@ _MAX_CAPTURE_NATIVE_BYTES: Final = 2 * 1_024 * 1_024
 _MAX_CAPTURE_JSON_DEPTH: Final = 32
 _MAX_CAPTURE_JSON_ITEMS: Final = 10_000
 _MAX_CAPTURE_JSON_STRING_BYTES: Final = 1 * 1_024 * 1_024
+_MAX_BRIDGE_SESSION_ID_BYTES: Final = 256 * 1_024
+_BRIDGE_CAPTURE_PROFILE_VALUES: Final = frozenset(("opencode-plugin/v1", "pi-extension/v1"))
 
 
 class CaptureHookError(ValueError):
@@ -93,6 +95,16 @@ class CaptureHookSpool(Protocol):
     """Minimum spool surface for ordered configured admission."""
 
     def admit(self, store: CaptureHookStore, intake: CaptureIntake) -> object: ...
+
+    def enqueue(self, intake: CaptureIntake) -> object: ...
+
+    def admit_transport(
+        self,
+        store: object,
+        chunk: object,
+        intakes: tuple[CaptureIntake, ...],
+        fallback: tuple[CaptureIntake, ...],
+    ) -> tuple[object, ...]: ...
 
 
 RegistryValidator = Callable[["CaptureProfile"], object]
@@ -216,25 +228,42 @@ def _default_dependencies(
                 _CLAUDE_CODE_HOOK_EVENT_VALUES,
                 "saliencegate.integrations.claude_code",
             ),
+            "opencode-plugin/v1": (
+                None,
+                "saliencegate.integrations.opencode",
+            ),
         }
         selected = providers.get(profile)
         if type(document) is not dict or selected is None:
             return None
         event_values, module_name = selected
-        event_name = document.get("hook_event_name")
-        session_id = document.get("session_id")
-        cwd = document.get("cwd")
-        if (
-            type(event_name) is not str
-            or event_name not in event_values
-            or type(session_id) is not str
-            or not 1 <= len(session_id.encode("utf-8")) <= _MAX_CAPTURE_JSON_STRING_BYTES
-            or type(cwd) is not str
-            or not 1 <= len(cwd.encode("utf-8")) <= _MAX_CAPTURE_JSON_STRING_BYTES
-            or not os.path.isabs(cwd)
-            or "\x00" in cwd
-        ):
-            return None
+        if event_values is None:
+            bootstrap = document.get("bootstrap")
+            session_id = document.get("session_id")
+            if (
+                document.get("schema_version") != "capture-batch/v1"
+                or type(bootstrap) is not dict
+                or bootstrap.get("profile") != profile
+                or bootstrap.get("connection_id") != connection_id
+                or type(session_id) is not str
+                or not 1 <= len(session_id.encode("utf-8")) <= _MAX_BRIDGE_SESSION_ID_BYTES
+            ):
+                return None
+        else:
+            event_name = document.get("hook_event_name")
+            session_id = document.get("session_id")
+            cwd = document.get("cwd")
+            if (
+                type(event_name) is not str
+                or event_name not in event_values
+                or type(session_id) is not str
+                or not 1 <= len(session_id.encode("utf-8")) <= _MAX_CAPTURE_JSON_STRING_BYTES
+                or type(cwd) is not str
+                or not 1 <= len(cwd.encode("utf-8")) <= _MAX_CAPTURE_JSON_STRING_BYTES
+                or not os.path.isabs(cwd)
+                or "\x00" in cwd
+            ):
+                return None
         import importlib
 
         module = importlib.import_module(module_name)
@@ -483,6 +512,76 @@ def _spool_disposition(receipt: object) -> str | None:
         return None
 
 
+def _transport_gap_intake(
+    intakes: tuple[CaptureIntake, ...],
+    descriptor: object,
+    *,
+    context: CaptureDigestContext,
+) -> CaptureIntake:
+    """Build one pseudonymous degradation marker for a spooled bridge chunk."""
+
+    try:
+        from saliencegate.capture.identities import CaptureDigestContext
+        from saliencegate.capture.publication import authenticate_capture_intake
+        from saliencegate.capture.schema import validate_capture_intake
+        from saliencegate.capture.transport import CaptureTransportChunk
+        from saliencegate.domain import canonical_json
+
+        if (
+            not intakes
+            or type(descriptor) is not CaptureTransportChunk
+            or type(context) is not CaptureDigestContext
+        ):
+            raise CaptureHookError()
+        first = intakes[0]
+        if first.kind != "session_started":
+            raise CaptureHookError()
+        marker = validate_capture_intake(
+            {
+                "schema_version": "capture-intake/v1",
+                "adapter_profile": first.adapter_profile,
+                "capability_manifest_digest": first.capability_manifest_digest,
+                "connection_id": first.connection_id,
+                "session_id": first.session_id,
+                "producer_event_digest": context.producer_event(
+                    canonical_json(
+                        {
+                            "schema_version": "capture-transport-gap/v1",
+                            "adapter_profile": first.adapter_profile,
+                            "connection_id": first.connection_id,
+                            "session_id": first.session_id,
+                        }
+                    )
+                ),
+                "intake_tag": "0" * 64,
+                "occurred_at": None,
+                "timestamp_authority": "unavailable",
+                "producer_sequence": None,
+                "sequence_authority": "unavailable",
+                "capture_disposition": "degraded",
+                "kind": "controller_failed",
+                "error_code": "gap_detected",
+                "failure_signature": None,
+            }
+        )
+        return authenticate_capture_intake(marker, context=context)
+    except CaptureHookError:
+        raise
+    except Exception:
+        raise CaptureHookError() from None
+
+
+def _bounded_transport_fallback(
+    intakes: tuple[CaptureIntake, ...],
+    gap: CaptureIntake,
+) -> tuple[CaptureIntake, ...]:
+    """Retain only lifecycle controls when atomic bridge admission is unavailable."""
+
+    if intakes[-1].kind == "session_finished":
+        return (intakes[0], gap, intakes[-1])
+    return (intakes[0], gap)
+
+
 def run_capture_hook(
     arguments: Sequence[str],
     stream: BinaryIO,
@@ -550,6 +649,41 @@ def run_capture_hook(
         store = selected.open_store(connection)
         if not callable(getattr(store, "append", None)):
             raise CaptureHookError()
+        if parsed.profile.value in _BRIDGE_CAPTURE_PROFILE_VALUES:
+            transport_chunk = getattr(adapter, "transport_chunk", None)
+            append_transport_chunk = getattr(store, "append_transport_chunk", None)
+            if not callable(transport_chunk) or not callable(append_transport_chunk):
+                raise CaptureHookError()
+            descriptor = transport_chunk(source, context=context)
+            fallback = _bounded_transport_fallback(
+                intakes,
+                _transport_gap_intake(intakes, descriptor, context=context),
+            )
+            try:
+                spool = selected.open_spool(connection)
+                admit_transport = getattr(spool, "admit_transport", None)
+                if not callable(admit_transport):
+                    raise CaptureHookError()
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                _mark_health(selected, connection, CaptureHealthCode.SPOOL_UNAVAILABLE)
+                return 0
+            try:
+                spool_receipts = admit_transport(store, descriptor, intakes, fallback)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except CaptureSpoolError:
+                _mark_health(
+                    selected,
+                    connection,
+                    CaptureHealthCode.SPOOL_UNAVAILABLE,
+                )
+                return 0
+            for spool_receipt in spool_receipts:
+                if _spool_disposition(spool_receipt) == "dropped_quota":
+                    _mark_health(selected, connection, CaptureHealthCode.SPOOL_QUOTA)
+            return 0
         if intakes:
             try:
                 spool = selected.open_spool(connection)

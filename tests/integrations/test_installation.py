@@ -159,6 +159,23 @@ def _make_command_hook_spec(
     )
 
 
+def _make_configless_bridge_spec(
+    tmp_path: Path,
+    *,
+    generation: int = 1,
+    bundle_name: str = "saliencegate-v1.js",
+    bundle_bytes: bytes | None = None,
+) -> ProviderInstallationSpec:
+    payload = _make_spec(
+        tmp_path,
+        generation=generation,
+        bundle_name=bundle_name,
+        bundle_bytes=bundle_bytes,
+    ).model_dump(mode="python", warnings="error")
+    payload.update(config_path=None, config=None)
+    return ProviderInstallationSpec.model_validate(payload)
+
+
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
@@ -170,7 +187,11 @@ def test_builtin_registry_is_closed_and_completed_connectors_are_available(
     for alias in ProviderAlias:
         registration = BUILTIN_PROVIDER_REGISTRY.resolve(alias, require_available=False)
         assert registration.alias is alias
-        available = alias in (ProviderAlias.CODEX, ProviderAlias.CLAUDE_CODE)
+        available = alias in (
+            ProviderAlias.CODEX,
+            ProviderAlias.CLAUDE_CODE,
+            ProviderAlias.OPENCODE,
+        )
         assert registration.available is available
         if available:
             assert BUILTIN_PROVIDER_REGISTRY.resolve(alias) == registration
@@ -217,6 +238,29 @@ def test_builtin_registry_is_closed_and_completed_connectors_are_available(
     incomplete_bridge["bundle_path"] = None
     with pytest.raises(ValidationError):
         ProviderInstallationSpec.model_validate(incomplete_bridge)
+
+    configured_bridge = _make_spec(tmp_path).model_dump(mode="python", warnings="error")
+    for missing_field in ("config_path", "config"):
+        incomplete_config = dict(configured_bridge)
+        incomplete_config[missing_field] = None
+        with pytest.raises(ValidationError):
+            ProviderInstallationSpec.model_validate(incomplete_config)
+
+    configless_bridge = _make_configless_bridge_spec(tmp_path)
+    assert configless_bridge.config_path is None
+    assert configless_bridge.config is None
+    assert configless_bridge.project_local_paths == (
+        configless_bridge.bundle_path,
+        configless_bridge.bootstrap_path,
+    )
+
+    configless_command_hook = _make_command_hook_spec(tmp_path).model_dump(
+        mode="python",
+        warnings="error",
+    )
+    configless_command_hook.update(config_path=None, config=None)
+    with pytest.raises(ValidationError):
+        ProviderInstallationSpec.model_validate(configless_command_hook)
 
 
 def test_pristine_missing_provider_directory_is_disabled_without_drift(tmp_path: Path) -> None:
@@ -367,18 +411,114 @@ def test_command_hook_install_and_uninstall_recovery_skip_bridge_stages(
     assert inspect_provider_installation(spec, KEY).drift == ()
 
 
+def test_configless_bridge_lifecycle_owns_only_auto_discovered_assets(tmp_path: Path) -> None:
+    spec = _make_configless_bridge_spec(tmp_path)
+
+    planned = install_provider(spec, KEY, dry_run=True)
+    assert planned.would_write == (
+        spec.launcher_path,
+        spec.bundle_path,
+        spec.bootstrap_path,
+        spec.receipt_path,
+        spec.journal_path,
+    )
+    assert inspect_provider_installation(spec, KEY).drift == ()
+
+    installed = install_provider(spec, KEY)
+
+    assert installed.disposition is InstallationDisposition.INSTALLED
+    assert installed.installed is True
+    assert spec.bundle_path.is_file()
+    assert spec.bootstrap_path.is_file()
+    assert inspect_provider_installation(spec, KEY).drift == ()
+    receipt_payload = json.loads(spec.receipt_path.read_bytes())
+    assert receipt_payload["config_path"] is None
+    assert receipt_payload["config_edit"] is None
+    assert "installation_kind" not in receipt_payload
+    assert install_provider(spec, KEY).disposition is InstallationDisposition.NOOP
+
+    removed = uninstall_provider(spec, KEY)
+
+    assert removed.disposition is InstallationDisposition.UNINSTALLED
+    assert not spec.bundle_path.exists()
+    assert not spec.bootstrap_path.exists()
+    assert not spec.launcher_path.exists()
+    assert inspect_provider_installation(spec, KEY).drift == ()
+
+
+def test_configless_bridge_install_and_uninstall_recover_without_config(
+    tmp_path: Path,
+) -> None:
+    spec = _make_configless_bridge_spec(tmp_path)
+
+    def fail_after_bundle(stage: str) -> None:
+        if stage == "after_bundle_publish":
+            raise RuntimeError("synthetic configless install interruption")
+
+    with pytest.raises(RuntimeError, match="configless install interruption"):
+        install_provider(spec, KEY, _fault_injector=fail_after_bundle)
+
+    journal_payload = json.loads(spec.journal_path.read_bytes())
+    assert journal_payload["target_receipt"]["config_path"] is None
+    assert journal_payload["target_receipt"]["config_edit"] is None
+    assert "installation_kind" not in journal_payload["target_receipt"]
+    assert recover_provider_installation(spec, KEY).state is InstallationState.ENABLED
+    assert inspect_provider_installation(spec, KEY).drift == ()
+
+    def fail_after_config_boundary(stage: str) -> None:
+        if stage == "after_config_remove":
+            raise RuntimeError("synthetic configless uninstall interruption")
+
+    with pytest.raises(RuntimeError, match="configless uninstall interruption"):
+        uninstall_provider(spec, KEY, _fault_injector=fail_after_config_boundary)
+
+    assert recover_provider_installation(spec, KEY).state is InstallationState.DISABLED
+    assert not spec.bundle_path.exists()
+    assert not spec.bootstrap_path.exists()
+    assert not spec.launcher_path.exists()
+    assert inspect_provider_installation(spec, KEY).drift == ()
+
+
+def test_configless_bridge_upgrade_replaces_only_authenticated_bridge_assets(
+    tmp_path: Path,
+) -> None:
+    first = _make_configless_bridge_spec(tmp_path)
+    install_provider(first, KEY)
+    second = _make_configless_bridge_spec(
+        tmp_path,
+        generation=2,
+        bundle_name="saliencegate-v2.js",
+        bundle_bytes=_bundle() + b"// v2\n",
+    )
+
+    upgraded = install_provider(second, KEY)
+
+    assert upgraded.disposition is InstallationDisposition.UPGRADED
+    assert upgraded.state is InstallationState.ENABLED
+    assert not first.bundle_path.exists()
+    assert second.bundle_path.read_bytes() == second.bundle_bytes
+    assert second.bootstrap_path.is_file()
+    assert second.config_path is None
+    assert second.config is None
+    assert inspect_provider_installation(second, KEY).drift == ()
+
+
 def test_receipt_v1_infers_kind_without_changing_the_authenticated_wire_shape(
     tmp_path: Path,
 ) -> None:
     bridge_root = tmp_path / "bridge"
     command_hook_root = tmp_path / "command-hook"
+    configless_root = tmp_path / "configless"
     bridge_root.mkdir()
     command_hook_root.mkdir()
+    configless_root.mkdir()
     bridge = _make_spec(bridge_root)
     command_hook = _make_command_hook_spec(command_hook_root)
+    configless = _make_configless_bridge_spec(configless_root)
 
     install_provider(bridge, KEY)
     install_provider(command_hook, KEY)
+    install_provider(configless, KEY)
 
     bridge_data = bridge.receipt_path.read_bytes()
     command_hook_data = command_hook.receipt_path.read_bytes()
@@ -393,6 +533,14 @@ def test_receipt_v1_infers_kind_without_changing_the_authenticated_wire_shape(
     )
     assert installation_module._decode_receipt(command_hook_data, KEY).installation_kind is (
         ProviderInstallationKind.COMMAND_HOOK
+    )
+    configless_data = configless.receipt_path.read_bytes()
+    configless_payload = json.loads(configless_data)
+    assert configless_payload["config_path"] is None
+    assert configless_payload["config_edit"] is None
+    assert b'"installation_kind"' not in configless_data
+    assert installation_module._decode_receipt(configless_data, KEY).installation_kind is (
+        ProviderInstallationKind.BRIDGE
     )
 
 

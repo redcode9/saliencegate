@@ -301,6 +301,9 @@ def _validate_project_hook_policy(spec: ProviderInstallationSpec) -> None:
 
     try:
         config_path = spec.config_path
+        config = spec.config
+        if config_path is None or config is None:
+            raise CodexIntegrationError()
         try:
             parent = config_path.parent.lstat()
         except FileNotFoundError:
@@ -311,7 +314,7 @@ def _validate_project_hook_policy(spec: ProviderInstallationSpec) -> None:
         if source is None:
             return
         document = tomllib.loads(source.decode("utf-8", errors="strict"))
-        for constraint in spec.config.toml_boolean_constraints:
+        for constraint in config.toml_boolean_constraints:
             current: object = document
             missing = False
             for component in constraint.path:
@@ -325,9 +328,9 @@ def _validate_project_hook_policy(spec: ProviderInstallationSpec) -> None:
                 continue
             if type(current) is not bool or current is not constraint.expected:
                 raise CodexIntegrationError()
-        marker = spec.config.marker.encode("ascii")
+        marker = config.marker.encode("ascii")
         if marker not in source:
-            plan_owned_config_install(source, spec.config)
+            plan_owned_config_install(source, config)
             return
         if source.count(marker) != 1:
             raise CodexIntegrationError()

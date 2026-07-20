@@ -2,7 +2,20 @@
 
 .NOTPARALLEL:
 
-.PHONY: format lint typecheck test coverage docs-check build artifact-smoke audit check
+.PHONY: format lint typecheck test coverage docs-check build artifact-smoke audit check connector-node-preflight connector-install connector-opencode-test connector-build
+
+connector-node-preflight:
+	@test "$$(node --version)" = "v22.19.0"
+	@test "$$(npm --version)" = "10.9.3"
+
+connector-install:
+	npm ci --no-audit --no-fund
+
+connector-opencode-test:
+	npm run connector:test
+
+connector-build:
+	npm run connector:build:check
 
 format:
 	uv run --locked ruff format --check .
