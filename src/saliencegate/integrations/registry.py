@@ -316,6 +316,7 @@ BUILTIN_PROVIDER_REGISTRY = ProviderRegistry(
             profile=CaptureProfile.PI_EXTENSION_V1,
             host_name="@earendil-works/pi-coding-agent",
             host_version="0.80.10",
+            available=True,
         ),
     )
 )

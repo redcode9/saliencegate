@@ -112,6 +112,7 @@ _FixturePath: TypeAlias = Annotated[
 _OutcomeAuthority: TypeAlias = Literal[
     "action_closed_outcome_unavailable",
     "action_observed",
+    "confirmed_success_or_ambiguous_error",
     "controller_failure_when_session_correlated",
     "correlation_only",
     "coverage_boundary",

@@ -689,6 +689,41 @@ def test_structured_action_outcome_authority_is_status_specific() -> None:
     for shared in ("provider_claimed_tool_outcome", "tool_state_discriminator"):
         assert _structured_status_is_authorized("succeeded", frozenset({shared}))
         assert _structured_status_is_authorized("failed", frozenset({shared}))
+    pi_authority = frozenset({"confirmed_success_or_ambiguous_error"})
+    assert _structured_status_is_authorized("succeeded", pi_authority)
+    assert not _structured_status_is_authorized("failed", pi_authority)
+
+
+def test_pi_success_only_authority_projects_only_confirmed_success(tmp_path: Path) -> None:
+    snapshot = _snapshot(
+        tmp_path / "pi-success-only.sqlite3",
+        CaptureProfile.PI_EXTENSION_V1,
+        (
+            {"kind": "session_started"},
+            {"kind": "action_started", "call": "one", "identity_authority": "coarse"},
+            {
+                "kind": "action_finished",
+                "call": "one",
+                "outcome_status": "succeeded",
+            },
+            {"kind": "session_finished"},
+        ),
+    )
+
+    normalized = normalize_capture_session_snapshot(
+        snapshot,
+        installation_key=INSTALLATION_KEY,
+    )
+    result = next(
+        event for event in normalized.events if event.event_type is EventType.TOOL_COMPLETION
+    )
+    outcome = result.payload["tool_outcome"]
+    assert isinstance(outcome, Mapping)
+    assert outcome["status"] == "succeeded"
+    assert outcome["error_code"] is None
+    assert outcome["exit_status"] is None
+    assert outcome["failure_signature"] is None
+    assert normalized.detector_evidence == ()
 
 
 @pytest.mark.parametrize(
@@ -696,7 +731,6 @@ def test_structured_action_outcome_authority_is_status_specific() -> None:
     (
         (CaptureProfile.CLAUDE_CODE_HOOKS_V1, "provider_error"),
         (CaptureProfile.OPENCODE_PLUGIN_V1, "tool_error"),
-        (CaptureProfile.PI_EXTENSION_V1, "tool_error"),
     ),
 )
 def test_structured_failures_keep_only_profile_derived_generic_details(
@@ -824,7 +858,7 @@ def test_capture_detector_minimum_rejects_uninstalled_detectors() -> None:
         ),
         (
             CaptureProfile.PI_EXTENSION_V1,
-            (SignalType.REPEATED_ACTION, SignalType.TOOL_ERROR),
+            (),
         ),
     ),
 )

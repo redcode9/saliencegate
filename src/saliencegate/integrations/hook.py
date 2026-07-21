@@ -232,6 +232,10 @@ def _default_dependencies(
                 None,
                 "saliencegate.integrations.opencode",
             ),
+            "pi-extension/v1": (
+                None,
+                "saliencegate.integrations.pi",
+            ),
         }
         selected = providers.get(profile)
         if type(document) is not dict or selected is None:

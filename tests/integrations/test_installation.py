@@ -191,6 +191,7 @@ def test_builtin_registry_is_closed_and_completed_connectors_are_available(
             ProviderAlias.CODEX,
             ProviderAlias.CLAUDE_CODE,
             ProviderAlias.OPENCODE,
+            ProviderAlias.PI,
         )
         assert registration.available is available
         if available:

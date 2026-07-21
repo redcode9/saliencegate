@@ -10,13 +10,16 @@
   },
   "workspaces": [
     "connectors/bridge-core",
-    "connectors/opencode"
+    "connectors/opencode",
+    "connectors/pi"
   ],
   "scripts": {
     "connector:typecheck": "tsc --project connectors/tsconfig.json --noEmit",
-    "connector:test": "npm run connector:typecheck && node --test connectors/bridge-core/test/*.test.ts connectors/opencode/test/*.test.ts",
-    "connector:build": "node connectors/scripts/build-opencode.mjs",
-    "connector:build:check": "node connectors/scripts/build-opencode.mjs --check"
+    "connector:test": "npm run connector:typecheck && node --test connectors/bridge-core/test/*.test.ts connectors/opencode/test/*.test.ts connectors/pi/test/*.test.ts",
+    "connector:test:opencode": "npm run connector:typecheck && node --test connectors/bridge-core/test/*.test.ts connectors/opencode/test/*.test.ts",
+    "connector:test:pi": "npm run connector:typecheck && node --test connectors/bridge-core/test/*.test.ts connectors/pi/test/*.test.ts",
+    "connector:build": "node connectors/scripts/build-connectors.mjs",
+    "connector:build:check": "node connectors/scripts/build-connectors.mjs --check"
   },
   "devDependencies": {
     "@types/node": "22.19.0",

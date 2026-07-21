@@ -197,29 +197,74 @@ migration, and read-only audit paths retain those full-data checks.
 ### Pi
 
 Every selected callback consumes the bounded provider session UUID returned by
-`ctx.sessionManager.getSessionId()` as a critical common field. The local transport HMAC-reduces it
-before durable storage, and the bridge never derives identity from a session-file path.
+`ctx.sessionManager.getSessionId()` as a critical common field. That UUID is bridge enrichment, not
+an upstream event-object field. Each `session_start` also creates a fresh cryptographic window
+discriminator, so startup, reload, new, resume, and fork observations remain distinct even when Pi
+reuses a native session UUID. The Python boundary HMAC-reduces the composite identity before
+durable storage, and the bridge never derives identity from a session-file path.
 
 | Event | Consumed fields | Evidence authority |
 |---|---|---|
-| `session_start` | `reason` | Opens an observed window; `reason` is provider claimed. |
+| `session_start` | `reason` | Opens a fresh observed window; `reason` is provider claimed. |
 | `before_agent_start` | none | Marks a turn boundary solely from the registered callback. The handler returns `undefined` and cannot inject or modify content. |
-| `tool_execution_start` | `toolCallId`, `toolName`, `args` | `toolCallId` is exact parent correlation; tool name and args derive only opaque action identity. |
-| `tool_execution_end` | `toolCallId`, `toolName`, `isError` | `isError=false` is provider-claimed success; `true` is provider-claimed failure. |
+| `tool_execution_start` | `toolCallId`, `toolName` | Keeps only an in-memory proposal. Pi can still run a later `tool_call` hook that mutates or blocks the call, so `args` are not read and this callback has no exact executed-action authority. |
+| `tool_execution_end` | `toolCallId`, `toolName`, `isError` | A bounded start/end pair with matching call and tool names emits one coarse tool-class action only when `isError=false`, which confirms that execution reached a structured successful result. Pi also emits `isError=true` for missing tools, invalid or truncated arguments, aborts, and calls blocked before execution, so that value produces a content-free ambiguity degradation instead of a failed action. |
 | `agent_settled` | none | Closes a stable observed unit after retries, compaction, and queued follow-up are settled. |
 | `session_compact` | `reason`, `willRetry`, `fromExtension` | Flush and coverage boundary only. |
-| `session_tree` | `newLeafId`, `oldLeafId`, `fromExtension` | Leaf IDs are HMAC-reduced lineage hints; no summary is consumed. |
+| `session_tree` | `newLeafId`, `oldLeafId` | Nullable leaf IDs are HMAC-reduced within-window hints; no cross-window lineage or summary is claimed. |
 | `session_shutdown` | `reason` | Closes the current observed window. |
 
-`previousSessionFile`, `targetSessionFile`, prompt text, images, system prompts and options,
-`result`, compaction entries, summary entries, and every other field are ignored. The extension
-must not call `ctx.sessionManager.getEntries()`, `getTree()`, or a history/backfill API; it must
-not add a session entry. It deliberately excludes `tool_call`, `tool_result`,
-`session_before_*`, and other hooks that can block or rewrite behavior.
+The accepted reason enums are exactly `startup|reload|new|resume|fork` for `session_start`,
+`manual|threshold|overflow` for `session_compact`, and `quit|reload|new|resume|fork` for
+`session_shutdown`. Enum drift degrades coverage rather than being reinterpreted.
+
+`previousSessionFile`, `targetSessionFile`, prompt text, images, `systemPrompt`,
+`systemPromptOptions`, tool `args` and `result`, `compactionEntry`, `summaryEntry`, and every other
+field are ignored; this includes optional `session_tree.fromExtension`. The extension must not call
+`ctx.sessionManager.getEntries()`, `getTree()`, `getBranch()`, or a history/backfill API; it must not
+add a session entry. It deliberately excludes
+`tool_call`, `tool_result`, `session_before_*`, and other hooks that can block or rewrite behavior.
+Because the selected surface cannot prove the post-hook executed input, repeated-action detection
+is unsupported for Pi v1. Tool-error detection is also unsupported: the pinned runtime uses the
+same `isError=true` end event for execution failures and for calls that never executed. An
+ambiguous error, unmatched start, unmatched end, or conflicting tool pair is omitted and marks
+coverage degraded instead of inventing an action or outcome.
+
+Each confirmed success is buffered and transported as one adjacent start/finish group. If JSON
+escaping makes either half exceed the native event envelope, the entire group becomes one
+content-free `oversize` degradation; an orphaned success half is never emitted.
+
+Pinned Pi manual compaction temporarily disconnects agent-event forwarding while it aborts active
+work. A start can therefore lack an end at that boundary without indicating successful execution;
+the connector emits `unmatched_start` degradation, and this interruption remains an explicit
+coverage exclusion.
+
+Shutdown closes only its fresh capture window. A later reload, resume, new session, fork, or process
+restart opens another window even if the native UUID is unchanged. A crash without
+`session_shutdown` leaves the previous window open and therefore incomplete. The sensitive
+previous/target session-file paths are never used to infer lineage, so cross-window lineage remains
+unavailable.
+
+An extension can start a Pi run with `sendMessage({triggerTurn:true})` without causing
+`before_agent_start`. Tool callbacks still open a reducible unit that `agent_settled` can close, but
+a tool-less extension-triggered run is invisible to this selected surface. That case is an explicit
+coverage exclusion and cannot support an absence claim.
+
+The windowed bridge inherits the bounded chunk contract described for OpenCode. Once any chunk is
+received, missing first, middle, or final chunks degrade coverage; a batch lost in full before any
+receipt remains inherently undetectable. `fully_unobserved_transport_batch` and
+`process_exit_without_session_shutdown` are therefore explicit Pi coverage exclusions. Normal Pi
+project trust or extension loading can also prevent every callback; until a receipt proves one was
+observed, status remains `installed_not_observed` and `project_trust_or_extension_loading` remains
+an explicit exclusion. A boundary that produces no evidence does not create an empty receipt;
+pending transport degradation is attached to the next real boundary, action, or terminal record.
 
 Pi documents start events in assistant source order and end events in completion order when tools
 run in parallel. Those delivery properties do not form a total causal sequence. Parallel calls
-remain distinct by `toolCallId`; receipt order and time remain local observation metadata.
+remain distinct by `toolCallId`; receipt order and time remain local observation metadata. The
+bridge bounds the native session identifier to 16 KiB and a closed identifier alphabet. Its fresh
+window discriminator is lowercase 64-hex, while positive decimal event IDs are bridge-local replay
+coordinates, never provider sequence authority.
 
 ## Authority, privacy, and integrity
 
@@ -262,7 +307,7 @@ date; exact release links define pinned TypeScript contracts where available.
 | Codex CLI `0.144.6` | [Hooks](https://learn.chatgpt.com/docs/hooks), [CLI commands](https://learn.chatgpt.com/docs/developer-commands?surface=cli#cli-codex-exec), [app server](https://learn.chatgpt.com/docs/app-server) |
 | Claude Code `2.1.204` | [Hooks](https://code.claude.com/docs/en/hooks), [plugins](https://code.claude.com/docs/en/plugins-reference), [settings](https://code.claude.com/docs/en/settings), [sessions](https://code.claude.com/docs/en/sessions) |
 | OpenCode `1.18.3` / `127bdb3` | [plugins](https://opencode.ai/docs/plugins/), [SDK sessions](https://opencode.ai/docs/sdk/#sessions), [SDK events](https://opencode.ai/docs/sdk/#events), [configuration locations](https://opencode.ai/docs/config/#locations), [v1.18.3 release](https://github.com/anomalyco/opencode/releases/tag/v1.18.3), [generated event types at `127bdb3`](https://github.com/anomalyco/opencode/blob/127bdb30784d508cc556c71a0f32b508a3061517/packages/sdk/js/src/gen/types.gen.ts), [plugin hook types at `127bdb3`](https://github.com/anomalyco/opencode/blob/127bdb30784d508cc556c71a0f32b508a3061517/packages/plugin/src/index.ts) |
-| Pi `0.80.10` / `8dc7883` | [extensions](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/docs/extensions.md), [RPC mode](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/docs/rpc.md), [JSON mode](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/docs/json.md), [session format](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/docs/session-format.md), [packages](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/docs/packages.md), [package manifest](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/package.json) |
+| Pi `0.80.10` / `8dc7883` | [extensions](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/docs/extensions.md), [RPC mode](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/docs/rpc.md), [JSON mode](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/docs/json.md), [session format](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/docs/session-format.md), [packages](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/docs/packages.md), [package manifest](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/package.json), [pinned event types](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/src/core/extensions/types.ts), [pinned session lifecycle](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/src/core/agent-session.ts), [pinned tool loop](https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/agent/src/agent-loop.ts) |
 
 Connector artifacts are built with Node.js `22.19.0` and npm `10.9.3`. The pin follows Pi
 `0.80.10`, whose package manifest requires Node.js `>=22.19.0`; Node's official

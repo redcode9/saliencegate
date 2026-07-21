@@ -4,6 +4,8 @@
     "bridge-core/src/**/*.ts",
     "bridge-core/test/**/*.ts",
     "opencode/src/**/*.ts",
-    "opencode/test/**/*.ts"
+    "opencode/test/**/*.ts",
+    "pi/src/**/*.ts",
+    "pi/test/**/*.ts"
   ]
 }

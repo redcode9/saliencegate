@@ -6,9 +6,11 @@ import {
   MAX_CAPTURE_BATCH_BYTES,
   MAX_CAPTURE_SESSION_ID_BYTES,
   buildCaptureChunks,
+  buildWindowedCaptureChunks,
   canonicalizeJson,
   encodeCanonicalJson,
   inspectChunkCoverage,
+  inspectWindowedChunkCoverage,
   type BootstrapBinding,
 } from "../src/index.ts";
 
@@ -35,6 +37,94 @@ test("canonical JSON is recursively sorted without changing supported values", (
   assert.equal(
     encodeCanonicalJson(value).toString("utf8"),
     '{"a":{"alpha":"one","beta":"two"},"z":[true,null,1.5]}',
+  );
+});
+
+test("windowed capture chunks bind every document and oversize control to one window", () => {
+  const piBootstrap: BootstrapBinding = {
+    ...bootstrap,
+    profile: "pi-extension/v1",
+    launcher_path: "/synthetic/state/pi/capture-hook",
+  };
+  const windowDiscriminator = "5".repeat(64);
+  const chunks = buildWindowedCaptureChunks({
+    bootstrap: piBootstrap,
+    batchID: "6".repeat(64),
+    sessionID: "019c0eaf-7b31-7000-8000-000000000001",
+    windowDiscriminator,
+    events: [
+      {
+        kind: "tool_started",
+        session_id: "019c0eaf-7b31-7000-8000-000000000001",
+        window_discriminator: windowDiscriminator,
+        event_id: "1",
+        call_id: "call-one",
+        tool: "read",
+        identity_authority: "coarse",
+        ignored: "RAW-WINDOW-SENTINEL".repeat(100_000),
+      },
+    ],
+  });
+
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0]!.document.window_discriminator, windowDiscriminator);
+  assert.ok(chunks[0]!.bytes.byteLength <= MAX_CAPTURE_BATCH_BYTES);
+  assert.doesNotMatch(chunks[0]!.bytes.toString("utf8"), /RAW-WINDOW-SENTINEL/);
+  assert.deepEqual(chunks[0]!.document.events, [
+    {
+      kind: "oversize",
+      reason: "event_limit",
+      session_id: "019c0eaf-7b31-7000-8000-000000000001",
+      window_discriminator: windowDiscriminator,
+    },
+  ]);
+});
+
+test("windowed chunk coverage detects gaps and rejects mixed discriminators", () => {
+  const piBootstrap: BootstrapBinding = {
+    ...bootstrap,
+    profile: "pi-extension/v1",
+  };
+  const chunks = buildWindowedCaptureChunks({
+    bootstrap: piBootstrap,
+    batchID: "7".repeat(64),
+    sessionID: "pi-session",
+    windowDiscriminator: "8".repeat(64),
+    events: Array.from({ length: 90 }, (_, index) => ({
+      kind: "coverage_boundary",
+      session_id: "pi-session",
+      window_discriminator: "8".repeat(64),
+      event_id: String(index + 1),
+      padding: "z".repeat(48_000),
+    })),
+  }).map((item) => item.document);
+  assert.ok(chunks.length >= 3);
+  const withoutMiddle = chunks.filter(
+    (item) => item.chunk_index !== Math.floor(chunks.length / 2),
+  );
+  assert.deepEqual(inspectWindowedChunkCoverage(withoutMiddle), {
+    complete: false,
+    missingIndexes: [Math.floor(chunks.length / 2)],
+  });
+
+  const forged = {
+    ...chunks[0]!,
+    window_discriminator: "9".repeat(64),
+  };
+  assert.throws(
+    () => inspectWindowedChunkCoverage([chunks[0]!, forged]),
+    BridgeContractError,
+  );
+  assert.throws(
+    () =>
+      buildWindowedCaptureChunks({
+        bootstrap: piBootstrap,
+        batchID: "7".repeat(64),
+        sessionID: "pi-session",
+        windowDiscriminator: "UPPER".repeat(13),
+        events: [],
+      }),
+    BridgeContractError,
   );
 });
 

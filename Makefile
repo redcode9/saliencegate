@@ -2,7 +2,7 @@
 
 .NOTPARALLEL:
 
-.PHONY: format lint typecheck test coverage docs-check build artifact-smoke audit check connector-node-preflight connector-install connector-opencode-test connector-build
+.PHONY: format lint typecheck test coverage docs-check build artifact-smoke audit check connector-node-preflight connector-install connector-opencode-test connector-pi-test connector-build
 
 connector-node-preflight:
 	@test "$$(node --version)" = "v22.19.0"
@@ -12,7 +12,10 @@ connector-install:
 	npm ci --no-audit --no-fund
 
 connector-opencode-test:
-	npm run connector:test
+	npm run connector:test:opencode
+
+connector-pi-test:
+	npm run connector:test:pi
 
 connector-build:
 	npm run connector:build:check

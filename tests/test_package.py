@@ -228,12 +228,14 @@ CAPTURE_RUNTIME_FILES = {
     "saliencegate/integrations/installation.py",
     "saliencegate/integrations/launcher_renderer.py",
     "saliencegate/integrations/opencode.py",
+    "saliencegate/integrations/pi.py",
     "saliencegate/integrations/registry.py",
 }
 CAPTURE_RESOURCE_FILES = {
     "saliencegate/capture/migrations/0001_capture_store.sql",
     "saliencegate/capture/migrations/0002_transport_receipts.sql",
     "saliencegate/integrations/assets/opencode-plugin.js",
+    "saliencegate/integrations/assets/pi-extension.js",
     "saliencegate/integrations/fixtures/claude-code-hooks-v1.json",
     "saliencegate/integrations/fixtures/codex-hooks-v1.json",
     "saliencegate/integrations/fixtures/opencode-plugin-v1.json",
@@ -269,6 +271,7 @@ SDIST_PREFIXES = (
     "benchmarks/",
     "connectors/bridge-core/",
     "connectors/opencode/",
+    "connectors/pi/",
     "connectors/scripts/",
     "connectors/tsconfig.json",
     "docs/assets/",

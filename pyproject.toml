@@ -83,6 +83,7 @@ include = [
   "/benchmarks",
   "/connectors/bridge-core",
   "/connectors/opencode",
+  "/connectors/pi",
   "/connectors/scripts",
   "/connectors/tsconfig.json",
   "/docs/benchmarks",

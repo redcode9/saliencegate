@@ -82,6 +82,7 @@ _SHARED_TOOL_OUTCOME_AUTHORITIES = frozenset(
         "tool_state_discriminator",
     }
 )
+_SUCCESS_ONLY_TOOL_OUTCOME_AUTHORITIES = frozenset({"confirmed_success_or_ambiguous_error"})
 _CONTROLLER_OUTCOME_AUTHORITIES = frozenset(
     {
         "controller_failure_when_session_correlated",
@@ -354,7 +355,14 @@ def _structured_status_is_authorized(
     authorities: frozenset[str],
 ) -> bool:
     if status == "succeeded":
-        return bool(authorities & (_SHARED_TOOL_OUTCOME_AUTHORITIES | {"provider_claimed_success"}))
+        return bool(
+            authorities
+            & (
+                _SHARED_TOOL_OUTCOME_AUTHORITIES
+                | _SUCCESS_ONLY_TOOL_OUTCOME_AUTHORITIES
+                | {"provider_claimed_success"}
+            )
+        )
     if status == "failed":
         return bool(authorities & (_SHARED_TOOL_OUTCOME_AUTHORITIES | {"provider_claimed_failure"}))
     return False

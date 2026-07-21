@@ -772,7 +772,7 @@ function checkedEnvironment(value) {
   }
   return result;
 }
-function launcherInvocation(input) {
+function launcherInvocation2(input) {
   try {
     if (typeof input.launcherPath !== "string" || input.launcherPath.length === 0 || input.launcherPath.length > 4096 || input.launcherPath.includes("\0")) {
       throw new BridgeContractError();
@@ -885,7 +885,7 @@ var OpenCodeBatchTransport = class {
   #activeWrites = 0;
   constructor(bootstrap, options = {}) {
     this.#bootstrap = bootstrap;
-    this.#invocation = launcherInvocation({
+    this.#invocation = launcherInvocation2({
       platform: options.platform ?? process.platform,
       launcherPath: bootstrap.launcher_path,
       environment: environment(options.environment ?? process.env)

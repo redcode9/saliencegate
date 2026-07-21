@@ -72,6 +72,9 @@ _HOSTS: Final = {
             "https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/docs/session-format.md",
             "https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/docs/packages.md",
             "https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/package.json",
+            "https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/src/core/extensions/types.ts",
+            "https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/coding-agent/src/core/agent-session.ts",
+            "https://github.com/earendil-works/pi/blob/8dc78834cde4e329284cf505f9e3f99763df5529/packages/agent/src/agent-loop.ts",
         ),
     ),
 }
@@ -212,30 +215,30 @@ _EVENTS: Final = {
         "dispose": ((), (), "flush_only"),
     },
     CaptureProfile.PI_EXTENSION_V1: {
-        "session_start": (("session_id",), ("reason",), "window_open"),
+        "session_start": (("reason", "session_id"), (), "window_open"),
         "before_agent_start": (("session_id",), (), "turn_open"),
         "tool_execution_start": (
-            ("session_id", "toolCallId"),
-            ("args", "toolName"),
-            "action_observed",
+            ("session_id", "toolCallId", "toolName"),
+            (),
+            "pre_hook_proposal",
         ),
         "tool_execution_end": (
-            ("isError", "session_id", "toolCallId"),
-            ("toolName",),
-            "provider_claimed_tool_outcome",
+            ("isError", "session_id", "toolCallId", "toolName"),
+            (),
+            "confirmed_success_or_ambiguous_error",
         ),
         "agent_settled": (("session_id",), (), "stable_unit_closed"),
         "session_compact": (
-            ("session_id",),
-            ("fromExtension", "reason", "willRetry"),
+            ("fromExtension", "reason", "session_id", "willRetry"),
+            (),
             "coverage_boundary",
         ),
         "session_tree": (
-            ("session_id",),
-            ("fromExtension", "newLeafId", "oldLeafId"),
+            ("newLeafId", "oldLeafId", "session_id"),
+            (),
             "lineage_hint_only",
         ),
-        "session_shutdown": (("session_id",), ("reason",), "window_closed"),
+        "session_shutdown": (("reason", "session_id"), (), "window_closed"),
     },
 }
 
@@ -305,14 +308,16 @@ _IGNORED_FIELDS: Final = {
         "properties.time",
     ),
     CaptureProfile.PI_EXTENSION_V1: (
-        "compaction.entries",
-        "compaction.summary",
+        "args",
+        "compactionEntry",
+        "fromExtension",
         "images",
-        "options",
         "previousSessionFile",
         "prompt",
         "result",
+        "summaryEntry",
         "systemPrompt",
+        "systemPromptOptions",
         "targetSessionFile",
     ),
 }
@@ -409,8 +414,19 @@ _COVERAGE: Final = {
         ),
     ),
     CaptureProfile.PI_EXTENSION_V1: (
-        ("observational_extension_callbacks",),
-        ("blocking_or_rewriting_hooks", "history_backfill", "rpc_json_and_session_jsonl"),
+        ("confirmed_successful_tool_executions",),
+        (
+            "blocking_or_rewriting_hooks",
+            "extension_triggered_toolless_turn_without_before_agent_start",
+            "fully_unobserved_transport_batch",
+            "history_backfill",
+            "manual_compaction_can_interrupt_active_tool_lifecycle",
+            "process_exit_without_session_shutdown",
+            "project_trust_or_extension_loading",
+            "rpc_json_and_session_jsonl",
+            "tool_execution_end_error_conflates_preflight_and_execution_failure",
+            "tool_execution_start_precedes_mutating_or_blocking_tool_call",
+        ),
     ),
 }
 
@@ -449,10 +465,10 @@ _DETECTORS: Final = {
         SignalType.CONFLICT: CapabilitySupport.UNSUPPORTED,
     },
     CaptureProfile.PI_EXTENSION_V1: {
-        SignalType.REPEATED_ACTION: CapabilitySupport.CONDITIONAL,
+        SignalType.REPEATED_ACTION: CapabilitySupport.UNSUPPORTED,
         SignalType.REPEATED_FAILURE: CapabilitySupport.UNSUPPORTED,
         SignalType.TEST_FAILURE: CapabilitySupport.UNSUPPORTED,
-        SignalType.TOOL_ERROR: CapabilitySupport.SUPPORTED,
+        SignalType.TOOL_ERROR: CapabilitySupport.UNSUPPORTED,
         SignalType.CONTEXT_SHIFT: CapabilitySupport.UNSUPPORTED,
         SignalType.STALE_CONSTRAINT: CapabilitySupport.UNSUPPORTED,
         SignalType.STAGNATION: CapabilitySupport.UNSUPPORTED,
@@ -789,6 +805,76 @@ def test_opencode_fixture_freezes_pinned_tool_states_and_runtime_only_envelope_f
     assert "properties.part.state.input" in authority["message.part.updated"].critical_fields
     assert authority["session.deleted"].critical_fields == ("properties.info.id",)
     assert authority["dispose"].critical_fields == authority["dispose"].optional_fields == ()
+
+
+def test_pi_fixture_freezes_pinned_event_shapes_enums_and_bridge_enrichment() -> None:
+    profile = capture_profile(CaptureProfile.PI_EXTENSION_V1)
+    fixture_bytes = (
+        resources.files("saliencegate.integrations").joinpath(profile.fixtures[0].path).read_bytes()
+    )
+    fixture_body = json.loads(fixture_bytes.decode("utf-8"))
+    events = fixture_body["events"]
+    payloads = {item["event_name"]: item["payload"] for item in events}
+
+    assert fixture_body["provenance"] == "fully_synthetic_no_provider_or_model_call"
+    assert tuple(payloads) == tuple(_EVENTS[CaptureProfile.PI_EXTENSION_V1])
+    assert len(events) == 8
+    assert all(payload["session_id"] == "synthetic-pi-session" for payload in payloads.values())
+
+    assert payloads["session_start"]["reason"] in {
+        "startup",
+        "reload",
+        "new",
+        "resume",
+        "fork",
+    }
+    assert payloads["session_compact"]["reason"] in {"manual", "threshold", "overflow"}
+    assert payloads["session_shutdown"]["reason"] in {
+        "quit",
+        "reload",
+        "new",
+        "resume",
+        "fork",
+    }
+    assert payloads["session_tree"]["newLeafId"] is None
+    assert type(payloads["session_tree"]["oldLeafId"]) is str
+
+    assert "previousSessionFile" in payloads["session_start"]
+    assert "systemPromptOptions" in payloads["before_agent_start"]
+    assert "options" not in payloads["before_agent_start"]
+    assert "compactionEntry" in payloads["session_compact"]
+    assert "compaction" not in payloads["session_compact"]
+    assert "summaryEntry" in payloads["session_tree"]
+    assert "fromExtension" in payloads["session_tree"]
+    assert "targetSessionFile" in payloads["session_shutdown"]
+    assert "targetSessionFile" not in payloads["session_tree"]
+
+    authority = {item.event_name: item for item in profile.events}
+    assert authority["tool_execution_start"].outcome_authority == "pre_hook_proposal"
+    assert "args" in authority["tool_execution_start"].ignored_fields
+    assert authority["tool_execution_start"].critical_fields == (
+        "session_id",
+        "toolCallId",
+        "toolName",
+    )
+    assert authority["tool_execution_end"].critical_fields == (
+        "isError",
+        "session_id",
+        "toolCallId",
+        "toolName",
+    )
+    assert authority["session_tree"].optional_fields == ()
+    assert "fromExtension" in authority["session_tree"].ignored_fields
+    repeated_action = next(
+        item for item in profile.detectors if item.signal_type is SignalType.REPEATED_ACTION
+    )
+    assert repeated_action.support is CapabilitySupport.UNSUPPORTED
+    assert repeated_action.omissions == ("pre_hook_proposals_are_not_execution_authoritative",)
+    tool_error = next(
+        item for item in profile.detectors if item.signal_type is SignalType.TOOL_ERROR
+    )
+    assert tool_error.support is CapabilitySupport.UNSUPPORTED
+    assert tool_error.omissions == ("is_error_conflates_preflight_and_execution_failure",)
 
 
 def test_binding_rejects_profile_and_manifest_digest_mismatch_without_value_leakage() -> None:
