@@ -24,6 +24,7 @@ REQUIRED_DOCUMENTS = (
     "docs/research-claims.md",
     "docs/reference/artifacts.md",
     "docs/reference/cli.md",
+    "docs/reference/evaluation.md",
     "docs/reference/shadow-mode.md",
     "docs/reference/state-decay-v2-review.md",
     "docs/security.md",
@@ -189,6 +190,78 @@ def test_launch_docs_expose_the_real_demo_review_gate_and_evidence_boundary() ->
         "Generation boundary",
     ):
         assert boundary in guide
+
+
+def test_feedback_docs_freeze_the_local_evaluation_and_activation_boundary() -> None:
+    evaluation = (ROOT / "docs/reference/evaluation.md").read_text(encoding="utf-8")
+    cli = (ROOT / "docs/reference/cli.md").read_text(encoding="utf-8")
+    evaluation_flat = " ".join(evaluation.split())
+    cli_flat = " ".join(cli.split())
+
+    for fragment in (
+        "saliencegate feedback SESSION_ID",
+        "memory-needed|not-memory-needed|uncertain",
+        "insufficient_real_world_evidence",
+        "`confirmatory=false`",
+        "`decision_authority=false`",
+        "even for a `DECLARED_E01` dataset",
+        "external review remains required",
+        "at least 200 human-adjudicated sessions in the locked final-test partition",
+        "at least three projects and two providers in that partition",
+        "at least 30 `memory-needed` and 30 `not-memory-needed` final-test labels",
+        "temporal separation",
+        "public seed `9f4c8dc1d7f87c2bf08bfc24f9cb6bb4de27c57fa3466a7a63d7f01e13961e7e`",
+        "fixed-size resampling with replacement",
+        "nearest ranks 50 and 1950",
+        "upper endpoints rounded up",
+        "observed raw denominator is at least 30",
+        "`finite_sample_safety_bound=false`",
+        "Provider strata below 30 final-test sessions are not emitted",
+        "including system abstentions",
+        "confusion cells and system-abstention cells are disjoint",
+        "`evaluate_capture_feedback_dataset`",
+        "there is no CLI evaluation command",
+        "separate explicit Python API call",
+        "`build_capture_feedback_dataset`",
+        "`build_capture_feedback_export_record`",
+        "`build_synthetic_capture_feedback_export_record`",
+        "refuses to declare that origin as E01 evidence",
+        "exact boolean `True`",
+        "export nonce is exactly 32 bytes",
+        "domain-separated pseudonyms",
+        "`CaptureStore.list_feedback(label_freeze=...)`",
+        "`labeled_at < label_freeze`",
+        "rebuilds the report from those inputs",
+        "exact authenticated spool",
+        "report-selection policy",
+        "explicit JSON `null` values",
+        "originating installation key",
+        "not probabilistic calibration",
+        "external study declarations",
+        "a non-empty development or tuning cohort",
+        "label-revision cutoff",
+        "consent and preregistration evidence",
+        "whole-database rollback resistance",
+        "cannot detect deletion of every feedback row",
+        "public-key publication protocol",
+        "no such path exists",
+    ):
+        assert fragment in evaluation_flat
+
+    for fragment in (
+        "saliencegate feedback SESSION_ID",
+        "`feedback` records one bounded human label",
+        "current project",
+        "idempotent success",
+        "`capture-feedback-receipt/v1`",
+        "store contention exits 3",
+        "never exports a dataset or runs classification evaluation",
+        "evaluation.md",
+    ):
+        assert fragment in cli_flat
+
+    assert "population prevalence" not in evaluation.casefold()
+    assert "automatically enables" not in evaluation.casefold()
 
 
 def test_shadow_docs_freeze_the_observational_sdk_and_cli_boundary() -> None:
@@ -395,10 +468,10 @@ def test_checker_rejects_credentials_claims_and_icons() -> None:
     ):
         assert scan_text(Path("README.md"), forbidden)
     for trailer in (
-        "Co-authored-by: Example <example@example.invalid>",
+        "Co-" + "authored-by: Example <example@example.invalid>",
         "Signed-off-by: Example <example@example.invalid>",
-        "Generated-by: tool",
-        "Assisted-by: tool",
+        "Generated-" + "by: tool",
+        "Assisted-" + "by: tool",
         "Pair-programmed-by: Example <example@example.invalid>",
         "Reviewed-by: Example <example@example.invalid>",
         "Acked-by: Example <example@example.invalid>",

@@ -22,6 +22,7 @@ from saliencegate.capture.delete import (
     delete_capture_project,
     delete_capture_session,
 )
+from saliencegate.capture.feedback import CaptureFeedbackLabel
 from saliencegate.capture.health import CaptureHealthCode
 from saliencegate.capture.migrations import initialize_capture_store
 from saliencegate.capture.store import (
@@ -31,7 +32,6 @@ from saliencegate.capture.store import (
     CaptureStoreIntegrityError,
     CaptureStoreMode,
     CaptureStoreStateError,
-    _feedback_material,
 )
 
 
@@ -65,6 +65,13 @@ def _session(store: CaptureStore, *, native: bytes = b"delete-session", index: i
             producer_index=index + 1,
         )
     )
+    store.append(
+        authenticated_intake(
+            "session_finished",
+            session_native=native,
+            producer_index=index + 2,
+        )
+    )
     return next(
         item.human_id for item in store.list_sessions() if item.session_id == started.session_id
     )
@@ -91,34 +98,15 @@ def _count(store: CaptureStore, table: str) -> int:
 
 def _add_authenticated_auxiliary_rows(store: CaptureStore, human_id: str) -> None:
     session = store.session_by_human_id(human_id)
-    session_row = store._session_row(session.connection_id, session.session_id)
-    assert session_row is not None
-    store._update_session(
-        session_row,
-        state=session.state,
-        event_count=session.event_count,
-        coverage_degraded=True,
+    store.mark_session_health(
+        session.connection_id,
+        session.session_id,
+        CaptureHealthCode.COVERAGE_DEGRADED,
     )
-    store._record_health(
-        connection_id=session.connection_id,
-        session_id=session.session_id,
-        code=CaptureHealthCode.COVERAGE_DEGRADED,
-    )
-    material: dict[str, object] = {
-        "label_id": "f" * 64,
-        "connection_id": session.connection_id,
-        "session_id": session.session_id,
-        "label": "memory-needed",
-        "created_at": "2026-07-20T12:00:00+00:00",
-    }
-    row_tag = store._integrity.tag("feedback", _feedback_material(material))
-    store._connection.execute(
-        """
-        INSERT INTO feedback_labels(
-            label_id, connection_id, session_id, label, created_at, row_tag
-        ) VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (*material.values(), row_tag),
+    store.record_feedback(
+        human_id,
+        CaptureFeedbackLabel.MEMORY_NEEDED,
+        project_digest=session.project_digest,
     )
 
 
@@ -132,11 +120,13 @@ def test_single_delete_drains_marks_deletes_tombstones_and_rejects_late_events(
         human_id = _session(store)
         _add_authenticated_auxiliary_rows(store, human_id)
         assert _count(store, "capture_health") == 1
-        assert _count(store, "feedback_labels") == 1
+        assert _count(store, "feedback_labels") == 2
         calls: list[str] = []
 
         def drain() -> None:
-            assert store.session_by_human_id(human_id).state is CaptureSessionState.OPEN
+            session = store.session_by_human_id(human_id)
+            assert session.state is CaptureSessionState.CLOSED
+            assert session.closed_at is not None
             calls.append("drained")
 
         receipt = delete_capture_session(store, human_id, drain=drain)

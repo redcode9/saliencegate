@@ -9,7 +9,7 @@ import re
 import sqlite3
 from collections.abc import Callable
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path, PureWindowsPath
 from threading import Lock
@@ -78,6 +78,12 @@ if TYPE_CHECKING:
     from saliencegate.capture.delete import (
         CaptureProjectDeleteReceipt,
         CaptureSessionDeleteReceipt,
+    )
+    from saliencegate.capture.feedback import (
+        CaptureFeedbackLabel,
+        CaptureFeedbackReceipt,
+        CaptureFeedbackRecord,
+        CaptureFeedbackRevision,
     )
     from saliencegate.capture.sessions import CaptureSessionSnapshot
 
@@ -244,6 +250,9 @@ class _CaptureStoreIntegrity:
         "health_set": b"saliencegate:capture-store:health-set:v1",
         "human_id": b"saliencegate:capture-store:human-id:v1",
         "feedback": b"saliencegate:capture-store:feedback:v1",
+        "feedback_id": b"saliencegate:capture-store:feedback-id:v1",
+        "feedback_anchor_id": b"saliencegate:capture-store:feedback-anchor-id:v1",
+        "feedback_record": b"saliencegate:capture:feedback-record:v1",
         "tombstone": b"saliencegate:capture-store:tombstone:v1",
     }
 
@@ -410,6 +419,46 @@ def _feedback_material(row: sqlite3.Row | dict[str, object]) -> dict[str, object
         "session_id": row["session_id"],
         "label": row["label"],
         "created_at": row["created_at"],
+    }
+
+
+def _feedback_identity_material(
+    *,
+    connection_id: str,
+    session_id: str,
+    revision: int,
+    previous_label_id: str | None,
+    label: str,
+    created_at: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": "capture-feedback-id/v1",
+        "connection_id": connection_id,
+        "session_id": session_id,
+        "revision": revision,
+        "previous_label_id": previous_label_id,
+        "label": label,
+        "created_at": created_at,
+    }
+
+
+def _feedback_anchor_identity_material(
+    *,
+    connection_id: str,
+    session_id: str,
+    revision_count: int,
+    head_label_id: str,
+    label: str,
+    created_at: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": "capture-feedback-anchor-id/v1",
+        "connection_id": connection_id,
+        "session_id": session_id,
+        "revision_count": revision_count,
+        "head_label_id": head_label_id,
+        "label": label,
+        "created_at": created_at,
     }
 
 
@@ -1386,6 +1435,426 @@ class CaptureStore:
             self._revalidate_boundary()
             return result
 
+    def record_feedback(
+        self,
+        human_id: str,
+        label: CaptureFeedbackLabel,
+        *,
+        project_digest: str,
+    ) -> CaptureFeedbackReceipt:
+        """Append one authenticated label revision to an explicitly bound session."""
+
+        from saliencegate.capture.feedback import (
+            MAX_CAPTURE_FEEDBACK_REVISIONS_PER_SESSION,
+            CaptureFeedbackLabel,
+            CaptureFeedbackReceipt,
+            CaptureFeedbackWriteDisposition,
+        )
+
+        self._require_maintenance()
+        human_id = self._validate_human_id(human_id)
+        project_digest = self._validate_project_digest(project_digest)
+        if type(label) is not CaptureFeedbackLabel:
+            raise CaptureStoreStateError()
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            self._begin_immediate()
+            try:
+                identity = self._connection.execute(
+                    """
+                    SELECT connection_id, session_id
+                    FROM capture_sessions
+                    WHERE human_id = ?
+                    """,
+                    (human_id,),
+                ).fetchone()
+                if identity is None:
+                    raise CaptureStoreStateError()
+                connection_id = identity["connection_id"]
+                session_id = identity["session_id"]
+                connection = self._connection_row(connection_id)
+                if not hmac.compare_digest(connection["project_digest"], project_digest):
+                    raise CaptureStoreStateError()
+                session = self._session_row(connection_id, session_id)
+                if session is None:
+                    raise CaptureStoreIntegrityError()
+                if (
+                    connection["state"] == CaptureConnectionState.DELETING.value
+                    or session["state"] != CaptureSessionState.CLOSED.value
+                ):
+                    raise CaptureStoreStateError()
+                self._session_summary(connection, session)
+                rows = self._verified_feedback_rows(connection_id, session_id)
+                if rows and rows[-1]["label"] == label.value:
+                    result = CaptureFeedbackReceipt(
+                        session_id=human_id,
+                        label=label,
+                        disposition=CaptureFeedbackWriteDisposition.UNCHANGED,
+                        revision_count=len(rows),
+                        labeled_at=_stored_timestamp(rows[-1]["created_at"]),
+                    )
+                    self._connection.commit()
+                else:
+                    if len(rows) >= MAX_CAPTURE_FEEDBACK_REVISIONS_PER_SESSION:
+                        raise CaptureStoreStateError()
+                    revision = len(rows) + 1
+                    created_at = _now()
+                    timestamp = _stored_timestamp(created_at)
+                    if timestamp.tzinfo is None or timestamp.utcoffset() != timedelta(0):
+                        raise CaptureStoreIntegrityError()
+                    timestamp = timestamp.astimezone(UTC)
+                    created_at = timestamp.isoformat()
+                    previous_label_id = None if not rows else rows[-1]["label_id"]
+                    if not rows:
+                        closed_at = _stored_timestamp(session["closed_at"])
+                        if timestamp < closed_at:
+                            timestamp = closed_at
+                            created_at = timestamp.isoformat()
+                    else:
+                        previous_anchor = self._connection.execute(
+                            """
+                            SELECT * FROM feedback_labels
+                            WHERE connection_id = ? AND session_id = ?
+                            ORDER BY created_at DESC, label_id DESC
+                            LIMIT 1
+                            """,
+                            (connection_id, session_id),
+                        ).fetchone()
+                        if previous_anchor is None:
+                            raise CaptureStoreIntegrityError()
+                        previous_timestamp = _stored_timestamp(previous_anchor["created_at"])
+                        if timestamp <= previous_timestamp:
+                            timestamp = previous_timestamp + timedelta(microseconds=1)
+                            created_at = timestamp.isoformat()
+                        deleted_anchor = self._connection.execute(
+                            "DELETE FROM feedback_labels WHERE label_id = ?",
+                            (previous_anchor["label_id"],),
+                        )
+                        if deleted_anchor.rowcount != 1:
+                            raise CaptureStoreIntegrityError()
+                    label_id = self._integrity.tag(
+                        "feedback_id",
+                        _feedback_identity_material(
+                            connection_id=connection_id,
+                            session_id=session_id,
+                            revision=revision,
+                            previous_label_id=previous_label_id,
+                            label=label.value,
+                            created_at=created_at,
+                        ),
+                    )
+                    material: dict[str, object] = {
+                        "label_id": label_id,
+                        "connection_id": connection_id,
+                        "session_id": session_id,
+                        "label": label.value,
+                        "created_at": created_at,
+                    }
+                    row_tag = self._integrity.tag("feedback", _feedback_material(material))
+                    self._connection.execute(
+                        """
+                        INSERT INTO feedback_labels(
+                            label_id, connection_id, session_id, label, created_at, row_tag
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            label_id,
+                            connection_id,
+                            session_id,
+                            label.value,
+                            created_at,
+                            row_tag,
+                        ),
+                    )
+                    anchor_timestamp = timestamp + timedelta(microseconds=1)
+                    anchor_created_at = anchor_timestamp.isoformat()
+                    anchor_id = self._integrity.tag(
+                        "feedback_anchor_id",
+                        _feedback_anchor_identity_material(
+                            connection_id=connection_id,
+                            session_id=session_id,
+                            revision_count=revision,
+                            head_label_id=label_id,
+                            label=label.value,
+                            created_at=anchor_created_at,
+                        ),
+                    )
+                    anchor_material: dict[str, object] = {
+                        "label_id": anchor_id,
+                        "connection_id": connection_id,
+                        "session_id": session_id,
+                        "label": label.value,
+                        "created_at": anchor_created_at,
+                    }
+                    anchor_tag = self._integrity.tag(
+                        "feedback",
+                        _feedback_material(anchor_material),
+                    )
+                    self._connection.execute(
+                        """
+                        INSERT INTO feedback_labels(
+                            label_id, connection_id, session_id, label, created_at, row_tag
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            anchor_id,
+                            connection_id,
+                            session_id,
+                            label.value,
+                            anchor_created_at,
+                            anchor_tag,
+                        ),
+                    )
+                    disposition = (
+                        CaptureFeedbackWriteDisposition.RECORDED
+                        if revision == 1
+                        else CaptureFeedbackWriteDisposition.CHANGED
+                    )
+                    result = CaptureFeedbackReceipt(
+                        session_id=human_id,
+                        label=label,
+                        disposition=disposition,
+                        revision_count=revision,
+                        labeled_at=timestamp,
+                    )
+                    self._fault("feedback_before_commit")
+                    self._connection.commit()
+                    self._fault("feedback_after_commit")
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except sqlite3.Error:
+                self._rollback()
+                raise CaptureStoreError() from None
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return result
+
+    def feedback_history(
+        self,
+        human_id: str,
+        *,
+        project_digest: str,
+    ) -> tuple[CaptureFeedbackRevision, ...]:
+        """Return every authenticated label revision in deterministic order."""
+
+        from saliencegate.capture.feedback import (
+            CaptureFeedbackLabel,
+            CaptureFeedbackRevision,
+        )
+
+        self._require_maintenance()
+        human_id = self._validate_human_id(human_id)
+        project_digest = self._validate_project_digest(project_digest)
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            self._begin_immediate()
+            try:
+                identity = self._connection.execute(
+                    """
+                    SELECT connection_id, session_id
+                    FROM capture_sessions
+                    WHERE human_id = ?
+                    """,
+                    (human_id,),
+                ).fetchone()
+                if identity is None:
+                    raise CaptureStoreStateError()
+                connection_id = identity["connection_id"]
+                session_id = identity["session_id"]
+                connection = self._connection_row(connection_id)
+                if not hmac.compare_digest(connection["project_digest"], project_digest):
+                    raise CaptureStoreStateError()
+                session = self._session_row(connection_id, session_id)
+                if session is None:
+                    raise CaptureStoreIntegrityError()
+                if (
+                    connection["state"] == CaptureConnectionState.DELETING.value
+                    or session["state"] == CaptureSessionState.DELETING.value
+                ):
+                    raise CaptureStoreStateError()
+                self._session_summary(connection, session)
+                rows = self._verified_feedback_rows(connection_id, session_id)
+                result = tuple(
+                    CaptureFeedbackRevision(
+                        session_id=human_id,
+                        label=CaptureFeedbackLabel(row["label"]),
+                        revision=revision,
+                        created_at=_stored_timestamp(row["created_at"]),
+                    )
+                    for revision, row in enumerate(rows, start=1)
+                )
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except sqlite3.Error:
+                self._rollback()
+                raise CaptureStoreError() from None
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return result
+
+    def list_feedback(
+        self,
+        *,
+        project_digest: str | None = None,
+        label_freeze: datetime | None = None,
+        limit: int = 1_000,
+    ) -> tuple[CaptureFeedbackRecord, ...]:
+        """Return authenticated labels strictly before an optional UTC freeze."""
+
+        from saliencegate.capture.feedback import (
+            CaptureFeedbackRecord,
+            _feedback_record_material,
+        )
+
+        self._require_maintenance()
+        if project_digest is not None:
+            project_digest = self._validate_project_digest(project_digest)
+        if (
+            (
+                label_freeze is not None
+                and (
+                    type(label_freeze) is not datetime
+                    or label_freeze.tzinfo is None
+                    or label_freeze.utcoffset() != timedelta(0)
+                    or label_freeze != label_freeze.astimezone(UTC)
+                )
+            )
+            or type(limit) is not int
+            or not 1 <= limit <= _MAX_CAPTURE_QUERY_RESULTS
+        ):
+            raise CaptureStoreStateError()
+        freeze_text = None if label_freeze is None else label_freeze.isoformat()
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            self._begin_immediate()
+            try:
+                identities = self._connection.execute(
+                    """
+                    SELECT sessions.connection_id, sessions.session_id
+                    FROM capture_sessions AS sessions
+                    JOIN connections
+                      ON connections.connection_id = sessions.connection_id
+                    WHERE (? IS NULL OR connections.project_digest = ?)
+                      AND EXISTS (
+                          SELECT 1
+                          FROM feedback_labels AS feedback
+                          WHERE feedback.connection_id = sessions.connection_id
+                            AND feedback.session_id = sessions.session_id
+                            AND (? IS NULL OR feedback.created_at < ?)
+                      )
+                    ORDER BY sessions.human_id ASC
+                    LIMIT ?
+                    """,
+                    (
+                        project_digest,
+                        project_digest,
+                        freeze_text,
+                        freeze_text,
+                        limit + 1,
+                    ),
+                ).fetchall()
+                if len(identities) > limit:
+                    raise CaptureStoreStateError()
+                records: list[CaptureFeedbackRecord] = []
+                for identity in identities:
+                    connection = self._connection_row(identity["connection_id"])
+                    if project_digest is not None and not hmac.compare_digest(
+                        connection["project_digest"],
+                        project_digest,
+                    ):
+                        raise CaptureStoreIntegrityError()
+                    session = self._session_row(
+                        identity["connection_id"],
+                        identity["session_id"],
+                    )
+                    if session is None:
+                        raise CaptureStoreIntegrityError()
+                    if (
+                        connection["state"] == CaptureConnectionState.DELETING.value
+                        or session["state"] == CaptureSessionState.DELETING.value
+                    ):
+                        raise CaptureStoreStateError()
+                    summary = self._session_summary(connection, session)
+                    rows = self._verified_feedback_rows(
+                        identity["connection_id"],
+                        identity["session_id"],
+                    )
+                    if not rows:
+                        raise CaptureStoreIntegrityError()
+                    selected_rows = (
+                        rows
+                        if label_freeze is None
+                        else tuple(
+                            row
+                            for row in rows
+                            if _stored_timestamp(row["created_at"]) < label_freeze
+                        )
+                    )
+                    if not selected_rows:
+                        raise CaptureStoreIntegrityError()
+                    latest = selected_rows[-1]
+                    unsigned = CaptureFeedbackRecord.model_validate_json(
+                        canonical_json(
+                            {
+                                "schema_version": "capture-feedback-record/v1",
+                                "project_digest": summary.project_digest,
+                                "profile_id": summary.profile_id.value,
+                                "session_id": summary.session_id,
+                                "human_id": summary.human_id,
+                                "label": latest["label"],
+                                "revision_count": len(selected_rows),
+                                "labeled_at": latest["created_at"],
+                                "record_tag": "0" * 64,
+                            }
+                        )
+                    )
+                    body = _feedback_record_material(unsigned)
+                    records.append(
+                        CaptureFeedbackRecord.model_validate_json(
+                            canonical_json(
+                                {
+                                    **body,
+                                    "record_tag": self._integrity.tag(
+                                        "feedback_record",
+                                        body,
+                                    ),
+                                }
+                            )
+                        )
+                    )
+                result = tuple(records)
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except sqlite3.Error:
+                self._rollback()
+                raise CaptureStoreError() from None
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return result
+
     def latest_session(
         self,
         *,
@@ -1709,20 +2178,104 @@ class CaptureStore:
         connection_id: str,
         session_id: str,
     ) -> tuple[sqlite3.Row, ...]:
+        from saliencegate.capture.feedback import (
+            MAX_CAPTURE_FEEDBACK_REVISIONS_PER_SESSION,
+            CaptureFeedbackLabel,
+        )
+
         rows = self._connection.execute(
             """
             SELECT * FROM feedback_labels
             WHERE connection_id = ? AND session_id = ?
-            ORDER BY label_id
+            ORDER BY created_at, label_id
             """,
             (connection_id, session_id),
         ).fetchall()
+        if not rows:
+            return ()
+        if not 2 <= len(rows) <= MAX_CAPTURE_FEEDBACK_REVISIONS_PER_SESSION + 1:
+            raise CaptureStoreIntegrityError()
+        anchor = rows[-1]
+        revision_rows = rows[:-1]
         verified: list[sqlite3.Row] = []
-        for row in rows:
+        previous_label_id: str | None = None
+        previous_label: CaptureFeedbackLabel | None = None
+        previous_created_at: datetime | None = None
+        for revision, row in enumerate(revision_rows, start=1):
+            try:
+                label = CaptureFeedbackLabel(row["label"])
+            except (TypeError, ValueError):
+                raise CaptureStoreIntegrityError() from None
+            created_at = _stored_timestamp(row["created_at"])
+            if (
+                row["connection_id"] != connection_id
+                or row["session_id"] != session_id
+                or created_at.tzinfo is None
+                or created_at.utcoffset() != timedelta(0)
+                or row["created_at"] != created_at.astimezone(UTC).isoformat()
+                or (previous_created_at is not None and created_at <= previous_created_at)
+                or (previous_label is not None and label is previous_label)
+            ):
+                raise CaptureStoreIntegrityError()
+            expected_label_id = self._integrity.tag(
+                "feedback_id",
+                _feedback_identity_material(
+                    connection_id=connection_id,
+                    session_id=session_id,
+                    revision=revision,
+                    previous_label_id=previous_label_id,
+                    label=label.value,
+                    created_at=row["created_at"],
+                ),
+            )
+            if type(row["label_id"]) is not str or not hmac.compare_digest(
+                row["label_id"],
+                expected_label_id,
+            ):
+                raise CaptureStoreIntegrityError()
             expected = self._integrity.tag("feedback", _feedback_material(row))
             if type(row["row_tag"]) is not str or not hmac.compare_digest(row["row_tag"], expected):
                 raise CaptureStoreIntegrityError()
             verified.append(cast(sqlite3.Row, row))
+            previous_label_id = row["label_id"]
+            previous_label = label
+            previous_created_at = created_at
+        if previous_label_id is None or previous_label is None or previous_created_at is None:
+            raise CaptureStoreIntegrityError()
+        try:
+            anchor_label = CaptureFeedbackLabel(anchor["label"])
+        except (TypeError, ValueError):
+            raise CaptureStoreIntegrityError() from None
+        anchor_created_at = _stored_timestamp(anchor["created_at"])
+        expected_anchor_id = self._integrity.tag(
+            "feedback_anchor_id",
+            _feedback_anchor_identity_material(
+                connection_id=connection_id,
+                session_id=session_id,
+                revision_count=len(revision_rows),
+                head_label_id=previous_label_id,
+                label=previous_label.value,
+                created_at=anchor["created_at"],
+            ),
+        )
+        expected_anchor_tag = self._integrity.tag(
+            "feedback",
+            _feedback_material(anchor),
+        )
+        if (
+            anchor["connection_id"] != connection_id
+            or anchor["session_id"] != session_id
+            or anchor_label is not previous_label
+            or anchor_created_at.tzinfo is None
+            or anchor_created_at.utcoffset() != timedelta(0)
+            or anchor["created_at"] != anchor_created_at.astimezone(UTC).isoformat()
+            or anchor_created_at <= previous_created_at
+            or type(anchor["label_id"]) is not str
+            or type(anchor["row_tag"]) is not str
+            or not hmac.compare_digest(anchor["label_id"], expected_anchor_id)
+            or not hmac.compare_digest(anchor["row_tag"], expected_anchor_tag)
+        ):
+            raise CaptureStoreIntegrityError()
         return tuple(verified)
 
     def _load_verified_health_rows(
@@ -1995,6 +2548,7 @@ class CaptureStore:
                 ORDER BY connection_id, session_id
                 """
             ).fetchall()
+            verified_feedback_count = 0
             for session_identity in session_rows:
                 connection_id = session_identity["connection_id"]
                 session_id = session_identity["session_id"]
@@ -2003,15 +2557,16 @@ class CaptureStore:
                     raise CaptureStoreIntegrityError()
                 head = self._head_row(connection_id, session_id)
                 self._verify_chain(connection_id, session_id, session, head)
-            feedback_rows = self._connection.execute(
-                "SELECT * FROM feedback_labels ORDER BY label_id"
-            ).fetchall()
-            for feedback in feedback_rows:
-                expected = self._integrity.tag("feedback", _feedback_material(feedback))
-                if type(feedback["row_tag"]) is not str or not hmac.compare_digest(
-                    feedback["row_tag"], expected
-                ):
-                    raise CaptureStoreIntegrityError()
+                feedback_rows = self._verified_feedback_rows(connection_id, session_id)
+                verified_feedback_count += len(feedback_rows) + bool(feedback_rows)
+            persisted_feedback_count = self._connection.execute(
+                "SELECT COUNT(*) FROM feedback_labels"
+            ).fetchone()[0]
+            if (
+                type(persisted_feedback_count) is not int
+                or persisted_feedback_count != verified_feedback_count
+            ):
+                raise CaptureStoreIntegrityError()
             tombstone_rows = self._connection.execute(
                 """
                 SELECT connection_id, session_id
@@ -2653,9 +3208,14 @@ class CaptureStore:
         if transport_head_tag is not None:
             material["transport_head_tag"] = transport_head_tag
         material["updated_at"] = _now()
-        material["closed_at"] = (
-            material["updated_at"] if state is CaptureSessionState.CLOSED else None
-        )
+        if state is CaptureSessionState.CLOSED:
+            material["closed_at"] = (
+                row["closed_at"]
+                if row["state"] == CaptureSessionState.CLOSED.value and row["closed_at"] is not None
+                else material["updated_at"]
+            )
+        else:
+            material["closed_at"] = None
         row_tag = self._integrity.tag("session", _session_material(material))
         result = self._connection.execute(
             """

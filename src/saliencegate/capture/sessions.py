@@ -159,7 +159,6 @@ class CaptureSessionSnapshot(_CaptureSnapshotModel):
             or self.compatibility_status is CompatibilityStatus.INCOMPATIBLE
             or self.event_count != len(self.events)
             or ((self.state is CaptureSessionState.CLOSED) != (self.closed_at is not None))
-            or (self.closed_at is not None and self.closed_at != self.updated_at)
             or (self.state is CaptureSessionState.CLOSED and final_kind != "session_finished")
             or (self.state is CaptureSessionState.OPEN and has_session_finished)
             or ((bool(self.health) or self.unattributed_drop) and not self.coverage_degraded)

@@ -41,6 +41,9 @@ def test_capture_query_parsers_expose_the_locked_surface() -> None:
     )
     latest = parser.parse_args(("report", "--latest", "--output", "report.json", "--replace"))
     selected = parser.parse_args(("report", "sgabcdefghijkl", "--json"))
+    feedback = parser.parse_args(
+        ("feedback", "sgabcdefghijkl", "--label", "memory-needed", "--json")
+    )
 
     assert vars(disconnect) == {
         "command": "disconnect",
@@ -75,6 +78,12 @@ def test_capture_query_parsers_expose_the_locked_surface() -> None:
         "session_id": "sgabcdefghijkl",
         "output": None,
         "replace": False,
+        "json": True,
+    }
+    assert vars(feedback) == {
+        "command": "feedback",
+        "session_id": "sgabcdefghijkl",
+        "label": "memory-needed",
         "json": True,
     }
 
@@ -116,6 +125,9 @@ def test_delete_parser_requires_one_explicit_scope() -> None:
         ("sessions", "--limit", "not-an-integer"),
         ("report",),
         ("report", "--latest", "sgabcdefghijkl"),
+        ("feedback", "sgabcdefghijkl"),
+        ("feedback", "sgabcdefghijkl", "--label", "unknown"),
+        ("feedback", "sgabcdefghijkl", "--lab", "memory-needed"),
         ("delete",),
         ("delete", "sgabcdefghijkl", "--all"),
     ),
@@ -141,6 +153,27 @@ def test_connect_help_is_short_and_copyable(run_cli: RunCli) -> None:
     assert "--dry-run" in completed.stdout
     assert "--json" in completed.stdout
     assert len(completed.stdout.splitlines()) <= 12
+
+
+def test_feedback_help_is_exact_and_copyable(run_cli: RunCli) -> None:
+    completed = run_cli("feedback", "--help")
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    assert completed.stdout == (
+        "usage: saliencegate feedback [-h] --label\n"
+        "                             {memory-needed,not-memory-needed,uncertain}\n"
+        "                             [--json]\n"
+        "                             session_id\n"
+        "\n"
+        "positional arguments:\n"
+        "  session_id\n"
+        "\n"
+        "options:\n"
+        "  -h, --help            show this help message and exit\n"
+        "  --label {memory-needed,not-memory-needed,uncertain}\n"
+        "  --json\n"
+    )
 
 
 def test_doctor_parser_accepts_the_read_only_capture_probe() -> None:
@@ -189,17 +222,28 @@ def test_capture_command_failures_use_stable_content_free_exits(
     unavailable = run_cli("report", "sgabcdefghijkl", "--json")
     invalid = run_cli("delete", "--all", "--project", str(project))
     missing_report = run_cli("report", "--latest", "--json")
+    missing_feedback = run_cli(
+        "feedback",
+        "sgabcdefghijkl",
+        "--label",
+        "uncertain",
+        "--json",
+    )
 
-    assert unavailable.returncode == 4
+    assert unavailable.returncode == missing_feedback.returncode == 4
     assert unavailable.stdout == ""
+    assert missing_feedback.stdout == ""
     assert unavailable.stderr == "error: capture integration is unavailable\n"
+    assert missing_feedback.stderr == "error: capture integration is unavailable\n"
     assert invalid.returncode == 2
     assert invalid.stdout == ""
     assert invalid.stderr == "error: capture command input is invalid\n"
     assert missing_report.returncode == 4
     assert missing_report.stdout == ""
     assert missing_report.stderr == "error: capture integration is unavailable\n"
-    assert "fixture-secret" not in unavailable.stderr + invalid.stderr + missing_report.stderr
+    assert "fixture-secret" not in (
+        unavailable.stderr + invalid.stderr + missing_report.stderr + missing_feedback.stderr
+    )
 
 
 def test_delete_all_connected_error_directs_the_user_to_disconnect(

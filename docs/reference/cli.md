@@ -37,6 +37,33 @@ status. A reader closing a pipe early is treated as success. A keyboard interrup
 | `70` | Unexpected internal error, reported without input values |
 | `130` | Keyboard interruption |
 
+## `feedback`
+
+Artifact-compatible after installation:
+
+```text
+saliencegate feedback SESSION_ID \
+  --label memory-needed|not-memory-needed|uncertain \
+  [--json]
+```
+
+`feedback` records one bounded human label for a **closed** captured session in the current project.
+The session must be addressed by its short SalienceGate identifier; open, quarantined,
+provider-native, and cross-project sessions are rejected. Repeating the current label is an
+idempotent success. Changing the label records an authenticated revision without copying captured
+events or provider content.
+
+The human result contains only the short session identifier, label, write disposition, and bounded
+revision count. `--json` emits one compact canonical `capture-feedback-receipt/v1` object and also
+includes the local label timestamp. Missing, open, quarantined, or wrong-project sessions exit 2;
+local configuration or store contention exits 3; unavailable local capture state exits 4; and
+authenticated-store corruption exits 5. Error text never echoes the session identifier, label,
+project, path, or exception detail.
+
+The command never exports a dataset or runs classification evaluation. Those are separate explicit
+Python APIs described in the [feedback and evaluation reference](evaluation.md). Recording a label
+does not enable a reminder, injection, or any other active behavior.
+
 ## `doctor`
 
 Artifact-compatible after installation:

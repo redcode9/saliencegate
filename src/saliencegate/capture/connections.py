@@ -72,11 +72,8 @@ class CaptureSessionSummary(_CaptureQueryModel):
 
     @model_validator(mode="after")
     def commitments_are_consistent(self) -> Self:
-        if (
-            self.updated_at < self.opened_at
-            or ((self.state is CaptureSessionState.CLOSED) != (self.closed_at is not None))
-            or (self.closed_at is not None and self.closed_at != self.updated_at)
-            or (self.unattributed_drop and not self.coverage_degraded)
+        if ((self.state is CaptureSessionState.CLOSED) != (self.closed_at is not None)) or (
+            self.unattributed_drop and not self.coverage_degraded
         ):
             raise ValueError("capture session summary commitments are inconsistent")
         return self

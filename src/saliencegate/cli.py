@@ -177,6 +177,15 @@ def _parser() -> _SafeArgumentParser:
     report.add_argument("--replace", action="store_true")
     report.add_argument("--json", action="store_true")
 
+    feedback = commands.add_parser("feedback", help="Record local capture feedback")
+    feedback.add_argument("session_id")
+    feedback.add_argument(
+        "--label",
+        required=True,
+        choices=("memory-needed", "not-memory-needed", "uncertain"),
+    )
+    feedback.add_argument("--json", action="store_true")
+
     delete = commands.add_parser("delete", help="Delete local passive capture records")
     delete_target = delete.add_mutually_exclusive_group(required=True)
     delete_target.add_argument("session_id", nargs="?")
@@ -407,6 +416,25 @@ def _dispatch_capture_report(arguments: argparse.Namespace) -> ExitCode:
         render_capture_session_report_json(report)
         if arguments.json
         else render_capture_session_report_human(report)
+    )
+    return ExitCode.SUCCESS
+
+
+def _dispatch_capture_feedback(arguments: argparse.Namespace) -> ExitCode:
+    from saliencegate.commands.capture.feedback import (
+        render_capture_feedback_human,
+        render_capture_feedback_json,
+        run_capture_feedback,
+    )
+
+    report = run_capture_feedback(
+        session_id=arguments.session_id,
+        label=arguments.label,
+    )
+    _write_stdout(
+        render_capture_feedback_json(report)
+        if arguments.json
+        else render_capture_feedback_human(report)
     )
     return ExitCode.SUCCESS
 
@@ -642,6 +670,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _dispatch_sessions(arguments)
         if arguments.command == "report":
             return _dispatch_capture_report(arguments)
+        if arguments.command == "feedback":
+            return _dispatch_capture_feedback(arguments)
         if arguments.command == "delete":
             return _dispatch_delete(arguments)
         if arguments.command == "replay":

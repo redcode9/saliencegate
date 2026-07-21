@@ -1366,6 +1366,41 @@ def test_open_rejects_forged_auxiliary_integrity_tags_without_repair(
     _assert_open_rejected_without_repair(path, forged_rows)
 
 
+def test_open_rejects_orphaned_feedback_rows_without_repair(tmp_path: Path) -> None:
+    path = tmp_path / "orphaned-feedback.sqlite3"
+    _create_admitted_session(path)
+    with CaptureStore.open(
+        path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.MAINTENANCE,
+    ) as store:
+        store._connection.execute("PRAGMA foreign_keys = OFF")
+        store._connection.execute(
+            """
+            INSERT INTO feedback_labels(
+                label_id, connection_id, session_id,
+                label, created_at, row_tag
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "e" * 64,
+                CONNECTION_ID,
+                "f" * 64,
+                "memory-needed",
+                "2000-01-01T00:00:00+00:00",
+                "0" * 64,
+            ),
+        )
+        store._connection.commit()
+
+        tampered_rows = _database_rows(path)
+        assert len(tampered_rows["feedback_labels"]) == 1
+        with pytest.raises(CaptureStoreIntegrityError):
+            store._verify_all_state()
+        assert _database_rows(path) == tampered_rows
+
+
 def test_validly_authenticated_database_rollback_is_explicitly_outside_the_threat_model(
     tmp_path: Path,
 ) -> None:

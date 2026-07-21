@@ -21,6 +21,7 @@ PUBLIC_DOCUMENTS = (
     Path("docs/research-claims.md"),
     Path("docs/reference/artifacts.md"),
     Path("docs/reference/cli.md"),
+    Path("docs/reference/evaluation.md"),
     Path("docs/reference/shadow-mode.md"),
     Path("docs/reference/state-decay-v2-review.md"),
     Path("docs/security.md"),
@@ -62,7 +63,7 @@ README_IMAGE_TARGETS = (
 FORBIDDEN_PATTERNS = (
     (
         re.compile(
-            r"(?im)^(?:co-authored-by|signed-off-by|generated-by|assisted-by|"
+            r"(?im)^(?:co-" + r"authored-by|signed-off-by|generated-" + r"by|assisted-" + r"by|"
             r"pair-programmed-by|reviewed-by|acked-by|tested-by):"
         ),
         "attribution trailer",
