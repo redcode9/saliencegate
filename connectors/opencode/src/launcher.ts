@@ -1,6 +1,10 @@
 import path from "node:path";
 
-import { BridgeContractError } from "@saliencegate/bridge-core";
+import {
+  BridgeContractError,
+  copyLauncherEnvironment,
+  type LauncherEnvironment,
+} from "@saliencegate/bridge-core";
 
 export type LauncherInvocation = Readonly<{
   file: string;
@@ -13,19 +17,10 @@ export type LauncherInvocation = Readonly<{
   };
 }>;
 
-function checkedEnvironment(value: Record<string, string>): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (key.includes("\0") || item.includes("\0")) throw new BridgeContractError();
-    result[key] = item;
-  }
-  return result;
-}
-
 export function launcherInvocation(input: {
   platform: NodeJS.Platform;
   launcherPath: string;
-  environment: Record<string, string>;
+  environment: LauncherEnvironment;
 }): LauncherInvocation {
   try {
     if (
@@ -36,7 +31,7 @@ export function launcherInvocation(input: {
     ) {
       throw new BridgeContractError();
     }
-    const environment = checkedEnvironment(input.environment);
+    const environment = copyLauncherEnvironment(input.environment);
     const options = {
       shell: false as const,
       windowsHide: true as const,

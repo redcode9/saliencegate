@@ -1163,7 +1163,8 @@ def test_hook_replay_rejects_an_authenticated_event_unreachable_from_the_head(
         mode=CaptureStoreMode.HOOK,
     ) as store:
         store.append(current)
-        store.append(tail)
+        tail_receipt = store.append(tail)
+    assert tail_receipt.event_tag is not None
     with CaptureStore.open(
         fork_path,
         installation_key=INSTALLATION_KEY,
@@ -1312,6 +1313,50 @@ def test_hook_append_reaudits_a_cached_chain_after_a_peer_commit(tmp_path: Path)
         assert _database_rows(path) == tampered_rows
 
     _assert_open_rejected_without_repair(path, tampered_rows)
+
+
+def test_fresh_hook_append_rejects_corrupted_interior_event_json(tmp_path: Path) -> None:
+    path = tmp_path / "cold-interior-event-json.sqlite3"
+    start = authenticated_intake("session_started", producer_index=1)
+    current = authenticated_intake("action_started", producer_index=2)
+    tail = authenticated_intake("turn_finished", producer_index=3)
+    fresh = authenticated_intake("turn_finished", producer_index=4)
+
+    with initialized_store(path) as maintenance:
+        register_connection(maintenance)
+        maintenance.append(start)
+        maintenance.append(current)
+        maintenance.append(tail)
+
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT event_json FROM capture_events WHERE receipt_ordinal = 2"
+        ).fetchone()
+        assert row is not None and type(row[0]) is bytes
+        tampered_json = row[0].replace(b'"captured"', b'"degraded"')
+        assert tampered_json != row[0] and len(tampered_json) == len(row[0])
+        updated = connection.execute(
+            "UPDATE capture_events SET event_json = ? WHERE receipt_ordinal = 2",
+            (tampered_json,),
+        )
+        assert updated.rowcount == 1
+        connection.commit()
+    finally:
+        connection.close()
+
+    tampered_rows = _database_rows(path)
+    with (
+        CaptureStore.open(
+            path,
+            installation_key=INSTALLATION_KEY,
+            busy_timeout_ms=250,
+            mode=CaptureStoreMode.HOOK,
+        ) as store,
+        pytest.raises(CaptureStoreIntegrityError),
+    ):
+        store.append(fresh)
+    assert _database_rows(path) == tampered_rows
 
 
 @pytest.mark.parametrize("forged_row", ("deleted-session", "feedback-label"))

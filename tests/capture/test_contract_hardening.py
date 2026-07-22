@@ -165,16 +165,20 @@ def test_registry_loader_rejects_noncanonical_and_malformed_installed_bytes(
         .joinpath("profiles.json")
         .read_bytes()
     )
-
-    for payload in (source + b"\n", b'{"native-secret":'):
-        monkeypatch.setattr(
-            capabilities_module.resources,
-            "files",
-            lambda _package, payload=payload: _ResourceBytes(payload),
-        )
-        with pytest.raises(CaptureCapabilityError) as captured:
-            load_capture_capability_registry()
-        assert "native-secret" not in str(captured.value)
+    cache = capabilities_module._load_verified_capture_capability_registry
+    cache.cache_clear()
+    try:
+        for payload in (source + b"\n", b'{"native-secret":'):
+            monkeypatch.setattr(
+                capabilities_module.resources,
+                "files",
+                lambda _package, payload=payload: _ResourceBytes(payload),
+            )
+            with pytest.raises(CaptureCapabilityError) as captured:
+                load_capture_capability_registry()
+            assert "native-secret" not in str(captured.value)
+    finally:
+        cache.cache_clear()
 
 
 def test_manifest_entry_points_revalidate_types_and_hide_dependency_failures(

@@ -13,7 +13,7 @@ from saliencegate.capture.capabilities import (
 )
 from saliencegate.capture.identities import CaptureDigestContext
 from saliencegate.capture.schema import CaptureIntake
-from saliencegate.domain.records import Sha256Digest
+from saliencegate.domain.primitives import Sha256Digest
 
 CAPTURE_ADAPTER_PROTOCOL_VERSION: Final = "capture-adapter/v1"
 

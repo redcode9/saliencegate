@@ -14,12 +14,17 @@
     "connectors/pi"
   ],
   "scripts": {
-    "connector:typecheck": "tsc --project connectors/tsconfig.json --noEmit",
-    "connector:test": "npm run connector:typecheck && node --test connectors/bridge-core/test/*.test.ts connectors/opencode/test/*.test.ts connectors/pi/test/*.test.ts",
-    "connector:test:opencode": "npm run connector:typecheck && node --test connectors/bridge-core/test/*.test.ts connectors/opencode/test/*.test.ts",
-    "connector:test:pi": "npm run connector:typecheck && node --test connectors/bridge-core/test/*.test.ts connectors/pi/test/*.test.ts",
-    "connector:build": "node connectors/scripts/build-connectors.mjs",
-    "connector:build:check": "node connectors/scripts/build-connectors.mjs --check"
+    "connector:network-denial:selftest": "node --import ./connectors/scripts/deny-network.mjs ./connectors/scripts/deny-network-selftest.mjs",
+    "connector:typecheck": "node --import ./connectors/scripts/deny-network.mjs ./node_modules/typescript/bin/tsc --project connectors/tsconfig.json --noEmit",
+    "connector:test:unit": "node --import ./connectors/scripts/deny-network.mjs --test connectors/bridge-core/test/bridge-core.test.ts connectors/bridge-core/test/windowed-transport.test.ts connectors/opencode/test/opencode.test.ts connectors/opencode/test/runtime.test.ts connectors/pi/test/pi.test.ts connectors/pi/test/runtime.test.ts",
+    "connector:test": "npm run connector:network-denial:selftest && npm run connector:typecheck && npm run connector:test:unit",
+    "connector:test:opencode": "npm run connector:network-denial:selftest && npm run connector:typecheck && node --import ./connectors/scripts/deny-network.mjs --test connectors/bridge-core/test/bridge-core.test.ts connectors/bridge-core/test/windowed-transport.test.ts connectors/opencode/test/opencode.test.ts connectors/opencode/test/runtime.test.ts",
+    "connector:test:pi": "npm run connector:network-denial:selftest && npm run connector:typecheck && node --import ./connectors/scripts/deny-network.mjs --test connectors/bridge-core/test/bridge-core.test.ts connectors/bridge-core/test/windowed-transport.test.ts connectors/pi/test/pi.test.ts connectors/pi/test/runtime.test.ts",
+    "connector:benchmark": "node --import ./connectors/scripts/deny-network.mjs ./connectors/scripts/benchmark-connectors.ts",
+    "connector:build": "node --import ./connectors/scripts/deny-network.mjs ./connectors/scripts/build-connectors.mjs",
+    "connector:build:check": "node --import ./connectors/scripts/deny-network.mjs ./connectors/scripts/build-connectors.mjs --check",
+    "connector:audit": "node --import ./connectors/scripts/deny-network.mjs ./connectors/scripts/build-connectors.mjs --check --audit-runtime",
+    "connector:check": "npm run connector:test && npm run connector:benchmark -- --assert-budgets && npm run connector:build:check && npm run connector:audit"
   },
   "devDependencies": {
     "@types/node": "22.19.0",

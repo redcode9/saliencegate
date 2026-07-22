@@ -22,6 +22,11 @@ event gives `cwd` no evidence authority.
 | `opencode-plugin/v1` | OpenCode `1.18.3`, release commit [`127bdb3`](https://github.com/anomalyco/opencode/commit/127bdb30784d508cc556c71a0f32b508a3061517) | `<repo>/.opencode/plugins/saliencegate.js`, the documented project plugin directory | `message.part.updated`, `session.idle`, `session.error`, `session.compacted`, `session.deleted`, and plugin `dispose` |
 | `pi-extension/v1` | `@earendil-works/pi-coding-agent` `0.80.10`, tag commit [`8dc7883`](https://github.com/earendil-works/pi/commit/8dc78834cde4e329284cf505f9e3f99763df5529) | `<repo>/.pi/extensions/saliencegate.ts`; Pi must trust the project before loading it | `session_start`, `before_agent_start`, `tool_execution_start`, `tool_execution_end`, `agent_settled`, `session_compact`, `session_tree`, `session_shutdown` |
 
+The native runner workflow is prepared but has not been run remotely from this unpublished branch.
+Ubuntu 24.04 and Windows 2025 are **implementation ready, remote verification pending**. The
+macOS 15 job is prepared as the third native boundary; remote evidence for all three runners is the
+separate R01 gate. Local contract tests do not promote any platform to remotely verified status.
+
 Installation must never bypass, pre-approve, or weaken provider trust. Project-local JavaScript,
 TypeScript, hook commands, and sidecars execute with the user's operating-system authority. Users
 should inspect managed files before trusting them.

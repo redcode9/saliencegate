@@ -26,6 +26,7 @@ from saliencegate.capture import (
 )
 from saliencegate.commands.capture.connect import run_connect
 from saliencegate.commands.doctor import (
+    CaptureDoctorCheck,
     CaptureDoctorReport,
     CaptureDoctorState,
     DoctorCheck,
@@ -758,6 +759,21 @@ def test_doctor_models_reject_inconsistent_status_and_unsafe_messages(tmp_path: 
             checks=report.checks,
         )
 
+    with pytest.raises(ValidationError, match="capture doctor state is inconsistent"):
+        CaptureDoctorCheck(
+            state=CaptureDoctorState.READY,
+            status=DoctorCheckStatus.SKIP,
+            required=False,
+            message="Capture status is inconsistent.",
+        )
+    with pytest.raises(ValidationError, match="control characters"):
+        CaptureDoctorCheck(
+            state=CaptureDoctorState.READY,
+            status=DoctorCheckStatus.PASS,
+            required=True,
+            message="unsafe\nmessage",
+        )
+
 
 def test_doctor_report_supports_optional_degraded_checks(tmp_path: Path) -> None:
     healthy = run_doctor(
@@ -780,6 +796,28 @@ def test_doctor_report_supports_optional_degraded_checks(tmp_path: Path) -> None
     )
 
     assert degraded.status is DoctorReportStatus.DEGRADED
+    capture = CaptureDoctorCheck(
+        state=CaptureDoctorState.READY,
+        status=DoctorCheckStatus.PASS,
+        required=True,
+        message="Capture is ready.",
+    )
+    assert (
+        CaptureDoctorReport(
+            status=DoctorReportStatus.DEGRADED,
+            ok=True,
+            environment=degraded,
+            capture=capture,
+        ).status
+        is DoctorReportStatus.DEGRADED
+    )
+    with pytest.raises(ValidationError, match="capture doctor report summary is inconsistent"):
+        CaptureDoctorReport(
+            status=DoctorReportStatus.HEALTHY,
+            ok=True,
+            environment=degraded,
+            capture=capture,
+        )
     with pytest.raises(ValidationError, match="summary does not match"):
         DoctorReport(
             status=DoctorReportStatus.HEALTHY,

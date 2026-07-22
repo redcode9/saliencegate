@@ -3,13 +3,77 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import subprocess
 import sys
+import threading
+import time
+from collections.abc import Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 from scripts import benchmark_capture_hook as benchmark
+from scripts import run_capture_hook_benchmark as registered
+
+from saliencegate.domain import canonical_json
 
 SCRIPT = Path("scripts/benchmark_capture_hook.py")
+REGISTERED_SCRIPT = Path("scripts/run_capture_hook_benchmark.py")
+
+
+class _PressureSpool:
+    def __init__(self) -> None:
+        self._counter_lock = threading.Lock()
+        self.active = 0
+        self.peak = 0
+
+    def _admit(self) -> str:
+        with self._counter_lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+        time.sleep(0.002)
+        with self._counter_lock:
+            self.active -= 1
+        return "admitted"
+
+    def admit(self, _store: object, _intake: object) -> str:
+        return self._admit()
+
+    def enqueue(self, _intake: object) -> str:
+        return self._admit()
+
+    def admit_transport(
+        self,
+        _store: object,
+        _chunk: object,
+        _intakes: tuple[object, ...],
+        _fallback: tuple[object, ...],
+    ) -> tuple[str, ...]:
+        return (self._admit(),)
+
+
+def test_shared_spool_proxy_serializes_every_admission_boundary() -> None:
+    spool = _PressureSpool()
+    proxy = registered._NonClosingSpoolProxy(spool)  # type: ignore[arg-type]
+    barrier = threading.Barrier(24)
+
+    def invoke(ordinal: int) -> object:
+        barrier.wait(timeout=10.0)
+        method = ordinal % 3
+        if method == 0:
+            return proxy.admit(object(), object())
+        if method == 1:
+            return proxy.enqueue(object())
+        return proxy.admit_transport(object(), object(), (), ())
+
+    with ThreadPoolExecutor(max_workers=24) as executor:
+        results = tuple(executor.map(invoke, range(24)))
+
+    assert results.count("admitted") == 16
+    assert results.count(("admitted",)) == 8
+    assert spool.active == 0
+    assert spool.peak == 1
 
 
 def _sample(
@@ -107,13 +171,18 @@ def test_nearest_rank_percentiles_and_functional_failures_are_gating(tmp_path: P
     assert report["passed"] is False
 
 
-def test_metadata_records_runner_os_and_filesystem_identity(tmp_path: Path) -> None:
+def test_metadata_records_runner_os_and_filesystem_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SALIENCEGATE_CAPTURE_BENCHMARK_RUNNER_IMAGE", "registered-runner")
     metadata = benchmark.runner_metadata(tmp_path)
 
     assert metadata["system"]
     assert metadata["platform"]
     assert metadata["machine"]
     assert metadata["python_version"]
+    assert metadata["runner_image"] == "registered-runner"
     filesystem = metadata["filesystem"]
     assert isinstance(filesystem, dict)
     assert filesystem["device"] is not None
@@ -199,6 +268,35 @@ def test_launcher_invocation_passes_only_fixed_launcher_path_and_redacts_output(
     ]
 
 
+def test_launcher_invocation_passes_an_exact_isolated_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = tmp_path / "provider-launcher"
+    launcher.write_bytes(b"synthetic")
+    launcher.chmod(0o700)
+    calls: list[dict[str, object]] = []
+
+    def fake_run(command: tuple[str, ...], **kwargs: object) -> benchmark._SilentProcessResult:
+        calls.append({"command": command, **kwargs})
+        return benchmark._SilentProcessResult(0, True, True, False)
+
+    monkeypatch.setattr(benchmark, "_run_silent_process", fake_run)
+    environment = {"HOME": str(tmp_path / "home"), "OPENAI_API_KEY": "poisoned"}
+
+    sample = benchmark.invoke_launcher(launcher, b"{}", environment=environment)
+
+    assert sample.passed is True
+    assert calls == [
+        {
+            "command": (str(launcher),),
+            "input_data": b"{}",
+            "timeout_seconds": benchmark.SUBPROCESS_TIMEOUT_SECONDS,
+            "environment": environment,
+        }
+    ]
+
+
 def test_silent_process_discards_large_child_output_without_pipe_deadlock() -> None:
     result = benchmark._run_silent_process(
         (
@@ -221,6 +319,90 @@ def test_silent_process_discards_large_child_output_without_pipe_deadlock() -> N
         stderr_empty=False,
         timed_out=False,
     )
+
+
+def test_silent_process_waits_once_in_a_blocking_waiter_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_popen = subprocess.Popen
+    waits: list[tuple[str, float | None]] = []
+
+    class ObservedProcess:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.delegate = real_popen(*args, **kwargs)  # type: ignore[arg-type]
+            self.stdin = self.delegate.stdin
+            self.stdout = self.delegate.stdout
+            self.stderr = self.delegate.stderr
+
+        @property
+        def returncode(self) -> int | None:
+            return self.delegate.returncode
+
+        def wait(self, timeout: float | None = None) -> int:
+            waits.append((threading.current_thread().name, timeout))
+            return self.delegate.wait(timeout=timeout)
+
+        def kill(self) -> None:
+            self.delegate.kill()
+
+    monkeypatch.setattr(benchmark.subprocess, "Popen", ObservedProcess)
+
+    result = benchmark._run_silent_process(
+        (sys.executable, "-c", "pass"),
+        input_data=None,
+        timeout_seconds=5.0,
+    )
+
+    assert result == benchmark._SilentProcessResult(0, True, True, False)
+    assert waits == [("capture-hook-process-waiter", None)]
+
+
+def test_silent_process_timeout_kills_and_reaps_the_blocking_waiter() -> None:
+    started = time.monotonic()
+    result = benchmark._run_silent_process(
+        (sys.executable, "-c", "import time; time.sleep(30)"),
+        input_data=None,
+        timeout_seconds=0.05,
+    )
+
+    assert time.monotonic() - started < 5.0
+    assert result.timed_out is True
+    assert result.returncode is not None
+    assert result.stdout_empty is True
+    assert result.stderr_empty is True
+    assert not any(thread.name == "capture-hook-process-waiter" for thread in threading.enumerate())
+
+
+def test_silent_process_wait_failure_kills_before_raising_content_free_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailedWaitProcess:
+        stdin = None
+        stdout = BytesIO()
+        stderr = BytesIO()
+        returncode = None
+
+        def __init__(self) -> None:
+            self.killed = False
+
+        def wait(self) -> int:
+            raise OSError
+
+        def kill(self) -> None:
+            self.killed = True
+
+    process = FailedWaitProcess()
+    monkeypatch.setattr(benchmark.subprocess, "Popen", lambda *_args, **_kwargs: process)
+
+    with pytest.raises(benchmark.CaptureHookBenchmarkError) as captured:
+        benchmark._run_silent_process(
+            ("synthetic-capture-hook",),
+            input_data=None,
+            timeout_seconds=1.0,
+        )
+
+    assert str(captured.value) == "capture hook benchmark failed"
+    assert process.killed is True
 
 
 def test_external_cold_reinitializer_is_silent_bounded_and_runs_before_every_cold(
@@ -376,6 +558,169 @@ def test_benchmark_has_no_network_or_model_runtime_imports() -> None:
         elif isinstance(node, ast.ImportFrom) and node.module is not None:
             imported_roots.add(node.module.partition(".")[0])
 
+    assert imported_roots.isdisjoint(
+        {"anthropic", "httpx", "openai", "openai_harmony", "requests", "socket", "urllib"}
+    )
+
+
+def test_registered_gate_locks_exact_workloads_and_provider_timeout() -> None:
+    assert benchmark.COLD_MEASUREMENTS == 30
+    assert benchmark.WARM_MEASUREMENTS == 200
+    assert registered.CONCURRENT_HOOK_INVOCATIONS == 64
+    assert registered.PROVIDER_TIMEOUT_BUDGET_MS == 2_000.0
+
+
+def test_registered_concurrency_provider_timeout_is_gating() -> None:
+    samples = tuple(
+        (0, 2_000.001 if ordinal == 17 else 10.0)
+        for ordinal in range(registered.CONCURRENT_HOOK_INVOCATIONS)
+    )
+
+    report = registered._concurrency_measurements(
+        seed_returncode=0,
+        seed_duration_ms=10.0,
+        samples=samples,
+    )
+
+    assert report["max_ms"] == 2_000.001
+    assert report["provider_timeout_budget_ms"] == 2_000.0
+    assert report["provider_timeout_passed"] is False
+    assert report["failed_invocations"] == 0
+    assert report["passed"] is False
+
+
+def test_registered_concurrency_seed_timeout_is_gating() -> None:
+    report = registered._concurrency_measurements(
+        seed_returncode=0,
+        seed_duration_ms=2_000.001,
+        samples=tuple((0, 10.0) for _ordinal in range(registered.CONCURRENT_HOOK_INVOCATIONS)),
+    )
+
+    assert report["max_ms"] == 10.0
+    assert report["provider_timeout_budget_ms"] == 2_000.0
+    assert report["provider_timeout_passed"] is False
+    assert report["passed"] is False
+
+
+def test_registered_gate_never_reads_ambient_provider_credentials(tmp_path: Path) -> None:
+    provider_keys = tuple(registered._PROVIDER_CREDENTIAL_NAMES)
+    mixed_case_keys = tuple(key.lower() for key in provider_keys)
+    observed: list[str] = []
+
+    class HostileEnvironment(Mapping[str, str]):
+        def __iter__(self) -> Iterator[str]:
+            return iter(("PATH", *mixed_case_keys))
+
+        def __len__(self) -> int:
+            return len(mixed_case_keys) + 1
+
+        def __getitem__(self, key: str) -> str:
+            observed.append(key)
+            if key.upper() in provider_keys:
+                raise AssertionError("provider credential value was read")
+            if key == "PATH":
+                return "/synthetic/bin"
+            raise KeyError(key)
+
+    copied = registered._environment_without_provider_credentials(HostileEnvironment())
+
+    assert copied == {"PATH": "/synthetic/bin"}
+    assert observed == ["PATH"]
+
+    launcher = tmp_path / "launcher"
+    launcher.write_bytes(b"synthetic")
+    launcher.chmod(0o700)
+    observed.clear()
+    with pytest.raises(ValueError):
+        benchmark.invoke_launcher(  # type: ignore[arg-type]
+            launcher,
+            b"{}",
+            environment=HostileEnvironment(),
+        )
+    assert observed == []
+
+
+def test_registered_gate_main_emits_one_canonical_report(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    expected = {
+        "schema_version": "registered-capture-hook-benchmark/v1",
+        "passed": True,
+    }
+    monkeypatch.setattr(
+        registered,
+        "run_registered_capture_hook_benchmark",
+        lambda _root: expected,
+    )
+
+    assert registered.main(["--assert-budgets"]) == 0
+
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert output.out.encode() == canonical_json(expected) + b"\n"
+
+
+def test_registered_gate_admits_all_64_contention_events_in_a_fresh_process() -> None:
+    program = """
+import tempfile
+from pathlib import Path
+
+from scripts import benchmark_capture_hook as engine
+from scripts import run_capture_hook_benchmark as gate
+from saliencegate.domain import canonical_json
+
+engine.COLD_MEASUREMENTS = 2
+engine.WARM_MEASUREMENTS = 3
+with tempfile.TemporaryDirectory(prefix="capture-hook-regression-") as raw:
+    report = gate.run_registered_capture_hook_benchmark(Path(raw).resolve(strict=True))
+summary = {
+    "capture_admission_verified": report["protocol"]["capture_admission_verified"],
+    "concurrency": report["concurrency"],
+}
+print(canonical_json(summary).decode("utf-8"))
+"""
+
+    completed = subprocess.run(
+        (sys.executable, "-c", program),
+        capture_output=True,
+        check=False,
+        timeout=60.0,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+    assert completed.stderr == b""
+    summary = json.loads(completed.stdout)
+    assert summary["capture_admission_verified"] is True
+    assert summary["concurrency"]["invocations"] == 64
+    assert summary["concurrency"]["concurrent_workers"] == 64
+    assert summary["concurrency"]["distinct_payloads"] == 64
+    assert summary["concurrency"]["mode"] == "in_process_hook_invocations"
+    assert summary["concurrency"]["launcher_processes_started"] == 0
+    assert summary["concurrency"]["simultaneous_barrier_release"] is True
+    assert summary["concurrency"]["spool_process_local_fence"] is True
+    assert summary["concurrency"]["authenticated_event_count_verified"] == 65
+    assert summary["concurrency"]["capture_admission_verified"] is True
+    assert summary["concurrency"]["failed_invocations"] == 0
+    assert summary["concurrency"]["provider_timeout_budget_ms"] == 2_000.0
+    assert summary["concurrency"]["provider_timeout_passed"] is True
+    assert summary["concurrency"]["passed"] is True
+
+
+def test_registered_gate_declares_real_admission_and_has_no_network_or_model_imports() -> None:
+    source = REGISTERED_SCRIPT.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported_roots: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported_roots.update(alias.name.partition(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported_roots.add(node.module.partition(".")[0])
+
+    assert "run_connect(" in source
+    assert '"capture_admission_verified": True' in source
+    assert "verify_capture_session_snapshot(" in source
+    assert "spool.drain(store)" in source
     assert imported_roots.isdisjoint(
         {"anthropic", "httpx", "openai", "openai_harmony", "requests", "socket", "urllib"}
     )

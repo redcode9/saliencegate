@@ -7,7 +7,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from saliencegate.domain.records import ComponentIdentifier, Sha256Digest
+from saliencegate.domain.primitives import ComponentIdentifier, Sha256Digest
 
 MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION = 1_000
 

@@ -42,14 +42,6 @@ export type WindowedCaptureFlushResult =
   | "delivered"
   | "not_started";
 
-function environment(value: NodeJS.ProcessEnv): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (typeof item === "string") result[key] = item;
-  }
-  return result;
-}
-
 export async function spawnWindowedCaptureChunk(
   input: Omit<WindowedCaptureChunkWrite, "timeoutMS">,
   spawnChild: SpawnFunction = spawn as SpawnFunction,
@@ -162,7 +154,7 @@ export class WindowedBatchTransport {
     this.#invocation = launcherInvocation({
       platform: options.platform ?? process.platform,
       launcherPath: bootstrap.launcher_path,
-      environment: environment(options.environment ?? process.env),
+      environment: options.environment ?? process.env,
     });
     this.#writeChunk = options.writeChunk ?? spawnWindowedCaptureChunk;
     this.#batchID = options.batchID ?? (() => randomBytes(32).toString("hex"));

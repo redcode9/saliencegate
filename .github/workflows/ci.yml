@@ -137,6 +137,135 @@ jobs:
           SALIENCEGATE_BENCHMARK_RUNNER_IMAGE: ubuntu-24.04
         run: uv run --locked python scripts/benchmark_shadow_trace.py --assert-budgets
 
+  capture-performance:
+    name: Capture reference budgets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ANTHROPIC_API_KEY: provider-credential-read-must-fail
+      AZURE_OPENAI_API_KEY: provider-credential-read-must-fail
+      OPENAI_API_KEY: provider-credential-read-must-fail
+      OPENAI_ORGANIZATION: provider-credential-read-must-fail
+      OPENAI_ORG_ID: provider-credential-read-must-fail
+      OPENAI_PROJECT: provider-credential-read-must-fail
+      OPENAI_PROJECT_ID: provider-credential-read-must-fail
+    steps:
+      - name: Check out the source revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Select the reference Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          check-latest: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.28"
+          enable-cache: false
+      - name: Install the locked capture benchmark environment
+        run: |
+          uv sync --locked --dev --no-install-project
+          uv sync --locked --dev --no-build-isolation
+      - name: Enforce hook and report budgets on the registered runner
+        env:
+          HOME: ${{ runner.temp }}/capture-performance-home
+          XDG_CACHE_HOME: ${{ runner.temp }}/capture-performance-home/cache
+          XDG_CONFIG_HOME: ${{ runner.temp }}/capture-performance-home/config
+          XDG_DATA_HOME: ${{ runner.temp }}/capture-performance-home/data
+          XDG_STATE_HOME: ${{ runner.temp }}/capture-performance-home/state
+          SALIENCEGATE_CAPTURE_BENCHMARK_RUNNER_IMAGE: ubuntu-24.04
+        run: |
+          uv run --locked python scripts/run_capture_hook_benchmark.py --assert-budgets
+          uv run --locked python scripts/benchmark_capture_report.py --assert-budgets
+
+  connectors:
+    name: Exact Node connector gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ANTHROPIC_API_KEY: provider-credential-read-must-fail
+      AZURE_OPENAI_API_KEY: provider-credential-read-must-fail
+      OPENAI_API_KEY: provider-credential-read-must-fail
+      OPENAI_ORGANIZATION: provider-credential-read-must-fail
+      OPENAI_ORG_ID: provider-credential-read-must-fail
+      OPENAI_PROJECT: provider-credential-read-must-fail
+      OPENAI_PROJECT_ID: provider-credential-read-must-fail
+    steps:
+      - name: Check out the source revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Select exact Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.19.0
+          check-latest: false
+          package-manager-cache: false
+      - name: Typecheck, test, benchmark, audit, and reproduce bundles
+        run: make connector-source-check
+
+  capture-platform-contract:
+    name: Capture platform contract (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-24.04
+            runner: ubuntu-24.04
+          - platform: macos-15
+            runner: macos-15
+          - platform: windows-2025
+            runner: windows-2025
+    env:
+      ANTHROPIC_API_KEY: provider-credential-read-must-fail
+      AZURE_OPENAI_API_KEY: provider-credential-read-must-fail
+      OPENAI_API_KEY: provider-credential-read-must-fail
+      OPENAI_ORGANIZATION: provider-credential-read-must-fail
+      OPENAI_ORG_ID: provider-credential-read-must-fail
+      OPENAI_PROJECT: provider-credential-read-must-fail
+      OPENAI_PROJECT_ID: provider-credential-read-must-fail
+    steps:
+      - name: Check out the source revision
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Select the reference Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          check-latest: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: "0.11.28"
+          enable-cache: false
+      - name: Install the locked platform contract environment
+        run: |
+          uv sync --locked --dev --no-install-project
+          uv sync --locked --dev --no-build-isolation
+      - name: Exercise native capture, launcher, and file-security boundaries
+        env:
+          HOME: ${{ runner.temp }}/capture-platform-home
+          USERPROFILE: ${{ runner.temp }}/capture-platform-home
+          XDG_CACHE_HOME: ${{ runner.temp }}/capture-platform-home/cache
+          XDG_CONFIG_HOME: ${{ runner.temp }}/capture-platform-home/config
+          XDG_DATA_HOME: ${{ runner.temp }}/capture-platform-home/data
+          XDG_STATE_HOME: ${{ runner.temp }}/capture-platform-home/state
+          APPDATA: ${{ runner.temp }}/capture-platform-home/appdata
+          LOCALAPPDATA: ${{ runner.temp }}/capture-platform-home/localappdata
+        run: >-
+          uv run --locked pytest -q
+          tests/security/test_windows.py
+          tests/capture/test_store_security.py
+          tests/capture/test_spool.py
+          tests/integrations/test_hook.py
+          tests/integrations/test_installation.py
+          tests/integrations/test_launcher_renderer.py
+
   build:
     name: Build distributions once
     needs:
@@ -144,6 +273,9 @@ jobs:
       - quality
       - coverage
       - shadow-trace-performance
+      - capture-performance
+      - connectors
+      - capture-platform-contract
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -183,11 +315,21 @@ jobs:
           retention-days: 7
 
   artifact-only-atif:
-    name: Prove ATIF from wheel and sdist artifacts only
+    name: Prove ATIF from artifacts only (${{ matrix.platform }})
     needs:
       - build
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-24.04
+            runner: ubuntu-24.04
+          - platform: macos-15
+            runner: macos-15
+          - platform: windows-2025
+            runner: windows-2025
     env:
       PYTHONPATH: ""
       ARTIFACT_ROOT: ${{ runner.temp }}/saliencegate-artifact-only
@@ -208,20 +350,180 @@ jobs:
           name: python-distributions
           path: ${{ runner.temp }}/saliencegate-artifact-only/dist
       - name: Recover the shared artifact verifier from the sdist
+        shell: python
         run: |
-          umask 077
-          mkdir -p "$ARTIFACT_ROOT/launcher"
-          chmod 700 "$ARTIFACT_ROOT" "$ARTIFACT_ROOT/launcher"
-          test "$(find "$ARTIFACT_ROOT/dist" -maxdepth 1 -type f -name '*.whl' | wc -l | tr -d ' ')" -eq 1
-          test "$(find "$ARTIFACT_ROOT/dist" -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')" -eq 1
-          tar -xzf "$ARTIFACT_ROOT"/dist/*.tar.gz --strip-components=1 -C "$ARTIFACT_ROOT/launcher"
-          test -f "$ARTIFACT_ROOT/launcher/scripts/verify_built_artifacts.py"
+          import os
+          import tarfile
+          from pathlib import Path, PurePosixPath
+
+          root = Path(os.environ["ARTIFACT_ROOT"]).resolve(strict=True)
+          dist = root / "dist"
+          children = tuple(dist.iterdir())
+          if len(children) != 2 or any(
+              not child.is_file() or child.is_symlink() for child in children
+          ):
+              raise SystemExit("downloaded artifact set must contain two regular files")
+          wheels = tuple(child for child in children if child.suffix == ".whl")
+          sdists = tuple(child for child in children if child.name.endswith(".tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              raise SystemExit("downloaded artifact set must contain one wheel and one sdist")
+          launcher = root / "launcher"
+          launcher.mkdir(mode=0o700)
+          with tarfile.open(sdists[0], mode="r:gz") as archive:
+              matches = tuple(
+                  member
+                  for member in archive.getmembers()
+                  if member.isfile()
+                  and len(PurePosixPath(member.name).parts) == 3
+                  and PurePosixPath(member.name).parts[1:]
+                  == ("scripts", "verify_built_artifacts.py")
+              )
+              if len(matches) != 1:
+                  raise SystemExit("sdist must contain exactly one artifact verifier")
+              stream = archive.extractfile(matches[0])
+              if stream is None:
+                  raise SystemExit("artifact verifier could not be read")
+              target = launcher / "scripts" / "verify_built_artifacts.py"
+              target.parent.mkdir(mode=0o700)
+              with target.open("xb") as output:
+                  output.write(stream.read())
       - name: Prove documented commands from wheel and sdist
+        shell: python
         run: |
-          python "$ARTIFACT_ROOT/launcher/scripts/verify_built_artifacts.py" \
-            --dist-dir "$ARTIFACT_ROOT/dist" \
-            --work-dir "$ARTIFACT_ROOT/proof" \
-            --python 3.12
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          root = Path(os.environ["ARTIFACT_ROOT"]).resolve(strict=True)
+          subprocess.run(
+              (
+                  sys.executable,
+                  str(root / "launcher" / "scripts" / "verify_built_artifacts.py"),
+                  "--dist-dir",
+                  str(root / "dist"),
+                  "--work-dir",
+                  str(root / "proof"),
+                  "--python",
+                  "3.12",
+              ),
+              check=True,
+          )
+
+  artifact-only-connectors:
+    name: Prove connectors from artifacts only (${{ matrix.platform }})
+    needs:
+      - build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-24.04
+            runner: ubuntu-24.04
+          - platform: macos-15
+            runner: macos-15
+          - platform: windows-2025
+            runner: windows-2025
+    env:
+      PYTHONPATH: ""
+      ARTIFACT_ROOT: ${{ runner.temp }}/saliencegate-connector-artifact-only
+      ANTHROPIC_API_KEY: provider-credential-read-must-fail
+      AZURE_OPENAI_API_KEY: provider-credential-read-must-fail
+      OPENAI_API_KEY: provider-credential-read-must-fail
+      OPENAI_ORGANIZATION: provider-credential-read-must-fail
+      OPENAI_ORG_ID: provider-credential-read-must-fail
+      OPENAI_PROJECT: provider-credential-read-must-fail
+      OPENAI_PROJECT_ID: provider-credential-read-must-fail
+    steps:
+      - name: Select Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          check-latest: false
+      - name: Select exact Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.19.0
+          check-latest: false
+          package-manager-cache: false
+      - name: Download the distributions built by CI
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-distributions
+          path: ${{ runner.temp }}/saliencegate-connector-artifact-only/dist
+      - name: Recover the connector artifact verifier from the sdist
+        shell: python
+        run: |
+          import os
+          import tarfile
+          from pathlib import Path, PurePosixPath
+
+          root = Path(os.environ["ARTIFACT_ROOT"]).resolve(strict=True)
+          dist = root / "dist"
+          children = tuple(dist.iterdir())
+          if len(children) != 2 or any(
+              not child.is_file() or child.is_symlink() for child in children
+          ):
+              raise SystemExit("downloaded artifact set must contain two regular files")
+          wheels = tuple(child for child in children if child.suffix == ".whl")
+          sdists = tuple(child for child in children if child.name.endswith(".tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              raise SystemExit("downloaded artifact set must contain one wheel and one sdist")
+          launcher = root / "launcher"
+          launcher.mkdir(mode=0o700)
+          with tarfile.open(sdists[0], mode="r:gz") as archive:
+              matches = tuple(
+                  member
+                  for member in archive.getmembers()
+                  if member.isfile()
+                  and len(PurePosixPath(member.name).parts) == 3
+                  and PurePosixPath(member.name).parts[1:]
+                  == ("scripts", "verify_connector_artifacts.py")
+              )
+              if len(matches) != 1:
+                  raise SystemExit("sdist must contain exactly one connector artifact verifier")
+              stream = archive.extractfile(matches[0])
+              if stream is None:
+                  raise SystemExit("connector artifact verifier could not be read")
+              target = launcher / "scripts" / "verify_connector_artifacts.py"
+              target.parent.mkdir(mode=0o700)
+              with target.open("xb") as output:
+                  output.write(stream.read())
+      - name: Import byte-identical bundles with network and credentials denied
+        env:
+          HOME: ${{ runner.temp }}/saliencegate-connector-artifact-only/home
+          XDG_CACHE_HOME: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/cache
+          XDG_CONFIG_HOME: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/config
+          XDG_DATA_HOME: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/data
+          XDG_STATE_HOME: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/state
+          USERPROFILE: ${{ runner.temp }}/saliencegate-connector-artifact-only/home
+          APPDATA: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/appdata
+          LOCALAPPDATA: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/localappdata
+        shell: python
+        run: |
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          root = Path(os.environ["ARTIFACT_ROOT"]).resolve(strict=True)
+          subprocess.run(
+              (
+                  sys.executable,
+                  str(root / "launcher" / "scripts" / "verify_connector_artifacts.py"),
+                  "--dist-dir",
+                  str(root / "dist"),
+                  "--work-dir",
+                  str(root / "proof"),
+                  "--node",
+                  "node",
+                  "--npm",
+                  "npm",
+              ),
+              check=True,
+          )
 
   installed-core-wheel:
     name: Test the installed core wheel

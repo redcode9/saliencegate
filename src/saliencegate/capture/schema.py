@@ -13,7 +13,7 @@ from typing import Annotated, Literal, Never, Self, TypeAlias, cast
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from saliencegate.domain import canonical_json
-from saliencegate.domain.records import ComponentIdentifier, Sha256Digest, UtcDatetime
+from saliencegate.domain.primitives import ComponentIdentifier, Sha256Digest, UtcDatetime
 
 MAX_CAPTURE_EVENT_BYTES = 64 * 1_024
 MAX_CAPTURE_NATIVE_BYTES = 2 * 1_024 * 1_024
@@ -411,11 +411,27 @@ def canonical_capture_event(value: CaptureEvent) -> bytes:
         raise CaptureSchemaError() from None
 
 
+def _read_canonical_capture_event_document(value: bytes) -> Mapping[str, object]:
+    """Return one bounded event document only when its stored bytes are canonical."""
+
+    document = read_bounded_json(value, limits=_CAPTURE_EVENT_LIMITS)
+    try:
+        if canonical_json(document) != value:
+            raise CaptureSchemaError()
+        return document
+    except CaptureSchemaError:
+        raise
+    except Exception:
+        raise CaptureSchemaError() from None
+
+
 def load_capture_event(value: bytes) -> CaptureEvent:
     read_bounded_json(value, limits=_CAPTURE_EVENT_LIMITS)
     try:
         event = CaptureEvent.model_validate_json(value)
-        if canonical_capture_event(event) != value:
+        # The raw document was already bounded above; this comparison rejects both
+        # non-canonical bytes and values that strict schema validation normalizes.
+        if canonical_json(event) != value:
             raise CaptureSchemaError()
         return event
     except CaptureSchemaError:

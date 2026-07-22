@@ -110,13 +110,35 @@ def _write_process_input(stream: BinaryIO, payload: bytes) -> None:
             stream.close()
 
 
+def _wait_for_process(
+    process: subprocess.Popen[bytes],
+    completed: Event,
+    errors: list[OSError],
+) -> None:
+    """Block in the platform waiter and publish one completion signal."""
+
+    try:
+        process.wait()
+    except OSError as error:
+        errors.append(error)
+    finally:
+        completed.set()
+
+
 def _run_silent_process(
     command: tuple[str, ...],
     *,
     input_data: bytes | None,
     timeout_seconds: float,
+    environment: dict[str, str] | None = None,
 ) -> _SilentProcessResult:
     """Run a child while draining and discarding output in fixed-size chunks."""
+
+    if environment is not None and (
+        type(environment) is not dict
+        or any(type(key) is not str or type(value) is not str for key, value in environment.items())
+    ):
+        raise CaptureHookBenchmarkError()
 
     process = subprocess.Popen(
         command,
@@ -124,6 +146,7 @@ def _run_silent_process(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0,
+        env=None if environment is None else environment.copy(),
     )
     if process.stdout is None or process.stderr is None:
         with suppress(OSError):
@@ -158,16 +181,24 @@ def _run_silent_process(
         )
         writer.start()
 
-    timed_out = False
+    wait_completed = Event()
+    wait_errors: list[OSError] = []
+    waiter = Thread(
+        target=_wait_for_process,
+        args=(process, wait_completed, wait_errors),
+        name="capture-hook-process-waiter",
+        daemon=True,
+    )
+    waiter.start()
+    timed_out = not wait_completed.wait(timeout_seconds)
     try:
-        process.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        with suppress(OSError):
-            process.kill()
-        with suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=1.0)
+        if timed_out or wait_errors:
+            with suppress(OSError):
+                process.kill()
+        if timed_out:
+            wait_completed.wait(timeout=1.0)
     finally:
+        waiter.join(timeout=1.0)
         if process.stdin is not None:
             with suppress(OSError, ValueError):
                 process.stdin.close()
@@ -180,7 +211,12 @@ def _run_silent_process(
                 stream.close()
         for reader in readers:
             reader.join(timeout=1.0)
-    if (writer is not None and writer.is_alive()) or any(reader.is_alive() for reader in readers):
+    if (
+        waiter.is_alive()
+        or wait_errors
+        or (writer is not None and writer.is_alive())
+        or any(reader.is_alive() for reader in readers)
+    ):
         raise CaptureHookBenchmarkError()
     return _SilentProcessResult(
         returncode=process.returncode,
@@ -329,7 +365,10 @@ def runner_metadata(filesystem_path: Path) -> dict[str, object]:
         "release": platform.release() or "unknown",
         "platform": platform.platform() or "unknown",
         "machine": platform.machine() or "unknown",
-        "runner_image": os.environ.get("SALIENCEGATE_BENCHMARK_RUNNER_IMAGE", "unspecified"),
+        "runner_image": os.environ.get(
+            "SALIENCEGATE_CAPTURE_BENCHMARK_RUNNER_IMAGE",
+            "unspecified",
+        ),
         "filesystem": {
             "device": file_stat.st_dev,
             **filesystem,
@@ -337,7 +376,12 @@ def runner_metadata(filesystem_path: Path) -> dict[str, object]:
     }
 
 
-def invoke_launcher(launcher: Path, payload: bytes) -> CaptureHookBenchmarkSample:
+def invoke_launcher(
+    launcher: Path,
+    payload: bytes,
+    *,
+    environment: dict[str, str] | None = None,
+) -> CaptureHookBenchmarkSample:
     """Measure one launcher without retaining or rendering provider-owned output."""
 
     if (
@@ -348,15 +392,33 @@ def invoke_launcher(launcher: Path, payload: bytes) -> CaptureHookBenchmarkSampl
         or (os.name != "nt" and not os.access(launcher, os.X_OK))
         or type(payload) is not bytes
         or not payload
+        or (
+            environment is not None
+            and (
+                type(environment) is not dict
+                or any(
+                    type(key) is not str or type(value) is not str
+                    for key, value in environment.items()
+                )
+            )
+        )
     ):
         raise ValueError("capture hook benchmark input is invalid")
     started = time.perf_counter_ns()
     try:
-        completed = _run_silent_process(
-            (str(launcher),),
-            input_data=payload,
-            timeout_seconds=SUBPROCESS_TIMEOUT_SECONDS,
-        )
+        if environment is None:
+            completed = _run_silent_process(
+                (str(launcher),),
+                input_data=payload,
+                timeout_seconds=SUBPROCESS_TIMEOUT_SECONDS,
+            )
+        else:
+            completed = _run_silent_process(
+                (str(launcher),),
+                input_data=payload,
+                timeout_seconds=SUBPROCESS_TIMEOUT_SECONDS,
+                environment=environment,
+            )
         duration_ms = max((time.perf_counter_ns() - started) / 1_000_000.0, 0.001)
         return CaptureHookBenchmarkSample(
             duration_ms=duration_ms,

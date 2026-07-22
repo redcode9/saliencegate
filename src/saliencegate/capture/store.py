@@ -7,8 +7,9 @@ import hmac
 import os
 import re
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path, PureWindowsPath
@@ -40,6 +41,7 @@ from saliencegate.capture.publication import verify_capture_intake_authenticatio
 from saliencegate.capture.schema import (
     CaptureEvent,
     CaptureIntake,
+    _read_canonical_capture_event_document,
     canonical_capture_event,
     canonical_capture_intake,
     load_capture_event,
@@ -52,7 +54,7 @@ from saliencegate.capture.transport import (
     validate_capture_transport_chunk,
 )
 from saliencegate.domain import canonical_json
-from saliencegate.domain.records import ComponentIdentifier, Sha256Digest
+from saliencegate.domain.primitives import ComponentIdentifier, Sha256Digest
 from saliencegate.security import (
     InstallationKey,
     SecureFileError,
@@ -91,6 +93,7 @@ MAX_CAPTURE_EVENTS_PER_SESSION: Final = 1_000
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _HOST_VERSION = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){1,3}$")
 _PROJECT_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_COMPONENT_IDENTIFIER = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._:/+\-]{0,255}$")
 _HUMAN_SESSION_ID = re.compile(r"^[a-z2-7]{12,52}$")
 _MAX_CAPTURE_QUERY_RESULTS: Final = 1_000
 _TRANSPORT_PROFILES: Final = frozenset(
@@ -169,6 +172,36 @@ class CaptureSessionState(StrEnum):
     CLOSED = "closed"
     QUARANTINED = "quarantined"
     DELETING = "deleting"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _CaptureHookConnection:
+    """Authenticated connection fields required by a provider hook."""
+
+    connection_id: str
+    project_digest: str
+    profile_id: CaptureProfile
+    capability_manifest_digest: str
+    host_version: str
+    state: CaptureConnectionState
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.connection_id) is not str
+            or _COMPONENT_IDENTIFIER.fullmatch(self.connection_id) is None
+            or type(self.project_digest) is not str
+            or _PROJECT_DIGEST.fullmatch(self.project_digest) is None
+            or type(self.profile_id) is not CaptureProfile
+            or type(self.capability_manifest_digest) is not str
+            or _PROJECT_DIGEST.fullmatch(self.capability_manifest_digest) is None
+            or type(self.host_version) is not str
+            or _HOST_VERSION.fullmatch(self.host_version) is None
+            or type(self.state) is not CaptureConnectionState
+        ):
+            raise CaptureStoreIntegrityError()
+
+    def __repr__(self) -> str:
+        return "_CaptureHookConnection(<redacted>)"
 
 
 class CaptureAppendDisposition(StrEnum):
@@ -342,7 +375,7 @@ def _event_material(
     previous_event_tag: str | None,
     admission_source: str,
     admitted_at: str,
-    intake: CaptureIntake,
+    intake: CaptureIntake | Mapping[str, object],
 ) -> dict[str, object]:
     return {
         "schema_version": "capture-event-integrity/v1",
@@ -354,7 +387,11 @@ def _event_material(
         "previous_event_tag": previous_event_tag,
         "admission_source": admission_source,
         "admitted_at": admitted_at,
-        "intake": intake.model_dump(mode="json", warnings="error"),
+        "intake": (
+            intake
+            if isinstance(intake, Mapping)
+            else intake.model_dump(mode="json", warnings="error")
+        ),
     }
 
 
@@ -623,12 +660,11 @@ class CaptureStore:
             instance._fault_injector = _fault_injector
             instance._verified_append_heads = {}
             instance._verified_data_version = instance._database_data_version()
-            # The hook is a latency-sensitive append-only caller.  Its open path has
-            # already validated schema identity, migration history, and inventory
-            # without scanning retained rows.  It authenticates the complete target
-            # chain on first observation and after any peer commit, then verifies the
-            # authenticated tip for same-connection extensions.  Maintenance callers
-            # retain the fail-closed whole-database checks and full audit before use.
+            # Hook open defers a whole-database audit, but the first mutation of each
+            # selected session authenticates its complete retained chain.  An
+            # unchanged cached head permits bounded verification on later appends;
+            # any peer commit clears that cache.  Maintenance callers retain the
+            # fail-closed whole-database audit before use.
             if mode is CaptureStoreMode.MAINTENANCE:
                 instance._verify_all_state()
             opened = True
@@ -1071,6 +1107,21 @@ class CaptureStore:
             updated_at=_stored_timestamp(row["updated_at"]),
         )
 
+    def _hook_connection(self, row: sqlite3.Row) -> _CaptureHookConnection:
+        profile_id = CaptureProfile(row["profile_id"])
+        validate_capture_capability_binding(
+            profile_id,
+            row["capability_manifest_digest"],
+        )
+        return _CaptureHookConnection(
+            connection_id=row["connection_id"],
+            project_digest=row["project_digest"],
+            profile_id=profile_id,
+            capability_manifest_digest=row["capability_manifest_digest"],
+            host_version=row["host_version"],
+            state=CaptureConnectionState(row["state"]),
+        )
+
     def _session_summary(
         self,
         connection: sqlite3.Row,
@@ -1188,6 +1239,31 @@ class CaptureStore:
                 raise
             self._revalidate_boundary()
             return summary
+
+    def _get_hook_connection(self, connection_id: str) -> _CaptureHookConnection:
+        """Return only the authenticated connection fields used by a hook."""
+
+        self._ensure_open()
+        if type(connection_id) is not str:
+            raise CaptureStoreError()
+        with self._lock:
+            self._ensure_open()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                connection = self._hook_connection(self._connection_row(connection_id))
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return connection
 
     def list_sessions(
         self,
@@ -2381,8 +2457,7 @@ class CaptureStore:
                 ),
             )
             if (
-                canonical_capture_event(event) != blob
-                or row["connection_id"] != intake.connection_id
+                row["connection_id"] != intake.connection_id
                 or row["session_id"] != intake.session_id
                 or row["receipt_ordinal"] != event.receipt_ordinal
                 or row["producer_event_digest"] != intake.producer_event_digest
@@ -2399,6 +2474,77 @@ class CaptureStore:
         if event is None:
             raise CaptureStoreIntegrityError()
         return event
+
+    def _load_verified_append_event(
+        self,
+        row: sqlite3.Row,
+    ) -> tuple[int, str | None, str]:
+        """Authenticate one retained row without rebuilding its validated model."""
+
+        try:
+            blob = row["event_json"]
+            if type(blob) is not bytes:
+                raise CaptureStoreIntegrityError()
+            document = _read_canonical_capture_event_document(blob)
+            if set(document) != {
+                "event_tag",
+                "intake",
+                "previous_event_tag",
+                "receipt_ordinal",
+                "schema_version",
+            }:
+                raise CaptureStoreIntegrityError()
+            receipt_ordinal = document["receipt_ordinal"]
+            previous_event_tag = document["previous_event_tag"]
+            event_tag = document["event_tag"]
+            intake = document["intake"]
+            if (
+                document["schema_version"] != "capture-event/v1"
+                or type(receipt_ordinal) is not int
+                or not 1 <= receipt_ordinal <= MAX_CAPTURE_EVENTS_PER_SESSION
+                or (receipt_ordinal == 1) != (previous_event_tag is None)
+                or (
+                    previous_event_tag is not None
+                    and (
+                        type(previous_event_tag) is not str
+                        or _PROJECT_DIGEST.fullmatch(previous_event_tag) is None
+                    )
+                )
+                or type(event_tag) is not str
+                or _PROJECT_DIGEST.fullmatch(event_tag) is None
+                or not isinstance(intake, Mapping)
+            ):
+                raise CaptureStoreIntegrityError()
+            expected = self._integrity.tag(
+                "event",
+                _event_material(
+                    connection_id=row["connection_id"],
+                    session_id=row["session_id"],
+                    receipt_ordinal=row["receipt_ordinal"],
+                    producer_event_digest=row["producer_event_digest"],
+                    event_kind=row["event_kind"],
+                    previous_event_tag=row["previous_event_tag"],
+                    admission_source=row["admission_source"],
+                    admitted_at=row["admitted_at"],
+                    intake=cast(Mapping[str, object], intake),
+                ),
+            )
+            if (
+                row["receipt_ordinal"] != receipt_ordinal
+                or row["previous_event_tag"] != previous_event_tag
+                or row["event_tag"] != event_tag
+                or row["connection_id"] != intake.get("connection_id")
+                or row["session_id"] != intake.get("session_id")
+                or row["producer_event_digest"] != intake.get("producer_event_digest")
+                or row["event_kind"] != intake.get("kind")
+                or type(row["admission_source"]) is not str
+                or type(row["admitted_at"]) is not str
+                or not hmac.compare_digest(event_tag, expected)
+            ):
+                raise CaptureStoreIntegrityError()
+            return receipt_ordinal, previous_event_tag, event_tag
+        except Exception:
+            raise CaptureStoreIntegrityError() from None
 
     def _verify_chain_rows(
         self,
@@ -2463,6 +2609,55 @@ class CaptureStore:
         )
         return tuple(event for event, _row in events)
 
+    def _verify_append_chain(
+        self,
+        connection_id: str,
+        session_id: str,
+        session: sqlite3.Row,
+        head: sqlite3.Row,
+    ) -> CaptureEvent | None:
+        """Authenticate every retained row before a cold append.
+
+        Each event tag was created only after strict intake authentication and
+        canonical CaptureEvent construction.  Recomputing that tag over the exact
+        bounded canonical document therefore re-establishes admission provenance
+        without constructing a Pydantic object for every historical row.  The tip
+        is still loaded through the full schema boundary before it is returned.
+        """
+
+        rows = self._connection.execute(
+            """
+            SELECT *
+            FROM capture_events
+            WHERE connection_id = ? AND session_id = ?
+            ORDER BY receipt_ordinal
+            """,
+            (connection_id, session_id),
+        ).fetchall()
+        previous: str | None = None
+        latest: sqlite3.Row | None = None
+        for ordinal, row in enumerate(rows, start=1):
+            receipt_ordinal, previous_event_tag, event_tag = self._load_verified_append_event(row)
+            if (
+                row["receipt_ordinal"] != ordinal
+                or receipt_ordinal != ordinal
+                or row["connection_id"] != connection_id
+                or row["session_id"] != session_id
+                or previous_event_tag != previous
+            ):
+                raise CaptureStoreIntegrityError()
+            previous = event_tag
+            latest = cast(sqlite3.Row, row)
+        if (
+            len(rows) != session["event_count"]
+            or len(rows) != head["receipt_count"]
+            or previous != head["head_event_tag"]
+        ):
+            raise CaptureStoreIntegrityError()
+        self._verify_health_set(connection_id, session_id, session)
+        self._verify_transport_chain(connection_id, session_id)
+        return None if latest is None else self._load_verified_event(latest)
+
     def _verify_append_commitment(
         self,
         connection_id: str,
@@ -2482,10 +2677,11 @@ class CaptureStore:
             self._verified_data_version = data_version
         key = (connection_id, session_id)
         commitment = (receipt_count, head["head_event_tag"])
-        if self._verified_append_heads.get(key) != commitment:
-            events = self._verify_chain(connection_id, session_id, session, head)
+        cache_miss = self._verified_append_heads.get(key) != commitment
+        if cache_miss:
+            latest = self._verify_append_chain(connection_id, session_id, session, head)
             self._verified_append_heads[key] = commitment
-            return None if not events else events[-1]
+            return latest
         inventory = self._connection.execute(
             """
             SELECT COUNT(*) AS event_count

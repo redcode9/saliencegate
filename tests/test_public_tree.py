@@ -88,6 +88,7 @@ def test_pure_validator_reports_every_nfc_casefold_collision_deterministically()
         "tests/test_" + "task" + "8_executor.py",
         "tests/test_" + "stage" + "1_compatibility.py",
         "tests/test_" + "stage" + "3a_compatibility.py",
+        "tests/test_" + "M" + "11_coverage.py",
     ),
 )
 def test_pure_validator_rejects_internal_milestones_in_paths(tracked_path: str) -> None:
@@ -249,6 +250,7 @@ def test_cli_passes_a_synthetic_public_tree(tmp_path: Path) -> None:
         "Internal " + "Task_" + "6A plan.\n",
         "Internal " + "task" + "8 plan.\n",
         "Internal " + "stage" + "3a plan.\n",
+        "Internal " + "M" + "11 plan.\n",
     ),
 )
 def test_cli_rejects_numbered_internal_milestone_language(

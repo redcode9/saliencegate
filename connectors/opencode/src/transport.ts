@@ -32,14 +32,6 @@ export type CaptureChunkWrite = Readonly<{
 export type CaptureChunkWriter = (write: CaptureChunkWrite) => Promise<boolean>;
 export type CaptureFlushResult = "attempted_failure" | "delivered" | "not_started";
 
-function environment(value: NodeJS.ProcessEnv): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (typeof item === "string") result[key] = item;
-  }
-  return result;
-}
-
 export async function spawnCaptureChunk(
   input: Omit<CaptureChunkWrite, "timeoutMS">,
   spawnChild: SpawnFunction = spawn as SpawnFunction,
@@ -121,7 +113,7 @@ export class OpenCodeBatchTransport {
     this.#invocation = launcherInvocation({
       platform: options.platform ?? process.platform,
       launcherPath: bootstrap.launcher_path,
-      environment: environment(options.environment ?? process.env),
+      environment: options.environment ?? process.env,
     });
     this.#writeChunk = options.writeChunk ?? spawnCaptureChunk;
     this.#batchID = options.batchID ?? (() => randomBytes(32).toString("hex"));

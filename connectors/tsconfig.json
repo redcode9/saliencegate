@@ -6,6 +6,7 @@
     "opencode/src/**/*.ts",
     "opencode/test/**/*.ts",
     "pi/src/**/*.ts",
-    "pi/test/**/*.ts"
+    "pi/test/**/*.ts",
+    "scripts/**/*.ts"
   ]
 }

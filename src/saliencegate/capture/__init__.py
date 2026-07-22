@@ -1,158 +1,332 @@
-"""Provider-neutral local capture contracts."""
+"""Provider-neutral local capture contracts.
 
-from saliencegate.capture.adapters import (
-    CAPTURE_ADAPTER_PROTOCOL_VERSION,
-    CaptureAdapter,
-    CaptureAdapterCapabilities,
-    CaptureAdapterContractError,
-    validated_capture_adapter,
-)
-from saliencegate.capture.capabilities import (
-    CapabilitySupport,
-    CaptureCapabilityError,
-    CaptureCapabilityManifest,
-    CaptureCapabilityRegistry,
-    CaptureProfile,
-    CompatibilityStatus,
-    capture_capability_digest,
-    capture_profile,
-    classify_capture_compatibility,
-    load_capture_capability_registry,
-    validate_capture_capability_binding,
-)
-from saliencegate.capture.connections import (
-    CaptureConnectionSummary,
-    CaptureSessionInventory,
-    CaptureSessionSummary,
-)
-from saliencegate.capture.delete import (
-    CaptureDeleteDisposition,
-    CaptureProjectDeleteReceipt,
-    CaptureSessionDeleteReceipt,
-    delete_capture_project,
-    delete_capture_session,
-)
-from saliencegate.capture.identities import CaptureDigestContext, CaptureIdentityError
-from saliencegate.capture.locations import (
-    CaptureLocationError,
-    CaptureStoreLocations,
-    resolve_capture_store_locations,
-)
-from saliencegate.capture.migrations import (
-    CaptureMigrationError,
-    CaptureMigrationIntegrityError,
-    CaptureMigrationReceipt,
-    CaptureSchemaTooNewError,
-    initialize_capture_store,
-)
-from saliencegate.capture.normalization import (
-    CaptureDetectorEvidence,
-    CaptureNormalization,
-    CaptureNormalizationCounts,
-    CaptureNormalizationDiagnostic,
-    CaptureNormalizationDiagnosticCode,
-    CaptureNormalizationError,
-    normalize_capture_session_snapshot,
-    verify_capture_normalization,
-)
-from saliencegate.capture.publication import (
-    CaptureIntakeAuthenticationError,
-    authenticate_capture_intake,
-    verify_capture_intake_authentication,
-)
-from saliencegate.capture.report import (
-    CAPTURE_SESSION_REPORT_SCHEMA_VERSION,
-    CaptureReportCounts,
-    CaptureReportCoverage,
-    CaptureReportDetector,
-    CaptureReportError,
-    CaptureReportHeadline,
-    CaptureReportHealthCount,
-    CaptureReportInterval,
-    CaptureReportLimit,
-    CaptureSessionReport,
-    CaptureSpoolReportStatus,
-    build_capture_session_report,
-    decode_capture_session_report,
-    encode_capture_session_report,
-    render_capture_session_report_human,
-    render_capture_session_report_json,
-)
-from saliencegate.capture.schema import (
-    CAPTURE_NATIVE_JSON_LIMITS,
-    MAX_CAPTURE_EVENT_BYTES,
-    MAX_CAPTURE_NATIVE_BYTES,
-    CaptureActionFinishedIntake,
-    CaptureActionStartedIntake,
-    CaptureControllerFailedIntake,
-    CaptureEvent,
-    CaptureIntake,
-    CaptureJSONLimits,
-    CapturePermissionDeniedIntake,
-    CaptureSchemaError,
-    CaptureSessionFinishedIntake,
-    CaptureSessionStartedIntake,
-    CaptureSubagentFinishedIntake,
-    CaptureSubagentStartedIntake,
-    CaptureTurnFinishedIntake,
-    canonical_capture_event,
-    canonical_capture_intake,
-    load_capture_event,
-    load_capture_intake,
-    read_bounded_json,
-    validate_capture_event,
-    validate_capture_intake,
-)
-from saliencegate.capture.sessions import (
-    CaptureHumanSessionId,
-    CaptureSessionSnapshot,
-    CaptureSessionSnapshotError,
-    CaptureSnapshotEvent,
-    CaptureSnapshotHealth,
-    verify_capture_session_snapshot,
-)
-from saliencegate.capture.spool import (
-    MAX_CAPTURE_SPOOL_BYTES,
-    MAX_CAPTURE_SPOOL_EVENTS,
-    CaptureSpool,
-    CaptureSpoolDrainReceipt,
-    CaptureSpoolEnqueueReceipt,
-    CaptureSpoolError,
-    CaptureSpoolHealth,
-    CaptureSpoolIntegrityError,
-    CaptureSpoolMaintenance,
-    CaptureSpoolObservation,
-    CaptureSpoolObservationError,
-    CaptureSpoolUnavailableError,
-    admit_capture_intake,
-    verify_capture_spool_observation,
-)
-from saliencegate.capture.store import (
-    MAX_CAPTURE_EVENTS_PER_SESSION,
-    CaptureAdmissionSource,
-    CaptureAppendDisposition,
-    CaptureAppendReceipt,
-    CaptureConnectionRegistration,
-    CaptureConnectionState,
-    CaptureConnectionTransition,
-    CaptureSessionState,
-    CaptureSessionVerification,
-    CaptureStore,
-    CaptureStoreBusyError,
-    CaptureStoreClosedError,
-    CaptureStoreError,
-    CaptureStoreIntegrityError,
-    CaptureStoreMode,
-    CaptureStoreStateError,
-)
-from saliencegate.capture.transport import (
-    MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION,
-    CaptureTransportChunk,
-    CaptureTransportDisposition,
-    CaptureTransportError,
-    CaptureTransportReceipt,
-    validate_capture_transport_chunk,
-)
+The package root is intentionally lazy.  Provider hooks import focused capture
+submodules, and eagerly constructing every public report and normalization model
+would add unrelated work to each short-lived hook process.
+"""
+
+from __future__ import annotations
+
+import importlib
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from saliencegate.capture.adapters import (
+        CAPTURE_ADAPTER_PROTOCOL_VERSION,
+        CaptureAdapter,
+        CaptureAdapterCapabilities,
+        CaptureAdapterContractError,
+        validated_capture_adapter,
+    )
+    from saliencegate.capture.capabilities import (
+        CapabilitySupport,
+        CaptureCapabilityError,
+        CaptureCapabilityManifest,
+        CaptureCapabilityRegistry,
+        CaptureProfile,
+        CompatibilityStatus,
+        capture_capability_digest,
+        capture_profile,
+        classify_capture_compatibility,
+        load_capture_capability_registry,
+        validate_capture_capability_binding,
+    )
+    from saliencegate.capture.connections import (
+        CaptureConnectionSummary,
+        CaptureSessionInventory,
+        CaptureSessionSummary,
+    )
+    from saliencegate.capture.delete import (
+        CaptureDeleteDisposition,
+        CaptureProjectDeleteReceipt,
+        CaptureSessionDeleteReceipt,
+        delete_capture_project,
+        delete_capture_session,
+    )
+    from saliencegate.capture.identities import CaptureDigestContext, CaptureIdentityError
+    from saliencegate.capture.locations import (
+        CaptureLocationError,
+        CaptureStoreLocations,
+        resolve_capture_store_locations,
+    )
+    from saliencegate.capture.migrations import (
+        CaptureMigrationError,
+        CaptureMigrationIntegrityError,
+        CaptureMigrationReceipt,
+        CaptureSchemaTooNewError,
+        initialize_capture_store,
+    )
+    from saliencegate.capture.normalization import (
+        CaptureDetectorEvidence,
+        CaptureNormalization,
+        CaptureNormalizationCounts,
+        CaptureNormalizationDiagnostic,
+        CaptureNormalizationDiagnosticCode,
+        CaptureNormalizationError,
+        normalize_capture_session_snapshot,
+        verify_capture_normalization,
+    )
+    from saliencegate.capture.publication import (
+        CaptureIntakeAuthenticationError,
+        authenticate_capture_intake,
+        verify_capture_intake_authentication,
+    )
+    from saliencegate.capture.report import (
+        CAPTURE_SESSION_REPORT_SCHEMA_VERSION,
+        CaptureReportCounts,
+        CaptureReportCoverage,
+        CaptureReportDetector,
+        CaptureReportError,
+        CaptureReportHeadline,
+        CaptureReportHealthCount,
+        CaptureReportInterval,
+        CaptureReportLimit,
+        CaptureSessionReport,
+        CaptureSpoolReportStatus,
+        build_capture_session_report,
+        decode_capture_session_report,
+        encode_capture_session_report,
+        render_capture_session_report_human,
+        render_capture_session_report_json,
+    )
+    from saliencegate.capture.schema import (
+        CAPTURE_NATIVE_JSON_LIMITS,
+        MAX_CAPTURE_EVENT_BYTES,
+        MAX_CAPTURE_NATIVE_BYTES,
+        CaptureActionFinishedIntake,
+        CaptureActionStartedIntake,
+        CaptureControllerFailedIntake,
+        CaptureEvent,
+        CaptureIntake,
+        CaptureJSONLimits,
+        CapturePermissionDeniedIntake,
+        CaptureSchemaError,
+        CaptureSessionFinishedIntake,
+        CaptureSessionStartedIntake,
+        CaptureSubagentFinishedIntake,
+        CaptureSubagentStartedIntake,
+        CaptureTurnFinishedIntake,
+        canonical_capture_event,
+        canonical_capture_intake,
+        load_capture_event,
+        load_capture_intake,
+        read_bounded_json,
+        validate_capture_event,
+        validate_capture_intake,
+    )
+    from saliencegate.capture.sessions import (
+        CaptureHumanSessionId,
+        CaptureSessionSnapshot,
+        CaptureSessionSnapshotError,
+        CaptureSnapshotEvent,
+        CaptureSnapshotHealth,
+        verify_capture_session_snapshot,
+    )
+    from saliencegate.capture.spool import (
+        MAX_CAPTURE_SPOOL_BYTES,
+        MAX_CAPTURE_SPOOL_EVENTS,
+        CaptureSpool,
+        CaptureSpoolDrainReceipt,
+        CaptureSpoolEnqueueReceipt,
+        CaptureSpoolError,
+        CaptureSpoolHealth,
+        CaptureSpoolIntegrityError,
+        CaptureSpoolMaintenance,
+        CaptureSpoolObservation,
+        CaptureSpoolObservationError,
+        CaptureSpoolUnavailableError,
+        admit_capture_intake,
+        verify_capture_spool_observation,
+    )
+    from saliencegate.capture.store import (
+        MAX_CAPTURE_EVENTS_PER_SESSION,
+        CaptureAdmissionSource,
+        CaptureAppendDisposition,
+        CaptureAppendReceipt,
+        CaptureConnectionRegistration,
+        CaptureConnectionState,
+        CaptureConnectionTransition,
+        CaptureSessionState,
+        CaptureSessionVerification,
+        CaptureStore,
+        CaptureStoreBusyError,
+        CaptureStoreClosedError,
+        CaptureStoreError,
+        CaptureStoreIntegrityError,
+        CaptureStoreMode,
+        CaptureStoreStateError,
+    )
+    from saliencegate.capture.transport import (
+        MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION,
+        CaptureTransportChunk,
+        CaptureTransportDisposition,
+        CaptureTransportError,
+        CaptureTransportReceipt,
+        validate_capture_transport_chunk,
+    )
+
+_EXPORT_GROUPS: Final[dict[str, tuple[str, ...]]] = {
+    "saliencegate.capture.adapters": (
+        "CAPTURE_ADAPTER_PROTOCOL_VERSION",
+        "CaptureAdapter",
+        "CaptureAdapterCapabilities",
+        "CaptureAdapterContractError",
+        "validated_capture_adapter",
+    ),
+    "saliencegate.capture.capabilities": (
+        "CapabilitySupport",
+        "CaptureCapabilityError",
+        "CaptureCapabilityManifest",
+        "CaptureCapabilityRegistry",
+        "CaptureProfile",
+        "CompatibilityStatus",
+        "capture_capability_digest",
+        "capture_profile",
+        "classify_capture_compatibility",
+        "load_capture_capability_registry",
+        "validate_capture_capability_binding",
+    ),
+    "saliencegate.capture.connections": (
+        "CaptureConnectionSummary",
+        "CaptureSessionInventory",
+        "CaptureSessionSummary",
+    ),
+    "saliencegate.capture.delete": (
+        "CaptureDeleteDisposition",
+        "CaptureProjectDeleteReceipt",
+        "CaptureSessionDeleteReceipt",
+        "delete_capture_project",
+        "delete_capture_session",
+    ),
+    "saliencegate.capture.identities": (
+        "CaptureDigestContext",
+        "CaptureIdentityError",
+    ),
+    "saliencegate.capture.locations": (
+        "CaptureLocationError",
+        "CaptureStoreLocations",
+        "resolve_capture_store_locations",
+    ),
+    "saliencegate.capture.migrations": (
+        "CaptureMigrationError",
+        "CaptureMigrationIntegrityError",
+        "CaptureMigrationReceipt",
+        "CaptureSchemaTooNewError",
+        "initialize_capture_store",
+    ),
+    "saliencegate.capture.normalization": (
+        "CaptureDetectorEvidence",
+        "CaptureNormalization",
+        "CaptureNormalizationCounts",
+        "CaptureNormalizationDiagnostic",
+        "CaptureNormalizationDiagnosticCode",
+        "CaptureNormalizationError",
+        "normalize_capture_session_snapshot",
+        "verify_capture_normalization",
+    ),
+    "saliencegate.capture.publication": (
+        "CaptureIntakeAuthenticationError",
+        "authenticate_capture_intake",
+        "verify_capture_intake_authentication",
+    ),
+    "saliencegate.capture.report": (
+        "CAPTURE_SESSION_REPORT_SCHEMA_VERSION",
+        "CaptureReportCounts",
+        "CaptureReportCoverage",
+        "CaptureReportDetector",
+        "CaptureReportError",
+        "CaptureReportHeadline",
+        "CaptureReportHealthCount",
+        "CaptureReportInterval",
+        "CaptureReportLimit",
+        "CaptureSessionReport",
+        "CaptureSpoolReportStatus",
+        "build_capture_session_report",
+        "decode_capture_session_report",
+        "encode_capture_session_report",
+        "render_capture_session_report_human",
+        "render_capture_session_report_json",
+    ),
+    "saliencegate.capture.schema": (
+        "CAPTURE_NATIVE_JSON_LIMITS",
+        "MAX_CAPTURE_EVENT_BYTES",
+        "MAX_CAPTURE_NATIVE_BYTES",
+        "CaptureActionFinishedIntake",
+        "CaptureActionStartedIntake",
+        "CaptureControllerFailedIntake",
+        "CaptureEvent",
+        "CaptureIntake",
+        "CaptureJSONLimits",
+        "CapturePermissionDeniedIntake",
+        "CaptureSchemaError",
+        "CaptureSessionFinishedIntake",
+        "CaptureSessionStartedIntake",
+        "CaptureSubagentFinishedIntake",
+        "CaptureSubagentStartedIntake",
+        "CaptureTurnFinishedIntake",
+        "canonical_capture_event",
+        "canonical_capture_intake",
+        "load_capture_event",
+        "load_capture_intake",
+        "read_bounded_json",
+        "validate_capture_event",
+        "validate_capture_intake",
+    ),
+    "saliencegate.capture.sessions": (
+        "CaptureHumanSessionId",
+        "CaptureSessionSnapshot",
+        "CaptureSessionSnapshotError",
+        "CaptureSnapshotEvent",
+        "CaptureSnapshotHealth",
+        "verify_capture_session_snapshot",
+    ),
+    "saliencegate.capture.spool": (
+        "MAX_CAPTURE_SPOOL_BYTES",
+        "MAX_CAPTURE_SPOOL_EVENTS",
+        "CaptureSpool",
+        "CaptureSpoolDrainReceipt",
+        "CaptureSpoolEnqueueReceipt",
+        "CaptureSpoolError",
+        "CaptureSpoolHealth",
+        "CaptureSpoolIntegrityError",
+        "CaptureSpoolMaintenance",
+        "CaptureSpoolObservation",
+        "CaptureSpoolObservationError",
+        "CaptureSpoolUnavailableError",
+        "admit_capture_intake",
+        "verify_capture_spool_observation",
+    ),
+    "saliencegate.capture.store": (
+        "MAX_CAPTURE_EVENTS_PER_SESSION",
+        "CaptureAdmissionSource",
+        "CaptureAppendDisposition",
+        "CaptureAppendReceipt",
+        "CaptureConnectionRegistration",
+        "CaptureConnectionState",
+        "CaptureConnectionTransition",
+        "CaptureSessionState",
+        "CaptureSessionVerification",
+        "CaptureStore",
+        "CaptureStoreBusyError",
+        "CaptureStoreClosedError",
+        "CaptureStoreError",
+        "CaptureStoreIntegrityError",
+        "CaptureStoreMode",
+        "CaptureStoreStateError",
+    ),
+    "saliencegate.capture.transport": (
+        "MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION",
+        "CaptureTransportChunk",
+        "CaptureTransportDisposition",
+        "CaptureTransportError",
+        "CaptureTransportReceipt",
+        "validate_capture_transport_chunk",
+    ),
+}
+
+_EXPORTS: Final[dict[str, str]] = {
+    name: module_name for module_name, names in _EXPORT_GROUPS.items() for name in names
+}
 
 __all__ = [
     "CAPTURE_ADAPTER_PROTOCOL_VERSION",
@@ -282,3 +456,21 @@ __all__ = [
     "verify_capture_session_snapshot",
     "verify_capture_spool_observation",
 ]
+
+if len(_EXPORTS) != len(__all__) or frozenset(_EXPORTS) != frozenset(__all__):
+    raise RuntimeError("capture public API export map is invalid")
+
+
+def __getattr__(name: str) -> object:
+    """Resolve and cache one declared public export from its owning submodule."""
+
+    module_name = _EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(frozenset(globals()).union(__all__))

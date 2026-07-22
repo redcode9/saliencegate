@@ -28,7 +28,7 @@ from saliencegate.capture.schema import (
     load_capture_intake,
 )
 from saliencegate.domain import canonical_json
-from saliencegate.domain.records import Sha256Digest
+from saliencegate.domain.primitives import Sha256Digest
 from saliencegate.security import (
     InstallationKey,
     SecureFileError,

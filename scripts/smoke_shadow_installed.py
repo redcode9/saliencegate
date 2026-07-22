@@ -12,11 +12,12 @@ import sys
 from collections.abc import Iterator, MutableMapping
 from dataclasses import dataclass
 from hashlib import sha256
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest import mock
 from uuid import UUID
 
 _MAX_COMMAND_REPORT_BYTES = 1 << 20
+_MAX_PRIVATE_PUBLICATION_BYTES = 64 << 20
 _OPTIONAL_MODULES = ("httpx", "openai_harmony")
 _PROVIDER_MODULES = ("harbor", "anthropic", "openai")
 _IMPORTED_MODULE_EXCLUSIONS = (*_PROVIDER_MODULES, *_OPTIONAL_MODULES)
@@ -238,15 +239,95 @@ def _assert_network_is_denied() -> None:
         raise RuntimeError("installed ATIF smoke requires the socket guard")
 
 
-def _require_private_parent(path: Path) -> None:
+def _selected_platform(platform: str | None = None) -> str:
+    selected = os.name if platform is None else platform
+    if selected not in {"nt", "posix"}:
+        raise RuntimeError("shadow smoke platform is unsupported")
+    return selected
+
+
+def _authorize_windows_private_parent(parent: Path) -> None:
+    from saliencegate.security.windows import (
+        NativeWindowsSecurityOperations,
+        WindowsPathKind,
+        authorize_windows_private_path,
+    )
+
+    operations = NativeWindowsSecurityOperations()
+    authorization = authorize_windows_private_path(
+        PureWindowsPath(os.fspath(parent)),
+        kind=WindowsPathKind.DIRECTORY,
+        operations=operations,
+    )
+    authorization.revalidate()
+
+
+def _publish_windows_private_file(path: Path, data: bytes) -> None:
+    from saliencegate.security.windows import NativeWindowsSecurityOperations
+
+    operations = NativeWindowsSecurityOperations()
+    published = operations.publish_private_file(
+        PureWindowsPath(os.fspath(path)),
+        data,
+        maximum_bytes=len(data),
+        validate_published=lambda current: current == data,
+    )
+    if published.data != data:
+        raise RuntimeError("private trace publication failed")
+    published.authorization.revalidate()
+
+
+def _read_windows_private_file(path: Path, *, maximum_bytes: int) -> bytes:
+    from saliencegate.security.windows import NativeWindowsSecurityOperations
+
+    operations = NativeWindowsSecurityOperations()
+    stable = operations.read_private_file(
+        PureWindowsPath(os.fspath(path)),
+        maximum_bytes=maximum_bytes,
+    )
+    stable.authorization.revalidate()
+    return stable.data
+
+
+def _ensure_windows_smoke_directory(path: Path) -> None:
+    from saliencegate.security.windows import (
+        NativeWindowsSecurityOperations,
+        ensure_windows_private_directory,
+    )
+
+    operations = NativeWindowsSecurityOperations()
+    authorization = ensure_windows_private_directory(
+        PureWindowsPath(os.fspath(path)),
+        operations=operations,
+    )
+    authorization.revalidate()
+
+
+def _prepare_private_directory(path: Path, *, platform: str | None = None) -> None:
+    selected_platform = _selected_platform(platform)
+    if selected_platform == "nt":
+        _ensure_windows_smoke_directory(path)
+        return
+    from saliencegate.security import ensure_private_directory, inspect_private_directory
+
+    ensure_private_directory(path)
+    if inspect_private_directory(path) is not True:
+        raise RuntimeError("shadow smoke parent is not private")
+
+
+def _require_private_parent(path: Path, *, platform: str | None = None) -> None:
     parent = path.parent
+    if "tests/fixtures" in parent.as_posix():
+        raise RuntimeError("shadow smoke input must not use checkout fixtures")
+    selected_platform = _selected_platform(platform)
+    if selected_platform == "nt":
+        _authorize_windows_private_parent(parent)
+        return
     metadata = parent.stat(follow_symlinks=False)
     if not stat.S_ISDIR(metadata.st_mode):
         raise RuntimeError("shadow smoke parent is invalid")
     if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
         raise RuntimeError("shadow smoke parent is not private")
-    if "tests/fixtures" in parent.as_posix():
-        raise RuntimeError("shadow smoke input must not use checkout fixtures")
 
 
 def _write_all(descriptor: int, data: bytes) -> None:
@@ -258,10 +339,14 @@ def _write_all(descriptor: int, data: bytes) -> None:
         offset += written
 
 
-def _write_private(path: Path, data: bytes) -> None:
-    _require_private_parent(path)
+def _write_private(path: Path, data: bytes, *, platform: str | None = None) -> None:
+    selected_platform = _selected_platform(platform)
+    _require_private_parent(path, platform=selected_platform)
     if type(data) is not bytes or not data:
         raise RuntimeError("private smoke payload is invalid")
+    if selected_platform == "nt":
+        _publish_windows_private_file(path, data)
+        return
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -293,10 +378,25 @@ def _write_trace(path: Path) -> None:
     _write_private(path, encoded)
 
 
-def _read_private(path: Path, *, maximum_bytes: int) -> bytes:
+def _publish_private_stdin(path: Path) -> None:
+    data = sys.stdin.buffer.read(_MAX_PRIVATE_PUBLICATION_BYTES + 1)
+    if not data or len(data) > _MAX_PRIVATE_PUBLICATION_BYTES:
+        raise RuntimeError("private smoke payload is invalid")
+    _write_private(path, data)
+
+
+def _read_private(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    platform: str | None = None,
+) -> bytes:
+    selected_platform = _selected_platform(platform)
+    _require_private_parent(path, platform=selected_platform)
+    if selected_platform == "nt":
+        return _read_windows_private_file(path, maximum_bytes=maximum_bytes)
     from saliencegate.security import StableReadPolicy, read_stable_file
 
-    _require_private_parent(path)
     return read_stable_file(
         path,
         maximum_bytes=maximum_bytes,
@@ -612,19 +712,29 @@ def _validate_atif_report(
         raise RuntimeError("ATIF smoke report disclosed source content or paths")
 
 
-def _validate_local_key(environment_guard: _EnvironmentReadGuard) -> None:
+def _validate_local_key(
+    environment_guard: _EnvironmentReadGuard,
+    *,
+    platform: str | None = None,
+) -> None:
     from saliencegate.security import default_installation_key_path
 
     key_path = default_installation_key_path()
-    metadata = key_path.stat(follow_symlinks=False)
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or metadata.st_uid != os.getuid()
-        or metadata.st_nlink != 1
-        or metadata.st_size != 32
-    ):
-        raise RuntimeError("installed ATIF smoke key boundary is invalid")
+    selected_platform = _selected_platform(platform)
+    if selected_platform == "nt":
+        key_data = _read_private(key_path, maximum_bytes=32, platform=selected_platform)
+        if len(key_data) != 32:
+            raise RuntimeError("installed ATIF smoke key boundary is invalid")
+    else:
+        metadata = key_path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or metadata.st_size != 32
+        ):
+            raise RuntimeError("installed ATIF smoke key boundary is invalid")
     if not environment_guard.reads.intersection(_LOCAL_KEY_ENVIRONMENT_KEYS):
         raise RuntimeError("installed ATIF smoke did not exercise the local key boundary")
 
@@ -680,10 +790,19 @@ def _exercise_atif_profiles(root: Path, environment_guard: _EnvironmentReadGuard
 def main() -> None:
     message: str | None = None
     with _guard_provider_environment_reads() as environment_guard:
-        if len(sys.argv) == 3 and sys.argv[1] == "write-trace":
+        if len(sys.argv) == 3 and sys.argv[1] == "prepare-private-directory":
+            _assert_core_only()
+            _prepare_private_directory(Path(sys.argv[2]))
+            message = "shadow-private-directory-ok"
+        elif len(sys.argv) == 3 and sys.argv[1] == "write-trace":
             _assert_core_only()
             _write_trace(Path(sys.argv[2]))
             message = "shadow-trace-ok"
+        elif len(sys.argv) == 3 and sys.argv[1] == "publish-private-file":
+            _assert_core_only()
+            _publish_private_stdin(Path(sys.argv[2]))
+            _assert_core_only()
+            message = "shadow-private-file-ok"
         elif len(sys.argv) == 5 and sys.argv[1] == "validate-report":
             _assert_core_only()
             _validate_report(Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4])

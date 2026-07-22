@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
+import saliencegate.policy.config as config_module
 from saliencegate.domain import BudgetAmounts
 from saliencegate.policy import (
     AlwaysInvokeConfig,
@@ -330,3 +331,55 @@ def test_resolved_configuration_rejects_unsafe_or_unbounded_json(
             configuration=cast(dict[str, object], configuration),
             configuration_digest="0" * 64,
         )
+
+
+def test_script_validator_rejects_container_subclasses() -> None:
+    class _Decisions(list[bool]):
+        pass
+
+    with pytest.raises(ValueError, match="exact bounded"):
+        ScriptedPolicyConfig.exact_bounded_decisions(_Decisions([True]))
+
+
+@pytest.mark.parametrize(
+    ("node_limit", "byte_limit", "value"),
+    (
+        (1, 1_000, {"a": 1}),
+        (50_000, 1, {}),
+        (50_000, 5, {"long": None}),
+        (50_000, 1, []),
+    ),
+)
+def test_bounded_json_accounts_for_declared_children_keys_and_containers(
+    monkeypatch: pytest.MonkeyPatch,
+    node_limit: int,
+    byte_limit: int,
+    value: object,
+) -> None:
+    monkeypatch.setattr(config_module, "_MAX_CONFIGURATION_NODES", node_limit)
+    monkeypatch.setattr(config_module, "_MAX_CONFIGURATION_BYTES", byte_limit)
+    assert not config_module._bounded_json(value, allow_mapping_proxy=False)
+
+
+def test_resolved_configuration_and_sealer_reject_internal_digest_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = resolve_policy_configuration("always-invoke/v1", always_config())
+    monkeypatch.setattr(config_module, "_configuration_digest", lambda *_args: None)
+    with pytest.raises(ValueError, match="canonical JSON"):
+        resolved.digest_matches_configuration()
+    with pytest.raises(PolicyConfigurationError):
+        config_module._seal_policy_configuration("example/v1", {})
+
+
+def test_budget_preflight_and_constructor_failure_are_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert config_module._config_is_preflight_safe(budget_config())
+    monkeypatch.setattr(
+        config_module,
+        "ResolvedPolicyConfiguration",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError()),
+    )
+    with pytest.raises(PolicyConfigurationError):
+        config_module._seal_policy_configuration("example/v1", {})

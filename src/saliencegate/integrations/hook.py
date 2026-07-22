@@ -117,7 +117,7 @@ SpoolFactory = Callable[[object], CaptureHookSpool]
 HealthMarker = Callable[[object, "CaptureHealthCode"], None]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class CaptureHookDependencies:
     """Ordered validation and runtime dependencies supplied by integration code."""
 

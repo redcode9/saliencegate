@@ -266,3 +266,70 @@ def test_trusted_extraction_rejects_unsealed_contexts_extractors_and_results(
 
     trusted = _extract_trusted_report(trusted_extractor, trusted_context)
     assert not _trusted_extraction_is_exact(replace(trusted, _token=object()))
+
+
+def test_internal_preflight_helpers_fail_closed_on_cycles_limits_and_unsealed_values(
+    event_factory: EventFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(base_module, "_MAX_CONTEXT_PAYLOAD_NODES", 1)
+    assert base_module._json_size_upper_bound({"value": 1}, limit=1_000) is None
+    monkeypatch.setattr(base_module, "_MAX_CONTEXT_PAYLOAD_NODES", 100)
+
+    mapping_cycle: dict[str, object] = {}
+    mapping_cycle["self"] = mapping_cycle
+    assert base_module._json_size_upper_bound(mapping_cycle, limit=1_000) is None
+
+    tuple_cycle_mapping: dict[str, object] = {}
+    tuple_cycle = (tuple_cycle_mapping,)
+    tuple_cycle_mapping["tuple"] = tuple_cycle
+    assert base_module._json_size_upper_bound(tuple_cycle, limit=1_000) is None
+    assert base_module._json_size_upper_bound(float("nan"), limit=1_000) is None
+    assert base_module._json_size_upper_bound(object(), limit=1_000) is None
+
+    malformed_context = DetectionContext.model_construct(run_id="not-a-uuid", events=())
+    assert not base_module._context_is_bounded(malformed_context)
+
+    uninitialized_values = (
+        (
+            base_module._detection_sequence_proof_is_exact,
+            object.__new__(base_module._DetectionSequenceProof),
+        ),
+        (
+            base_module._trusted_detection_context_is_exact,
+            object.__new__(base_module._TrustedDetectionContext),
+        ),
+        (
+            base_module._trusted_extractor_is_exact,
+            object.__new__(DeterministicSignalExtractor),
+        ),
+        (
+            base_module._trusted_extraction_is_exact,
+            object.__new__(base_module._TrustedExtraction),
+        ),
+    )
+    for validator, value in uninitialized_values:
+        assert validator(value) is False
+        assert validator(object()) is False
+
+    with pytest.raises(DetectionInputError):
+        _admit_detection_sequence([])  # type: ignore[arg-type]
+    with pytest.raises(DetectionInputError):
+        _admit_detection_sequence((object(),))  # type: ignore[arg-type]
+
+    event = event_factory(1)
+    monkeypatch.setattr(
+        base_module.TraceEvent,
+        "model_validate_json",
+        classmethod(lambda _cls, _value: event.model_copy(update={"sequence": 2})),
+    )
+    with pytest.raises(DetectionInputError):
+        _admit_detection_sequence((event,))
+    monkeypatch.undo()
+
+    def interrupt(_value: object) -> bytes:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(base_module, "canonical_json", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        _admit_detection_sequence((event,))

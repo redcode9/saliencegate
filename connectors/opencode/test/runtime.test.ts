@@ -36,6 +36,16 @@ const VALID_BOOTSTRAP: BootstrapBinding = {
   receipt_mac: "4".repeat(64),
 };
 
+const PROVIDER_CREDENTIAL_KEYS = new Set([
+  "ANTHROPIC_API_KEY",
+  "AZURE_OPENAI_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENAI_ORGANIZATION",
+  "OPENAI_ORG_ID",
+  "OPENAI_PROJECT",
+  "OPENAI_PROJECT_ID",
+]);
+
 function toolEvent(sessionID: string, callID: string, status: "pending" | "completed"): object {
   return {
     type: "message.part.updated",
@@ -76,6 +86,51 @@ function document(write: CaptureChunkWrite): {
     chunk_count: number;
   };
 }
+
+test("OpenCode transport filters provider credentials without reading hostile getters", async () => {
+  const target: NodeJS.ProcessEnv = {
+    SAFE_MARKER: "preserved",
+    ...(process.platform === "win32" ? { SystemRoot: "C:\\Windows" } : {}),
+  };
+  for (const key of PROVIDER_CREDENTIAL_KEYS) target[key] = `${key}-must-not-be-read`;
+  const reads: string[] = [];
+  const environment = new Proxy(target, {
+    get(value, property, receiver) {
+      if (typeof property === "string") {
+        if (PROVIDER_CREDENTIAL_KEYS.has(property.toUpperCase())) {
+          throw new Error(`credential getter was read: ${property}`);
+        }
+        reads.push(property);
+      }
+      return Reflect.get(value, property, receiver) as unknown;
+    },
+  });
+  const writes: CaptureChunkWrite[] = [];
+  const transport = new OpenCodeBatchTransport(VALID_BOOTSTRAP, {
+    environment,
+    batchID: () => "6".repeat(64),
+    writeChunk: async (write) => {
+      writes.push(write);
+      return true;
+    },
+  });
+
+  assert.equal(
+    await transport.flush("no-read-session", [
+      { kind: "turn_finished", session_id: "no-read-session" },
+    ]),
+    "delivered",
+  );
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0]!.invocation.options.env.SAFE_MARKER, "preserved");
+  assert.ok(reads.includes("SAFE_MARKER"));
+  assert.equal(
+    Object.keys(writes[0]!.invocation.options.env).some((key) =>
+      PROVIDER_CREDENTIAL_KEYS.has(key.toUpperCase()),
+    ),
+    false,
+  );
+});
 
 test("bootstrap loading requires canonical sidecar bytes and the exact sibling bundle digest", async () => {
   const directory = await mkdtemp(path.join(tmpdir(), "saliencegate-opencode-bootstrap-"));

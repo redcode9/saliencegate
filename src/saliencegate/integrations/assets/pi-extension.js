@@ -115,24 +115,50 @@ function encodeCanonicalJson(value) {
 
 // connectors/bridge-core/src/launcher.ts
 import path from "node:path";
-function checkedEnvironment(value) {
-  const result = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (key.includes("\0") || item.includes("\0")) throw new BridgeContractError();
-    result[key] = item;
+var PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS = Object.freeze([
+  "ANTHROPIC_API_KEY",
+  "AZURE_OPENAI_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENAI_ORGANIZATION",
+  "OPENAI_ORG_ID",
+  "OPENAI_PROJECT",
+  "OPENAI_PROJECT_ID"
+]);
+var PROVIDER_CREDENTIAL_ENVIRONMENT_KEY_SET = new Set(
+  PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS
+);
+function copyLauncherEnvironment(value) {
+  try {
+    const result = {};
+    for (const key of Object.keys(value)) {
+      if (key.includes("\0")) throw new BridgeContractError();
+      if (PROVIDER_CREDENTIAL_ENVIRONMENT_KEY_SET.has(key.toUpperCase())) continue;
+      const item = Reflect.get(value, key);
+      if (typeof item !== "string") continue;
+      if (item.includes("\0")) throw new BridgeContractError();
+      Object.defineProperty(result, key, {
+        configurable: true,
+        enumerable: true,
+        value: item,
+        writable: true
+      });
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof BridgeContractError) throw error;
+    throw new BridgeContractError();
   }
-  return result;
 }
 function launcherInvocation(input) {
   try {
     if (typeof input.launcherPath !== "string" || input.launcherPath.length === 0 || input.launcherPath.length > 4096 || input.launcherPath.includes("\0")) {
       throw new BridgeContractError();
     }
-    const environment2 = checkedEnvironment(input.environment);
+    const environment = copyLauncherEnvironment(input.environment);
     const options = {
       shell: false,
       windowsHide: true,
-      env: environment2,
+      env: environment,
       stdio: ["pipe", "ignore", "ignore"]
     };
     if (input.platform !== "win32") {
@@ -142,7 +168,7 @@ function launcherInvocation(input) {
     if (!path.win32.isAbsolute(input.launcherPath) || input.launcherPath.includes('"')) {
       throw new BridgeContractError();
     }
-    const systemRoots = Object.entries(environment2).filter(
+    const systemRoots = Object.entries(environment).filter(
       ([key]) => key.toUpperCase() === "SYSTEMROOT"
     );
     if (systemRoots.length !== 1) throw new BridgeContractError();
@@ -152,7 +178,7 @@ function launcherInvocation(input) {
     }
     const file = path.win32.join(systemRoot, "System32", "cmd.exe");
     const windowsEnvironment = Object.fromEntries(
-      Object.entries(environment2).filter(
+      Object.entries(environment).filter(
         ([key]) => key.toUpperCase() !== "SALIENCEGATE_LAUNCHER"
       )
     );
@@ -329,13 +355,6 @@ var CAPTURE_LAUNCHER_TIMEOUT_MS = 2e3;
 var MAX_CONCURRENT_CAPTURE_LAUNCHERS = 4;
 var MAX_PENDING_GAP_WINDOWS = 256;
 var WINDOW_DISCRIMINATOR = /^[0-9a-f]{64}$/;
-function environment(value) {
-  const result = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (typeof item === "string") result[key] = item;
-  }
-  return result;
-}
 async function spawnWindowedCaptureChunk(input, spawnChild = spawn) {
   return await new Promise((resolve) => {
     let child;
@@ -410,7 +429,7 @@ var WindowedBatchTransport = class {
     this.#invocation = launcherInvocation({
       platform: options.platform ?? process.platform,
       launcherPath: bootstrap.launcher_path,
-      environment: environment(options.environment ?? process.env)
+      environment: options.environment ?? process.env
     });
     this.#writeChunk = options.writeChunk ?? spawnWindowedCaptureChunk;
     this.#batchID = options.batchID ?? (() => randomBytes(32).toString("hex"));

@@ -246,6 +246,14 @@ CAPTURE_RESOURCE_FILES = {
     "saliencegate/integrations/launchers/windows.cmd",
     "saliencegate/integrations/profiles.json",
 }
+CONNECTOR_BUNDLES = {
+    "saliencegate/integrations/assets/opencode-plugin.js": (
+        "src/saliencegate/integrations/assets/opencode-plugin.js"
+    ),
+    "saliencegate/integrations/assets/pi-extension.js": (
+        "src/saliencegate/integrations/assets/pi-extension.js"
+    ),
+}
 CAPTURE_SECURITY_RUNTIME_FILES = {
     "saliencegate/security/windows.py",
 }
@@ -652,6 +660,8 @@ def test_built_sdist_has_exact_reviewable_membership_and_payloads(
         "examples/shadow_asyncio.py",
         "scripts/benchmark_shadow_trace.py",
         "scripts/benchmark_capture_hook.py",
+        "scripts/benchmark_capture_report.py",
+        "scripts/run_capture_hook_benchmark.py",
         "scripts/run_without_sockets.py",
         "scripts/smoke_core_imports.py",
         "scripts/smoke_launch_contracts.py",
@@ -659,6 +669,11 @@ def test_built_sdist_has_exact_reviewable_membership_and_payloads(
         "scripts/smoke_package_imports.py",
         "scripts/smoke_shadow_installed.py",
         "scripts/verify_built_artifacts.py",
+        "scripts/verify_connector_artifacts.py",
+        "connectors/scripts/benchmark-connectors.ts",
+        "connectors/scripts/build-connectors.mjs",
+        "connectors/scripts/deny-network-selftest.mjs",
+        "connectors/scripts/deny-network.mjs",
         "uv.lock",
         "tests/test_installed_shadow_atif_smoke.py",
         "tests/test_shadow_trace_benchmark.py",
@@ -680,6 +695,17 @@ def test_built_sdist_has_exact_reviewable_membership_and_payloads(
         *(f"src/{path}" for path in SHADOW_RUNTIME_FILES),
         *(f"src/{path}" for path in SHADOW_RESOURCE_FILES),
     } <= files.keys()
+
+
+def test_built_connector_bundles_are_byte_identical_across_archives(
+    built_distributions: tuple[Path, Path],
+) -> None:
+    wheel, sdist = built_distributions
+    wheel_files = _wheel_files(wheel)
+    sdist_files = _sdist_files(sdist)
+
+    for wheel_member, sdist_member in CONNECTOR_BUNDLES.items():
+        assert wheel_files[wheel_member] == sdist_files[sdist_member]
 
 
 def test_built_distributions_exclude_local_and_generated_state(

@@ -374,14 +374,34 @@ def test_hook_connection_lookup_authenticates_only_the_selected_row(tmp_path: Pa
         busy_timeout_ms=250,
         mode=CaptureStoreMode.HOOK,
     ) as hook:
+        narrow = hook._get_hook_connection(CONNECTION_ID)
         selected = hook.get_connection(CONNECTION_ID)
+        assert type(narrow) is store_module._CaptureHookConnection
+        assert (
+            narrow.connection_id,
+            narrow.project_digest,
+            narrow.profile_id,
+            narrow.capability_manifest_digest,
+            narrow.host_version,
+            narrow.state,
+        ) == (
+            selected.connection_id,
+            selected.project_digest,
+            selected.profile_id,
+            selected.capability_manifest_digest,
+            selected.host_version,
+            selected.state,
+        )
+        assert repr(narrow) == "_CaptureHookConnection(<redacted>)"
         assert selected.connection_id == CONNECTION_ID
         assert selected.state is CaptureConnectionState.ENABLED
+        with pytest.raises(CaptureStoreIntegrityError):
+            hook._get_hook_connection(OTHER_CONNECTION_ID)
         with pytest.raises(CaptureStoreIntegrityError):
             hook.get_connection(OTHER_CONNECTION_ID)
 
 
-def test_hook_append_verifies_only_the_authenticated_session_tip(
+def test_cached_hook_append_verifies_only_the_authenticated_session_tip(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -412,6 +432,41 @@ def test_hook_append_verifies_only_the_authenticated_session_tip(
 
     assert receipt.receipt_ordinal == 2
     assert receipt.previous_event_tag is not None
+
+
+def test_fresh_hook_append_authenticates_the_full_long_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "bounded-cold-hook-append.sqlite3"
+    with initialized_store(path) as maintenance:
+        register_connection(maintenance)
+        for producer_index in range(1, 129):
+            maintenance.append(
+                authenticated_intake(
+                    "session_started" if producer_index == 1 else "turn_finished",
+                    producer_index=producer_index,
+                )
+            )
+
+    verified_ordinals: list[int] = []
+    original = CaptureStore._load_verified_append_event
+
+    def counted(self: CaptureStore, row: sqlite3.Row):
+        verified_ordinals.append(row["receipt_ordinal"])
+        return original(self, row)
+
+    monkeypatch.setattr(CaptureStore, "_load_verified_append_event", counted)
+    with CaptureStore.open(
+        path,
+        installation_key=INSTALLATION_KEY,
+        busy_timeout_ms=250,
+        mode=CaptureStoreMode.HOOK,
+    ) as hook:
+        receipt = hook.append(authenticated_intake("turn_finished", producer_index=129))
+
+    assert receipt.receipt_ordinal == 129
+    assert verified_ordinals == list(range(1, 129))
 
 
 def test_append_rejects_an_intake_bound_to_a_different_profile_without_mutation(

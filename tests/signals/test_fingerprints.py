@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 import saliencegate.signals as public_signals
 import saliencegate.signals.fingerprints as fingerprints_module
-from saliencegate.domain import EventPhase, EventType
+from saliencegate.domain import EventPhase, EventType, TraceEvent
 from saliencegate.signals.base import AbstentionReason
 from saliencegate.signals.fingerprints import (
     ActionFingerprint,
@@ -1227,3 +1227,104 @@ def test_invalid_event_object_and_text_subclass_fail_closed() -> None:
     assert unavailable_reason(lambda: normalize_test_id(TextSubclass("tests/a.py::test"))) is (
         AbstentionReason.STRUCTURED_EVIDENCE_INVALID
     )
+
+
+def test_payload_bounder_exercises_node_key_tuple_and_byte_limits() -> None:
+    assert not fingerprints_module._payload_is_bounded(
+        {"a": 1, "b": 2},
+        max_bytes=1_000,
+        max_nodes=1,
+    )
+    assert not fingerprints_module._payload_is_bounded(
+        {1: "invalid-key"},
+        max_bytes=1_000,
+        max_nodes=100,
+    )
+    assert not fingerprints_module._payload_is_bounded(
+        (1, 2),
+        max_bytes=1_000,
+        max_nodes=1,
+    )
+    assert not fingerprints_module._payload_is_bounded(
+        "too-large",
+        max_bytes=1,
+        max_nodes=100,
+    )
+
+
+def test_evidence_models_reject_prevalidation_and_postvalidation_aggregate_overflow() -> None:
+    failure_item = FailureEvidence(
+        schema_version="1.0",
+        test_id="t" * fingerprints_module._MAX_TEST_ID_BYTES,
+    )
+    with pytest.raises(ValidationError):
+        ReportEvidence(
+            schema_version="1.0",
+            framework="pytest",
+            status="failed",
+            failures=(failure_item,) * (fingerprints_module._MAX_TEST_FAILURES + 1),
+        )
+    with pytest.raises(ValidationError):
+        ReportEvidence(
+            schema_version="1.0",
+            framework="pytest",
+            status="failed",
+            failures=object(),  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValidationError):
+        detailed_failure = FailureEvidence(
+            schema_version="1.0",
+            test_id="t" * fingerprints_module._MAX_TEST_ID_BYTES,
+            failure_type="f" * 5_238,
+        )
+        ReportEvidence(
+            schema_version="1.0",
+            framework="f" * fingerprints_module._MAX_SHORT_TEXT_BYTES,
+            status="failed",
+            failures=(detailed_failure, *(failure_item,) * 9),
+        )
+
+
+def test_transient_fingerprints_reject_aggregate_overflow_after_item_validation() -> None:
+    token = "x" * fingerprints_module._MAX_ARG_BYTES
+    with pytest.raises(ValueError):
+        ActionFingerprint(
+            execution_mode="argv",
+            tokens=(token,) * fingerprints_module._MAX_ARGV_ITEMS,
+            working_directory=WORKING_DIRECTORY,
+            environment_digest=ENVIRONMENT_DIGEST,
+        )
+
+    normalized = NormalizedTestFailure(test_id="t" * fingerprints_module._MAX_TEST_ID_BYTES)
+    with pytest.raises(ValueError):
+        ParsedTestReport(
+            framework="pytest",
+            status=ReportStatus.FAILED,
+            failures=(normalized,) * (fingerprints_module._MAX_TEST_FAILURES + 1),
+        )
+    with pytest.raises(ValueError):
+        ParsedTestReport(
+            framework="f" * fingerprints_module._MAX_SHORT_TEXT_BYTES,
+            status=ReportStatus.FAILED,
+            failures=(normalized,) * 10,
+        )
+    with pytest.raises(ValueError):
+        FailureFingerprint(
+            category="tool",
+            components=("s" * fingerprints_module._MAX_SIGNATURE_BYTES,) * 3,
+        )
+
+
+def test_internal_loaders_reject_mutable_payload_state_even_on_exact_event_types() -> None:
+    mutable_tool_event = TraceEvent.model_construct(
+        event_type=EventType.TOOL_COMPLETION,
+        payload={},
+    )
+    mutable_test_event = TraceEvent.model_construct(
+        event_type=EventType.OBSERVATION,
+        payload={},
+    )
+    with pytest.raises(FingerprintUnavailableError):
+        fingerprints_module._load_tool_outcome(mutable_tool_event)
+    with pytest.raises(FingerprintUnavailableError):
+        fingerprints_module._load_test_report(mutable_test_event)

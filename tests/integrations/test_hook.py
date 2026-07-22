@@ -1307,6 +1307,46 @@ def test_posix_launcher_preserves_stdin_fixed_argv_and_absorbs_child_output_and_
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX launcher contract")
+def test_posix_launcher_removes_provider_credentials_before_exec(tmp_path: Path) -> None:
+    captured_environment = tmp_path / "captured-environment"
+    executable = _python_target(
+        tmp_path / "capture-hook",
+        "import os, pathlib\n"
+        f"pathlib.Path({str(captured_environment)!r}).write_text("
+        "repr({key: os.environ.get(key) for key in "
+        "('ANTHROPIC_API_KEY', 'AZURE_OPENAI_API_KEY', 'OPENAI_API_KEY', "
+        "'OPENAI_ORGANIZATION', 'OPENAI_ORG_ID', 'OPENAI_PROJECT', "
+        "'OPENAI_PROJECT_ID')}), encoding='utf-8')",
+    )
+    launcher = _render_posix_launcher(tmp_path / "launcher", executable=executable)
+    environment = os.environ.copy()
+    for key in (
+        "ANTHROPIC_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_ORGANIZATION",
+        "OPENAI_ORG_ID",
+        "OPENAI_PROJECT",
+        "OPENAI_PROJECT_ID",
+    ):
+        environment[key] = "provider-credential-read-must-fail"
+
+    completed = subprocess.run(
+        (str(launcher),),
+        input=b"{}",
+        capture_output=True,
+        check=False,
+        env=environment,
+        timeout=5,
+    )
+
+    assert (completed.returncode, completed.stdout, completed.stderr) == (0, b"", b"")
+    assert set(ast.literal_eval(captured_environment.read_text(encoding="utf-8")).values()) == {
+        None
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX launcher contract")
 @pytest.mark.parametrize("executable_mode", (None, 0o600))
 def test_posix_launcher_is_zero_and_silent_for_missing_or_nonexecutable_target(
     tmp_path: Path,
@@ -1373,6 +1413,16 @@ def test_windows_launcher_encodes_the_native_contract() -> None:
     assert "WaitForExit([int]$remaining)" in source
     assert ".Kill()" in source
     assert "call :capture_main >nul 2>nul" in source
+    for key in (
+        "ANTHROPIC_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_ORGANIZATION",
+        "OPENAI_ORG_ID",
+        "OPENAI_PROJECT",
+        "OPENAI_PROJECT_ID",
+    ):
+        assert f'set "{key}="' in source
     assert '"%capture_powershell%" -NoLogo' in source
     assert "\npowershell.exe " not in source
     assert source.count("exit /b 0") >= 2

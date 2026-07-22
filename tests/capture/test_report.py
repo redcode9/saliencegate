@@ -4,8 +4,10 @@ import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 from tests.capture.store_support import (
     CONNECTION_ID,
     INSTALLATION_KEY,
@@ -15,6 +17,7 @@ from tests.capture.store_support import (
     register_connection,
 )
 
+import saliencegate.capture.report as report_module
 import saliencegate.capture.spool as spool_module
 from saliencegate.capture.capabilities import (
     CapabilitySupport,
@@ -1324,3 +1327,370 @@ def test_builder_rejects_snapshot_mismatch_and_digest_forgery(tmp_path: Path) ->
         _report_real_capture(first_snapshot, forged_normalization, tmp_path=tmp_path)
     with pytest.raises(CaptureReportError):
         _report_real_capture(forged_snapshot, first_normalization, tmp_path=tmp_path)
+
+
+def test_report_count_and_health_models_reject_inconsistent_bounds() -> None:
+    with pytest.raises(ValidationError):
+        CaptureReportCounts(
+            captured_events=1,
+            projected_events=0,
+            action_identities=0,
+            structured_results=0,
+            detected_signals=0,
+            ignored_records=0,
+        )
+    with pytest.raises(ValidationError):
+        CaptureReportHealthCount(
+            code=CaptureHealthCode.GAP_DETECTED,
+            count=0,
+            lower_bound=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        "health_order",
+        "duplicate_exclusion",
+        "duplicate_limit",
+        "spool_authentication",
+        "clean_spool_with_queue",
+        "counter_without_limit",
+        "pending_spool_with_drop",
+        "health_without_limit",
+        "degraded_without_limit",
+    ),
+)
+def test_report_coverage_validator_exercises_each_fail_closed_contract(change: str) -> None:
+    coverage = _report(
+        headline=CaptureReportHeadline.NO_CURRENT_EVIDENCE,
+        disposition=ShadowHeuristicDisposition.NOT_FLAGGED,
+        authorized_actions=2,
+    ).coverage
+    body = coverage.model_dump(mode="python")
+    if change == "health_order":
+        body["health"] = tuple(reversed(coverage.health))
+    elif change == "duplicate_exclusion":
+        first = coverage.capability_exclusions[0]
+        body["capability_exclusions"] = (*coverage.capability_exclusions, first)
+    elif change == "duplicate_limit":
+        body["limits"] = (
+            CaptureReportLimit.SESSION_OPEN,
+            CaptureReportLimit.SESSION_OPEN,
+        )
+    elif change == "spool_authentication":
+        body["spool_observation_tag"] = None
+    elif change == "clean_spool_with_queue":
+        body["queued_spool_events"] = 1
+    elif change == "counter_without_limit":
+        body["gap_count"] = 1
+    elif change == "pending_spool_with_drop":
+        body.update(
+            spool_status=CaptureSpoolReportStatus.VERIFIED_PENDING,
+            queued_spool_events=1,
+            dropped_spool_events=1,
+            limits=tuple(
+                sorted(
+                    (CaptureReportLimit.SPOOL_DROP, CaptureReportLimit.SPOOL_PENDING),
+                    key=lambda item: item.value,
+                )
+            ),
+            coverage_degraded=True,
+        )
+    elif change == "health_without_limit":
+        body["health"] = tuple(
+            item.model_copy(update={"count": 1})
+            if item.code is CaptureHealthCode.COVERAGE_DEGRADED
+            else item
+            for item in coverage.health
+        )
+    else:
+        body["coverage_degraded"] = True
+
+    with pytest.raises(ValidationError):
+        CaptureReportCoverage.model_validate(body)
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        "duplicate_omission",
+        "supported_with_omission",
+        "bounded_without_omission",
+        "wrong_minimum",
+        "detected_without_flag",
+        "unsupported_with_evidence",
+    ),
+)
+def test_report_detector_validator_exercises_capability_and_evidence_edges(
+    change: str,
+) -> None:
+    detectors = _detectors(authorized_actions=2)
+    bounded = next(item for item in detectors if item.support is not CapabilitySupport.UNSUPPORTED)
+    unsupported = next(item for item in detectors if item.support is CapabilitySupport.UNSUPPORTED)
+    body = bounded.model_dump(mode="python")
+    if change == "duplicate_omission":
+        body["omissions"] = (*bounded.omissions, bounded.omissions[0])
+    elif change == "supported_with_omission":
+        body["support"] = CapabilitySupport.SUPPORTED
+    elif change == "bounded_without_omission":
+        body["omissions"] = ()
+    elif change == "wrong_minimum":
+        body["minimum_authorized_observations"] = 1
+    elif change == "detected_without_flag":
+        body["detected_count"] = 1
+    else:
+        body = unsupported.model_dump(mode="python")
+        body["authorized_observation_count"] = 1
+
+    with pytest.raises(ValidationError):
+        CaptureReportDetector.model_validate(body)
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        "detector_denominator",
+        "signal_total",
+        "closed_without_timestamp",
+        "open_with_closed_timestamp",
+        "wrong_state_limit",
+        "invalid_headline",
+    ),
+)
+def test_report_validator_rejects_cross_field_contradictions(change: str) -> None:
+    report = _report(
+        headline=CaptureReportHeadline.NO_CURRENT_EVIDENCE,
+        disposition=ShadowHeuristicDisposition.NOT_FLAGGED,
+        authorized_actions=2,
+    )
+    body = report.model_dump(mode="python")
+    body.pop("report_digest")
+    if change == "detector_denominator":
+        body["counts"] = report.counts.model_copy(
+            update={
+                "captured_events": 1,
+                "projected_events": 1,
+                "action_identities": 1,
+            }
+        )
+    elif change == "signal_total":
+        body["counts"] = report.counts.model_copy(update={"detected_signals": 1})
+    elif change == "closed_without_timestamp":
+        body["interval"] = report.interval.model_copy(update={"closed_at": None})
+    elif change == "open_with_closed_timestamp":
+        body["session_state"] = CaptureSessionState.OPEN
+    elif change == "wrong_state_limit":
+        body["coverage"] = report.coverage.model_copy(
+            update={
+                "limits": (CaptureReportLimit.SESSION_OPEN,),
+                "coverage_degraded": True,
+            }
+        )
+    else:
+        body["headline"] = CaptureReportHeadline.MEMORY_REVIEW_SUGGESTED
+
+    with pytest.raises(CaptureReportError):
+        _seal_capture_session_report(body)
+
+
+def test_report_model_rejects_a_digest_that_does_not_bind_its_body() -> None:
+    report = _report(
+        headline=CaptureReportHeadline.NO_CURRENT_EVIDENCE,
+        disposition=ShadowHeuristicDisposition.NOT_FLAGGED,
+        authorized_actions=2,
+    )
+    body = report.model_dump(mode="python")
+    body["report_digest"] = "0" * 64
+
+    with pytest.raises(ValidationError):
+        CaptureSessionReport.model_validate(body)
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        "capability",
+        "detector_denominator",
+        "signal_total",
+        "open_with_closed_timestamp",
+        "headline",
+    ),
+)
+def test_report_direct_revalidation_hits_defensive_cross_field_branches(change: str) -> None:
+    report = _report(
+        headline=CaptureReportHeadline.NO_CURRENT_EVIDENCE,
+        disposition=ShadowHeuristicDisposition.NOT_FLAGGED,
+        authorized_actions=2,
+    )
+    if change == "capability":
+        forged = report.model_copy(update={"capability_manifest_digest": "0" * 64})
+    elif change == "detector_denominator":
+        forged = report.model_copy(
+            update={
+                "counts": report.counts.model_copy(
+                    update={
+                        "captured_events": 1,
+                        "projected_events": 1,
+                        "action_identities": 1,
+                    }
+                )
+            }
+        )
+    elif change == "signal_total":
+        forged = report.model_copy(
+            update={"counts": report.counts.model_copy(update={"detected_signals": 1})}
+        )
+    elif change == "open_with_closed_timestamp":
+        forged = report.model_copy(update={"session_state": CaptureSessionState.OPEN})
+    else:
+        forged = report.model_copy(
+            update={"headline": CaptureReportHeadline.MEMORY_REVIEW_SUGGESTED}
+        )
+
+    with pytest.raises(ValueError):
+        forged.conclusion_and_bindings_are_consistent()
+
+
+def test_report_direct_revalidation_rejects_a_nonclosed_detector_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _report(
+        headline=CaptureReportHeadline.NO_CURRENT_EVIDENCE,
+        disposition=ShadowHeuristicDisposition.NOT_FLAGGED,
+        authorized_actions=2,
+    )
+    detectors = (report.detectors[0], report.detectors[0], *report.detectors[2:])
+    forged = report.model_copy(update={"detectors": detectors})
+    manifest = SimpleNamespace(
+        coverage_exclusions=report.coverage.capability_exclusions,
+        detectors=detectors,
+        host_version=report.host_version,
+    )
+    monkeypatch.setattr(report_module, "capture_profile", lambda _profile: manifest)
+    monkeypatch.setattr(
+        report_module,
+        "capture_capability_digest",
+        lambda _manifest: report.capability_manifest_digest,
+    )
+    with pytest.raises(ValueError, match="matrix"):
+        forged.conclusion_and_bindings_are_consistent()
+
+
+def test_report_sealing_exactness_and_duplicate_digest_defenses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _report(
+        headline=CaptureReportHeadline.NO_CURRENT_EVIDENCE,
+        disposition=ShadowHeuristicDisposition.NOT_FLAGGED,
+        authorized_actions=2,
+    )
+    body = report_module._capture_report_body(report)
+    with pytest.raises(CaptureReportError):
+        _seal_capture_session_report({**body, "report_digest": report.report_digest})
+
+    monkeypatch.setattr(report_module, "_model_state_is_exact", lambda *_args: False)
+    with pytest.raises(CaptureReportError):
+        _seal_capture_session_report(body)
+
+
+def test_spool_report_state_covers_queued_degraded_nonquota_observation() -> None:
+    status, queued, dropped, limits = report_module._spool_report_state(
+        SimpleNamespace(queued_events=2, dropped_events=1, last_drop_reason="write_failed")
+    )
+    assert status is CaptureSpoolReportStatus.VERIFIED_DEGRADED
+    assert (queued, dropped) == (2, 1)
+    assert limits == (CaptureReportLimit.SPOOL_DROP, CaptureReportLimit.SPOOL_PENDING)
+
+
+def test_detector_matrix_rejects_capability_and_evidence_mismatches() -> None:
+    manifest = capture_profile(CaptureProfile.CODEX_HOOKS_V1)
+    bad_snapshot = SimpleNamespace(
+        profile_id=CaptureProfile.CODEX_HOOKS_V1,
+        capability_manifest_digest="0" * 64,
+    )
+    with pytest.raises(CaptureReportError):
+        report_module._detector_matrix(
+            bad_snapshot,
+            SimpleNamespace(detector_evidence=(), extraction_reports=()),
+        )
+
+    snapshot = SimpleNamespace(
+        profile_id=CaptureProfile.CODEX_HOOKS_V1,
+        capability_manifest_digest=capture_capability_digest(manifest),
+    )
+    unsupported = next(
+        item for item in manifest.detectors if item.support is CapabilitySupport.UNSUPPORTED
+    )
+    with pytest.raises(CaptureReportError):
+        report_module._detector_matrix(
+            snapshot,
+            SimpleNamespace(
+                detector_evidence=(SimpleNamespace(signal_type=unsupported.signal_type),),
+                extraction_reports=(),
+            ),
+        )
+    with pytest.raises(CaptureReportError):
+        report_module._detector_matrix(
+            snapshot,
+            SimpleNamespace(detector_evidence=(), extraction_reports=()),
+        )
+
+
+def test_report_builder_rejects_a_post_verification_digest_disagreement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        report_module,
+        "verify_capture_session_snapshot",
+        lambda *_args, **_kwargs: SimpleNamespace(snapshot_digest="a" * 64),
+    )
+    monkeypatch.setattr(
+        "saliencegate.capture.normalization.verify_capture_normalization",
+        lambda *_args, **_kwargs: SimpleNamespace(snapshot_digest="b" * 64),
+    )
+    with pytest.raises(CaptureReportError):
+        build_capture_session_report(
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            installation_key=INSTALLATION_KEY,
+            spool=None,
+        )
+
+
+def test_report_codec_defensive_branches_are_value_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = _report(
+        headline=CaptureReportHeadline.NO_CURRENT_EVIDENCE,
+        disposition=ShadowHeuristicDisposition.NOT_FLAGGED,
+        authorized_actions=2,
+    )
+    with pytest.raises(ValueError):
+        report_module._require_exact_report_text(1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="bytes"):
+        report_module._decode_capture_session_report("{}")  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        CaptureSessionReport,
+        "model_validate_json",
+        lambda _data: report,
+    )
+    monkeypatch.setattr(report_module, "_model_state_is_exact", lambda *_args: False)
+    with pytest.raises(ValueError, match="model"):
+        report_module._decode_capture_session_report(b"{}")
+
+    monkeypatch.setattr(report_module, "_model_state_is_exact", lambda *_args: True)
+    monkeypatch.setattr(report_module, "_capture_report_body_digest", lambda _report: "0" * 64)
+    with pytest.raises(ValueError, match="digest"):
+        report_module._decode_capture_session_report(b"{}")
+
+    monkeypatch.setattr(
+        report_module,
+        "_decode_capture_session_report",
+        lambda _data: SimpleNamespace(),
+    )
+    with pytest.raises(CaptureReportError):
+        encode_capture_session_report(report)
+    with pytest.raises(CaptureReportError):
+        encode_capture_session_report(object())  # type: ignore[arg-type]

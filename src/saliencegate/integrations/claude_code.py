@@ -49,6 +49,7 @@ from saliencegate.integrations.config_files import (
     plan_owned_config_install,
     read_config_bytes,
 )
+from saliencegate.integrations.environment import environment_without_provider_credentials
 from saliencegate.integrations.registry import (
     ProviderInstallationKind,
     ProviderInstallationSpec,
@@ -363,11 +364,7 @@ def probe_claude_code_version(
     try:
         if not callable(runner):
             raise ClaudeCodeIntegrationError()
-        environment = dict(os.environ if environ is None else environ)
-        if any(
-            type(key) is not str or type(value) is not str for key, value in environment.items()
-        ):
-            raise ClaudeCodeIntegrationError()
+        environment = environment_without_provider_credentials(environ)
         selected = _exact_executable(executable)
         command: tuple[str, ...] = (str(selected), "--version")
         if os.name == "nt":  # pragma: no cover - exercised by native Windows R01
@@ -503,11 +500,7 @@ def probe_claude_code_environment(
     """Resolve and optionally probe the Claude executable from one explicit environment."""
 
     try:
-        environment = os.environ if environ is None else environ
-        if not isinstance(environment, Mapping) or any(
-            type(key) is not str or type(value) is not str for key, value in environment.items()
-        ):
-            raise ClaudeCodeIntegrationError()
+        environment = environment_without_provider_credentials(environ)
         configured_path = environment.get("PATH")
         if (configured_path is None and environ is not None) or (
             configured_path is not None and type(configured_path) is not str
@@ -878,9 +871,7 @@ def provider_installation_spec(
         ):
             raise ClaudeCodeIntegrationError()
         version_parts = _supported_version_parts(host_version)
-        environment = os.environ if environ is None else environ
-        if not isinstance(environment, Mapping):
-            raise ClaudeCodeIntegrationError()
+        environment = environment_without_provider_credentials(environ)
         configured_home = environment.get("HOME")
         if configured_home is not None and type(configured_home) is not str:
             raise ClaudeCodeIntegrationError()
@@ -1409,7 +1400,6 @@ def build_capture_hook_dependencies(
             CaptureStore,
             CaptureStoreMode,
         )
-        from saliencegate.commands.capture.connect import materialize_provider_launcher
         from saliencegate.integrations.hook import CaptureHookDependencies
         from saliencegate.integrations.installation import (
             InstallationIdentity,
@@ -1417,6 +1407,9 @@ def build_capture_hook_dependencies(
             InstallationStatus,
             derive_installation_identity,
             inspect_provider_installation,
+        )
+        from saliencegate.integrations.launcher_materialization import (
+            materialize_provider_launcher,
         )
         from saliencegate.integrations.registry import (
             BUILTIN_PROVIDER_REGISTRY,
@@ -1432,11 +1425,7 @@ def build_capture_hook_dependencies(
             or (environ is not None and not isinstance(environ, Mapping))
         ):
             raise ClaudeCodeIntegrationError()
-        environment = dict(os.environ if environ is None else environ)
-        if any(
-            type(key) is not str or type(value) is not str for key, value in environment.items()
-        ):
-            raise ClaudeCodeIntegrationError()
+        environment = environment_without_provider_credentials(environ)
         document = read_bounded_json(source, limits=CAPTURE_NATIVE_JSON_LIMITS)
         session_native = _exact_text(
             document.get("session_id"),

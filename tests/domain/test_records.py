@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
 
+import saliencegate.domain.records as records_module
 from saliencegate.domain import (
     CycleRecord,
     CycleState,
@@ -288,3 +290,68 @@ def test_stage_one_reason_codes_have_stable_wire_values() -> None:
         "ungrounded",
     }
     assert required_values <= {reason.value for reason in ReasonCode}
+
+
+def test_json_freezing_rejects_subclasses_non_string_keys_and_unknown_values() -> None:
+    class TextSubclass(str):
+        pass
+
+    class FloatSubclass(float):
+        pass
+
+    for value in (
+        {1: "non-string-key"},
+        TextSubclass("text"),
+        FloatSubclass(1.0),
+        object(),
+    ):
+        with pytest.raises(ValueError):
+            records_module._freeze_json(value)
+
+
+def test_json_bounder_rejects_declared_shape_mismatches_and_exceptions() -> None:
+    class ShortMapping(Mapping[str, object]):
+        def __getitem__(self, key: str) -> object:
+            if key != "only":
+                raise KeyError(key)
+            return 1
+
+        def __iter__(self) -> Iterator[str]:
+            yield "only"
+
+        def __len__(self) -> int:
+            return 2
+
+    class ExplodingMapping(ShortMapping):
+        def __len__(self) -> int:
+            raise RuntimeError("fixture-sensitive-detail")
+
+    bounded = records_module._json_is_bounded
+    assert not bounded({"a": 1, "b": 2}, max_bytes=1_000, max_nodes=1, max_depth=8)
+    assert not bounded({1: 1}, max_bytes=1_000, max_nodes=8, max_depth=8)
+    assert not bounded(ShortMapping(), max_bytes=1_000, max_nodes=8, max_depth=8)
+    assert not bounded([1, 2], max_bytes=1_000, max_nodes=1, max_depth=8)
+    assert not bounded("too-large", max_bytes=1, max_nodes=8, max_depth=8)
+    assert not bounded(ExplodingMapping(), max_bytes=1_000, max_nodes=8, max_depth=8)
+
+
+def test_memory_delta_bounded_predicate_rejects_forged_internal_shapes(
+    sample_records: tuple[RuntimeRecord, ...],
+) -> None:
+    delta = next(item for item in sample_records if type(item) is MemoryDelta)
+    assert isinstance(delta, MemoryDelta)
+    assert not records_module.memory_delta_is_bounded(object())
+    assert not records_module.memory_delta_is_bounded(
+        delta.model_copy(update={"schema_version": "0.0"})
+    )
+    assert not records_module.memory_delta_is_bounded(
+        delta.model_copy(update={"creates": list(delta.creates)})
+    )
+    assert not records_module.memory_delta_is_bounded(
+        delta.model_copy(update={"updates": (object(),)})
+    )
+    assert not records_module.memory_delta_is_bounded(
+        delta.model_copy(update={"invalidations": (object(),)})
+    )
+    incomplete = MemoryDelta.model_construct()
+    assert not records_module.memory_delta_is_bounded(incomplete)

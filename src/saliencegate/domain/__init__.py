@@ -1,87 +1,186 @@
+"""Stable domain public API resolved without eager model construction."""
+
 from __future__ import annotations
 
-from saliencegate.domain.enums import (
-    ClaimKind,
-    ConstraintStatus,
-    CycleState,
-    DeduplicationGuarantee,
-    DeliveryOutcome,
-    DeliveryState,
-    DeliveryTarget,
-    EventPhase,
-    EventType,
-    EvidenceSource,
-    ExpirationAction,
-    InterventionAction,
-    MemoryKind,
-    OutcomeEvidenceMode,
-    PayloadDigestAlgorithm,
-    ReasonCode,
-    RepeatedErrorStatus,
-    SignalType,
-    TrustLabel,
-    UtilityLabel,
-    ValidityState,
-)
-from saliencegate.domain.errors import (
-    CanonicalJSONError,
-    DomainError,
-    InvalidSchemaVersionError,
-    UnknownRecordTypeError,
-    UnsupportedSchemaVersionError,
-)
-from saliencegate.domain.ids import (
-    content_digest,
-    cycle_id,
-    delivery_id,
-    length_prefixed_sha256,
-    new_repository_id,
-)
-from saliencegate.domain.records import (
-    CURRENT_SCHEMA_VERSION,
-    MAX_MEMORY_CONTENT_BYTES,
-    MAX_MEMORY_DELTA_ITEMS,
-    MAX_MEMORY_PROVENANCE_ITEMS,
-    MAX_SIGNAL_EVIDENCE_EVENTS,
-    MAX_TRACE_EVENT_PARENTS,
-    MAX_TRACE_EVENT_PAYLOAD_BYTES,
-    MAX_TRACE_EVENT_PAYLOAD_DEPTH,
-    MAX_TRACE_EVENT_PAYLOAD_NODES,
-    SUPPORTED_SCHEMA_VERSIONS,
-    BudgetAmounts,
-    BudgetLimits,
-    BudgetSnapshot,
-    CycleRecord,
-    DeliveryRecord,
-    EvidenceReference,
-    ExpirationPatch,
-    InterventionClaim,
-    InterventionDecision,
-    InterventionOutcome,
-    InvocationDecision,
-    JsonObject,
-    LedgerRecord,
-    MemoryCreate,
-    MemoryDelta,
-    MemoryIdAssignment,
-    MemoryInvalidation,
-    MemoryRecord,
-    MemoryUpdate,
-    NormalizedTraceEventDraft,
-    PayloadDigest,
-    PrivateStatusReplacement,
-    RedactedTraceEventDraft,
-    RuntimeRecord,
-    Signal,
-    TextSpan,
-    TraceEvent,
-    evidence_reference_is_bounded,
-    memory_delta_is_bounded,
-    normalized_trace_event_draft_is_bounded,
-    trace_event_payload_is_bounded,
-)
-from saliencegate.domain.serde import canonical_digest, canonical_json, load_record
-from saliencegate.domain.validation import validate_normalized_trace_event_draft
+import importlib
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from saliencegate.domain.enums import (
+        ClaimKind,
+        ConstraintStatus,
+        CycleState,
+        DeduplicationGuarantee,
+        DeliveryOutcome,
+        DeliveryState,
+        DeliveryTarget,
+        EventPhase,
+        EventType,
+        EvidenceSource,
+        ExpirationAction,
+        InterventionAction,
+        MemoryKind,
+        OutcomeEvidenceMode,
+        PayloadDigestAlgorithm,
+        ReasonCode,
+        RepeatedErrorStatus,
+        SignalType,
+        TrustLabel,
+        UtilityLabel,
+        ValidityState,
+    )
+    from saliencegate.domain.errors import (
+        CanonicalJSONError,
+        DomainError,
+        InvalidSchemaVersionError,
+        UnknownRecordTypeError,
+        UnsupportedSchemaVersionError,
+    )
+    from saliencegate.domain.ids import (
+        content_digest,
+        cycle_id,
+        delivery_id,
+        length_prefixed_sha256,
+        new_repository_id,
+    )
+    from saliencegate.domain.records import (
+        CURRENT_SCHEMA_VERSION,
+        MAX_MEMORY_CONTENT_BYTES,
+        MAX_MEMORY_DELTA_ITEMS,
+        MAX_MEMORY_PROVENANCE_ITEMS,
+        MAX_SIGNAL_EVIDENCE_EVENTS,
+        MAX_TRACE_EVENT_PARENTS,
+        MAX_TRACE_EVENT_PAYLOAD_BYTES,
+        MAX_TRACE_EVENT_PAYLOAD_DEPTH,
+        MAX_TRACE_EVENT_PAYLOAD_NODES,
+        SUPPORTED_SCHEMA_VERSIONS,
+        BudgetAmounts,
+        BudgetLimits,
+        BudgetSnapshot,
+        CycleRecord,
+        DeliveryRecord,
+        EvidenceReference,
+        ExpirationPatch,
+        InterventionClaim,
+        InterventionDecision,
+        InterventionOutcome,
+        InvocationDecision,
+        JsonObject,
+        LedgerRecord,
+        MemoryCreate,
+        MemoryDelta,
+        MemoryIdAssignment,
+        MemoryInvalidation,
+        MemoryRecord,
+        MemoryUpdate,
+        NormalizedTraceEventDraft,
+        PayloadDigest,
+        PrivateStatusReplacement,
+        RedactedTraceEventDraft,
+        RuntimeRecord,
+        Signal,
+        TextSpan,
+        TraceEvent,
+        evidence_reference_is_bounded,
+        memory_delta_is_bounded,
+        normalized_trace_event_draft_is_bounded,
+        trace_event_payload_is_bounded,
+    )
+    from saliencegate.domain.serde import canonical_digest, canonical_json, load_record
+    from saliencegate.domain.validation import validate_normalized_trace_event_draft
+
+_EXPORT_GROUPS: Final[dict[str, tuple[str, ...]]] = {
+    "saliencegate.domain.enums": (
+        "ClaimKind",
+        "ConstraintStatus",
+        "CycleState",
+        "DeduplicationGuarantee",
+        "DeliveryOutcome",
+        "DeliveryState",
+        "DeliveryTarget",
+        "EventPhase",
+        "EventType",
+        "EvidenceSource",
+        "ExpirationAction",
+        "InterventionAction",
+        "MemoryKind",
+        "OutcomeEvidenceMode",
+        "PayloadDigestAlgorithm",
+        "ReasonCode",
+        "RepeatedErrorStatus",
+        "SignalType",
+        "TrustLabel",
+        "UtilityLabel",
+        "ValidityState",
+    ),
+    "saliencegate.domain.errors": (
+        "CanonicalJSONError",
+        "DomainError",
+        "InvalidSchemaVersionError",
+        "UnknownRecordTypeError",
+        "UnsupportedSchemaVersionError",
+    ),
+    "saliencegate.domain.ids": (
+        "content_digest",
+        "cycle_id",
+        "delivery_id",
+        "length_prefixed_sha256",
+        "new_repository_id",
+    ),
+    "saliencegate.domain.records": (
+        "CURRENT_SCHEMA_VERSION",
+        "MAX_MEMORY_CONTENT_BYTES",
+        "MAX_MEMORY_DELTA_ITEMS",
+        "MAX_MEMORY_PROVENANCE_ITEMS",
+        "MAX_SIGNAL_EVIDENCE_EVENTS",
+        "MAX_TRACE_EVENT_PARENTS",
+        "MAX_TRACE_EVENT_PAYLOAD_BYTES",
+        "MAX_TRACE_EVENT_PAYLOAD_DEPTH",
+        "MAX_TRACE_EVENT_PAYLOAD_NODES",
+        "SUPPORTED_SCHEMA_VERSIONS",
+        "BudgetAmounts",
+        "BudgetLimits",
+        "BudgetSnapshot",
+        "CycleRecord",
+        "DeliveryRecord",
+        "EvidenceReference",
+        "ExpirationPatch",
+        "InterventionClaim",
+        "InterventionDecision",
+        "InterventionOutcome",
+        "InvocationDecision",
+        "JsonObject",
+        "LedgerRecord",
+        "MemoryCreate",
+        "MemoryDelta",
+        "MemoryIdAssignment",
+        "MemoryInvalidation",
+        "MemoryRecord",
+        "MemoryUpdate",
+        "NormalizedTraceEventDraft",
+        "PayloadDigest",
+        "PrivateStatusReplacement",
+        "RedactedTraceEventDraft",
+        "RuntimeRecord",
+        "Signal",
+        "TextSpan",
+        "TraceEvent",
+        "evidence_reference_is_bounded",
+        "memory_delta_is_bounded",
+        "normalized_trace_event_draft_is_bounded",
+        "trace_event_payload_is_bounded",
+    ),
+    "saliencegate.domain.serde": (
+        "canonical_digest",
+        "canonical_json",
+        "load_record",
+    ),
+    "saliencegate.domain.validation": ("validate_normalized_trace_event_draft",),
+}
+
+_EXPORTS: Final[dict[str, str]] = {
+    name: module_name for module_name, names in _EXPORT_GROUPS.items() for name in names
+}
 
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
@@ -161,3 +260,19 @@ __all__ = [
     "trace_event_payload_is_bounded",
     "validate_normalized_trace_event_draft",
 ]
+
+if len(_EXPORTS) != len(__all__) or frozenset(_EXPORTS) != frozenset(__all__):
+    raise RuntimeError("domain public API export map is invalid")
+
+
+def __getattr__(name: str) -> object:
+    module_name = _EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(frozenset(globals()).union(__all__))

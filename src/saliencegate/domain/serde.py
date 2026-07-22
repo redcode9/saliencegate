@@ -4,7 +4,7 @@ import json
 import math
 import re
 from collections.abc import Mapping
-from typing import Never, cast
+from typing import TYPE_CHECKING, Never, cast
 
 from pydantic import BaseModel
 
@@ -15,33 +15,11 @@ from saliencegate.domain.errors import (
     UnsupportedSchemaVersionError,
 )
 from saliencegate.domain.ids import content_digest
-from saliencegate.domain.records import (
-    SUPPORTED_SCHEMA_VERSIONS,
-    CycleRecord,
-    DeliveryRecord,
-    InterventionDecision,
-    InterventionOutcome,
-    InvocationDecision,
-    MemoryDelta,
-    MemoryRecord,
-    RuntimeRecord,
-    Signal,
-    TraceEvent,
-    VersionedRecord,
-)
+
+if TYPE_CHECKING:
+    from saliencegate.domain.records import RuntimeRecord
 
 _SCHEMA_VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
-_RECORD_TYPES: dict[str, type[VersionedRecord]] = {
-    "trace_event": TraceEvent,
-    "signal": Signal,
-    "memory_record": MemoryRecord,
-    "invocation_decision": InvocationDecision,
-    "memory_delta": MemoryDelta,
-    "intervention_decision": InterventionDecision,
-    "intervention_outcome": InterventionOutcome,
-    "cycle_record": CycleRecord,
-    "delivery_record": DeliveryRecord,
-}
 
 
 def _normalize_json(value: object) -> object:
@@ -117,6 +95,8 @@ def _decode_json(data: bytes | str) -> tuple[str, dict[str, object]]:
 
 
 def _validate_version(payload: Mapping[str, object]) -> str:
+    from saliencegate.domain.records import SUPPORTED_SCHEMA_VERSIONS
+
     version = payload.get("schema_version")
     if not isinstance(version, str) or _SCHEMA_VERSION.fullmatch(version) is None:
         raise InvalidSchemaVersionError(version)
@@ -128,10 +108,35 @@ def _validate_version(payload: Mapping[str, object]) -> str:
 def load_record(data: bytes | str) -> RuntimeRecord:
     """Validate version metadata, then dispatch a serialized runtime record."""
 
+    from saliencegate.domain.records import (
+        CycleRecord,
+        DeliveryRecord,
+        InterventionDecision,
+        InterventionOutcome,
+        InvocationDecision,
+        MemoryDelta,
+        MemoryRecord,
+        RuntimeRecord,
+        Signal,
+        TraceEvent,
+        VersionedRecord,
+    )
+
+    record_types: dict[str, type[VersionedRecord]] = {
+        "trace_event": TraceEvent,
+        "signal": Signal,
+        "memory_record": MemoryRecord,
+        "invocation_decision": InvocationDecision,
+        "memory_delta": MemoryDelta,
+        "intervention_decision": InterventionDecision,
+        "intervention_outcome": InterventionOutcome,
+        "cycle_record": CycleRecord,
+        "delivery_record": DeliveryRecord,
+    }
     text, payload = _decode_json(data)
     _validate_version(payload)
     record_type = payload.get("record_type")
-    if not isinstance(record_type, str) or record_type not in _RECORD_TYPES:
+    if not isinstance(record_type, str) or record_type not in record_types:
         raise UnknownRecordTypeError(record_type)
-    model = _RECORD_TYPES[record_type]
+    model = record_types[record_type]
     return cast(RuntimeRecord, model.model_validate_json(text))

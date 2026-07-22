@@ -48,6 +48,16 @@ case "$capture_profile" in
     *) exit 0 ;;
 esac
 
+# Provider credentials are outside the capture protocol. Remove them before the
+# Python process is created so neither the hook nor its dependencies can read them.
+unset ANTHROPIC_API_KEY
+unset AZURE_OPENAI_API_KEY
+unset OPENAI_API_KEY
+unset OPENAI_ORGANIZATION
+unset OPENAI_ORG_ID
+unset OPENAI_PROJECT
+unset OPENAI_PROJECT_ID
+
 "$capture_executable" \
     --profile "$capture_profile" \
     --connection "$capture_connection" <&0 &

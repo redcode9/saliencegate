@@ -47,10 +47,15 @@ _WORKSPACE_ROOTS = frozenset(
 )
 _ROOT_INSTRUCTION_FILES = frozenset({"agents.md", "claude.md", "codex.md", "gemini.md"})
 _GITHUB_WORKSPACE_ROOTS = frozenset({"agents", "prompts", "instructions"})
-_INTERNAL_MILESTONE_PATTERN = r"(^|[^[:alnum:]])(stage|task)[[:space:]_-]*[0-9]+"
+_INTERNAL_MILESTONE_PATTERN = (
+    r"(^|[^[:alnum:]])((stage|task)[[:space:]_-]*[0-9]+[[:alpha:]]?|m[0-9]{2})"
+    r"([^[:alnum:]]|$)"
+)
 _INTERNAL_MILESTONE_TEXT_PATTERN = re.compile(
-    r"(?i)(?<![a-z0-9])(?P<label>task|stage)[ _-]*"
-    r"(?P<number>[0-9]+)(?P<suffix>[a-z]?)(?![a-z0-9])"
+    r"(?i)(?<![a-z0-9])(?:"
+    r"(?P<label>task|stage)[ _-]*(?P<number>[0-9]+)(?P<suffix>[a-z]?)"
+    r"|(?P<milestone>m[0-9]{2})"
+    r")(?![a-z0-9])"
 )
 
 
@@ -96,6 +101,8 @@ def _is_forbidden_path(normalized_parts: tuple[str, ...]) -> bool:
 
 def _has_internal_milestone(text: str) -> bool:
     for match in _INTERNAL_MILESTONE_TEXT_PATTERN.finditer(text):
+        if match.group("milestone") is not None:
+            return True
         if (
             match.group("label").casefold() == "stage"
             and match.group("number") == "2"

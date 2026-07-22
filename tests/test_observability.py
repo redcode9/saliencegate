@@ -9,6 +9,7 @@ from threading import Event, Thread
 
 import pytest
 
+import saliencegate.observability as observability_module
 from saliencegate.domain import canonical_json
 from saliencegate.observability import (
     OBSERVABILITY_SCHEMA_VERSION,
@@ -499,6 +500,47 @@ def test_metric_integer_bound_and_name_unit_registry_are_closed() -> None:
         Metric(MetricName.EVENTS, 1 << 64, MetricUnit.COUNT)
     with pytest.raises(ValueError, match="stable metric"):
         Metric(MetricName.EVENTS, 1, MetricUnit.BYTES)
+
+
+def test_low_level_json_budget_edges_cover_encoded_text_and_numbers() -> None:
+    assert observability_module._copy_json(None) is None
+    with pytest.raises(ObservabilityError, match="byte bound"):
+        observability_module._consume_text("é", [1])
+    with pytest.raises(ObservabilityError, match="byte bound"):
+        observability_module._copy_json(1, byte_budget=[0])
+    with pytest.raises(ObservabilityError, match="byte bound"):
+        observability_module._copy_json(1.0, byte_budget=[0])
+
+
+def test_constructor_rejects_a_present_noncallable_writer() -> None:
+    class _NonWriter:
+        write = 1
+
+    with pytest.raises(TypeError, match="text stream"):
+        StructuredLogger(stream=_NonWriter())  # type: ignore[arg-type]
+
+
+def test_metric_iter_acquisition_limit_and_final_record_size_are_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _NoIterator:
+        def __iter__(self) -> Iterator[Metric]:
+            raise RuntimeError("untrusted")
+
+    logger = StructuredLogger(stream=StringIO(), clock=fixed_clock)
+    with pytest.raises(ObservabilityError, match="metrics"):
+        logger.emit(ObservabilityEvent.RUN_STARTED, metrics=_NoIterator())
+
+    monkeypatch.setattr(observability_module, "_MAX_METRICS", 0)
+    with pytest.raises(ObservabilityError, match="metric count"):
+        logger.emit(
+            ObservabilityEvent.RUN_STARTED,
+            metrics=(Metric(MetricName.EVENTS, 1, MetricUnit.COUNT),),
+        )
+    monkeypatch.setattr(observability_module, "_MAX_METRICS", 128)
+    monkeypatch.setattr(observability_module, "_MAX_LOG_BYTES", 1)
+    with pytest.raises(ObservabilityError, match="event exceeds"):
+        logger.emit(ObservabilityEvent.RUN_STARTED)
 
 
 class _BlockingStream(StringIO):

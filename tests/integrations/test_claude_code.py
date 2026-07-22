@@ -655,7 +655,7 @@ def test_version_probe_is_optional_bounded_and_exact(tmp_path: Path) -> None:
                 "capture_output": True,
                 "check": False,
                 "timeout": 2.0,
-                "env": environment,
+                "env": {"PATH": str(tmp_path)},
                 "cwd": str(executable.parent),
             },
         )

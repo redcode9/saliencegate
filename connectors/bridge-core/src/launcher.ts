@@ -2,6 +2,24 @@ import path from "node:path";
 
 import { BridgeContractError } from "./contracts.ts";
 
+export const PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS = Object.freeze([
+  "ANTHROPIC_API_KEY",
+  "AZURE_OPENAI_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENAI_ORGANIZATION",
+  "OPENAI_ORG_ID",
+  "OPENAI_PROJECT",
+  "OPENAI_PROJECT_ID",
+] as const);
+
+const PROVIDER_CREDENTIAL_ENVIRONMENT_KEY_SET = new Set<string>(
+  PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS,
+);
+
+export type LauncherEnvironment = Readonly<
+  Record<string, string | undefined>
+>;
+
 export type LauncherInvocation = Readonly<{
   file: string;
   arguments: string[];
@@ -13,19 +31,35 @@ export type LauncherInvocation = Readonly<{
   };
 }>;
 
-function checkedEnvironment(value: Record<string, string>): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (key.includes("\0") || item.includes("\0")) throw new BridgeContractError();
-    result[key] = item;
+export function copyLauncherEnvironment(
+  value: LauncherEnvironment,
+): Record<string, string> {
+  try {
+    const result: Record<string, string> = {};
+    for (const key of Object.keys(value)) {
+      if (key.includes("\0")) throw new BridgeContractError();
+      if (PROVIDER_CREDENTIAL_ENVIRONMENT_KEY_SET.has(key.toUpperCase())) continue;
+      const item = Reflect.get(value, key) as unknown;
+      if (typeof item !== "string") continue;
+      if (item.includes("\0")) throw new BridgeContractError();
+      Object.defineProperty(result, key, {
+        configurable: true,
+        enumerable: true,
+        value: item,
+        writable: true,
+      });
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof BridgeContractError) throw error;
+    throw new BridgeContractError();
   }
-  return result;
 }
 
 export function launcherInvocation(input: {
   platform: NodeJS.Platform;
   launcherPath: string;
-  environment: Record<string, string>;
+  environment: LauncherEnvironment;
 }): LauncherInvocation {
   try {
     if (
@@ -36,7 +70,7 @@ export function launcherInvocation(input: {
     ) {
       throw new BridgeContractError();
     }
-    const environment = checkedEnvironment(input.environment);
+    const environment = copyLauncherEnvironment(input.environment);
     const options = {
       shell: false as const,
       windowsHide: true as const,

@@ -7,6 +7,7 @@ import hmac
 import re
 from collections.abc import Mapping
 from enum import StrEnum
+from functools import lru_cache
 from importlib import resources
 from pathlib import PurePosixPath
 from typing import Annotated, Literal, Self, TypeAlias
@@ -23,9 +24,10 @@ from pydantic import (
 
 from saliencegate.capture.schema import CAPTURE_NATIVE_JSON_LIMITS, read_bounded_json
 from saliencegate.domain import SignalType, canonical_json
-from saliencegate.domain.records import Sha256Digest
+from saliencegate.domain.primitives import Sha256Digest
 
 _REGISTRY_RESOURCE = "profiles.json"
+_REGISTRY_RESOURCE_SHA256 = "e6f2d7e9411d066a1cf9a1bb9142730e1b32e4fd9007e8445f2de9dc930c9e4c"
 _HOST_VERSION = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -342,18 +344,37 @@ def _validate_fixture_resources(registry: CaptureCapabilityRegistry) -> None:
                 raise CaptureCapabilityError()
 
 
-def load_capture_capability_registry() -> CaptureCapabilityRegistry:
-    """Load and strictly validate the canonical installed capability registry."""
+@lru_cache(maxsize=1)
+def _load_verified_capture_capability_registry(
+    expected_digest: str,
+) -> CaptureCapabilityRegistry:
+    """Authenticate the immutable packaged registry once in this process."""
 
     try:
+        if expected_digest != _REGISTRY_RESOURCE_SHA256:
+            raise CaptureCapabilityError()
         source = (
             resources.files("saliencegate.integrations").joinpath(_REGISTRY_RESOURCE).read_bytes()
         )
+        if not hmac.compare_digest(hashlib.sha256(source).hexdigest(), expected_digest):
+            raise CaptureCapabilityError()
         registry = CaptureCapabilityRegistry.model_validate_json(source)
         if canonical_json(registry) != source:
             raise CaptureCapabilityError()
         _validate_fixture_resources(registry)
         return registry
+    except CaptureCapabilityError:
+        raise
+    except Exception:
+        raise CaptureCapabilityError() from None
+
+
+def load_capture_capability_registry() -> CaptureCapabilityRegistry:
+    """Return a fresh validated view of the authenticated installed registry."""
+
+    try:
+        verified = _load_verified_capture_capability_registry(_REGISTRY_RESOURCE_SHA256)
+        return CaptureCapabilityRegistry.model_validate(verified)
     except CaptureCapabilityError:
         raise
     except Exception:

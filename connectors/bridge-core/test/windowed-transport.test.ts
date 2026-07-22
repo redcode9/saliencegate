@@ -13,11 +13,24 @@ const bootstrap: BootstrapBinding = {
   schema_version: "integration-bootstrap/v1",
   profile: "pi-extension/v1",
   connection_id: `sg-${"1".repeat(48)}`,
-  launcher_path: "/synthetic/state/pi/capture-hook",
+  launcher_path:
+    process.platform === "win32"
+      ? "C:\\synthetic\\state\\pi\\capture-hook.cmd"
+      : "/synthetic/state/pi/capture-hook",
   capability_digest: "2".repeat(64),
   bundle_digest: "3".repeat(64),
   receipt_mac: "4".repeat(64),
 };
+
+const PROVIDER_CREDENTIAL_KEYS = new Set([
+  "ANTHROPIC_API_KEY",
+  "AZURE_OPENAI_API_KEY",
+  "OPENAI_API_KEY",
+  "OPENAI_ORGANIZATION",
+  "OPENAI_ORG_ID",
+  "OPENAI_PROJECT",
+  "OPENAI_PROJECT_ID",
+]);
 
 function coordinates(index: number): WindowCoordinates {
   return {
@@ -41,6 +54,47 @@ function decodedEvents(write: WindowedCaptureChunkWrite): Record<string, unknown
   };
   return document.events;
 }
+
+test("windowed transport filters provider credentials without reading hostile getters", async () => {
+  const target: NodeJS.ProcessEnv = {
+    SAFE_MARKER: "preserved",
+    ...(process.platform === "win32" ? { SystemRoot: "C:\\Windows" } : {}),
+  };
+  for (const key of PROVIDER_CREDENTIAL_KEYS) target[key] = `${key}-must-not-be-read`;
+  const reads: string[] = [];
+  const environment = new Proxy(target, {
+    get(value, property, receiver) {
+      if (typeof property === "string") {
+        if (PROVIDER_CREDENTIAL_KEYS.has(property.toUpperCase())) {
+          throw new Error(`credential getter was read: ${property}`);
+        }
+        reads.push(property);
+      }
+      return Reflect.get(value, property, receiver) as unknown;
+    },
+  });
+  const writes: WindowedCaptureChunkWrite[] = [];
+  const transport = new WindowedBatchTransport(bootstrap, {
+    environment,
+    batchID: () => "b".repeat(64),
+    writeChunk: async (write) => {
+      writes.push(write);
+      return true;
+    },
+  });
+  const window = coordinates(901);
+
+  assert.equal(await transport.flush(window, [record(window, "1")]), "delivered");
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0]!.invocation.options.env.SAFE_MARKER, "preserved");
+  assert.ok(reads.includes("SAFE_MARKER"));
+  assert.equal(
+    Object.keys(writes[0]!.invocation.options.env).some((key) =>
+      PROVIDER_CREDENTIAL_KEYS.has(key.toUpperCase()),
+    ),
+    false,
+  );
+});
 
 test("pending-gap capacity overflow permanently poisons all later valid windows", async () => {
   let deliver = false;

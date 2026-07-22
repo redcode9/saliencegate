@@ -524,6 +524,54 @@ test("no-op and disabled boundaries cannot exhaust receipts before shutdown", as
   assert.equal(events(writes).at(-1)?.kind, "session_finished");
 });
 
+test("64 concurrent Pi callbacks remain ordered, complete, and provider-independent", async () => {
+  const writes: WindowedCaptureChunkWrite[] = [];
+  const api = new FakePiAPI();
+  await createPiExtension({
+    bootstrapURL: new URL("file:///synthetic/.pi/extensions/saliencegate.bootstrap.json"),
+    loadBootstrap: async () => bootstrap,
+    writeChunk: async (write) => {
+      writes.push(write);
+      return true;
+    },
+    batchID: () => "a".repeat(64),
+    windowDiscriminator: () => WINDOW_A,
+  })(api as PiExtensionAPI);
+
+  await invoke(api, "session_start", { type: "session_start", reason: "startup" });
+  const starts = Array.from({ length: 64 }, (_, index) =>
+    invoke(api, "tool_execution_start", {
+      type: "tool_execution_start",
+      toolCallId: `concurrent-${index}`,
+      toolName: "read",
+      args: null,
+    }),
+  );
+  assert.ok((await Promise.all(starts)).every((result) => result === undefined));
+
+  const finishes = Array.from({ length: 64 }, (_, index) =>
+    invoke(api, "tool_execution_end", {
+      type: "tool_execution_end",
+      toolCallId: `concurrent-${index}`,
+      toolName: "read",
+      result: null,
+      isError: false,
+    }),
+  );
+  assert.ok((await Promise.all(finishes)).every((result) => result === undefined));
+  await invoke(api, "agent_settled", { type: "agent_settled" });
+
+  const reduced = events(writes);
+  assert.equal(reduced.filter((record) => record.kind === "tool_started").length, 64);
+  assert.equal(reduced.filter((record) => record.kind === "tool_finished").length, 64);
+  assert.equal(reduced.filter((record) => record.kind === "coverage_degraded").length, 0);
+  assert.equal(reduced.at(-1)?.kind, "turn_finished");
+  assert.deepEqual(
+    reduced.map((record) => record.event_id),
+    Array.from({ length: 129 }, (_, index) => String(index + 1)),
+  );
+});
+
 test("one-sided oversize success groups become one cross-language control", async () => {
   const writes: WindowedCaptureChunkWrite[] = [];
   const api = new FakePiAPI();
@@ -659,10 +707,24 @@ test("windowed transport is byte-idempotent and reports a prior attempted gap on
 });
 
 test("shared launcher treats metacharacters as data and absorbs spawn errors", async () => {
+  const providerCredentials = {
+    ANTHROPIC_API_KEY: "anthropic-poison",
+    AZURE_OPENAI_API_KEY: "azure-poison",
+    OPENAI_API_KEY: "openai-poison",
+    OPENAI_ORGANIZATION: "organization-poison",
+    OPENAI_ORG_ID: "organization-id-poison",
+    OPENAI_PROJECT: "project-poison",
+    OPENAI_PROJECT_ID: "project-id-poison",
+    openai_api_key: "case-folded-api-key-poison",
+  };
   const invocation = launcherInvocation({
     platform: "win32",
     launcherPath: "C:\\State & Data\\saliencegate.cmd",
-    environment: { SystemRoot: "C:\\Windows", KEEP: "value" },
+    environment: {
+      SystemRoot: "C:\\Windows",
+      KEEP: "value",
+      ...providerCredentials,
+    },
   });
   assert.equal(invocation.file, "C:\\Windows\\System32\\cmd.exe");
   assert.deepEqual(invocation.arguments, [
@@ -675,6 +737,21 @@ test("shared launcher treats metacharacters as data and absorbs spawn errors", a
   assert.equal(
     invocation.options.env.SALIENCEGATE_LAUNCHER,
     "C:\\State & Data\\saliencegate.cmd",
+  );
+  assert.equal(invocation.options.env.KEEP, "value");
+  assert.equal(
+    Object.keys(invocation.options.env).some((key) =>
+      [
+        "ANTHROPIC_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_ORGANIZATION",
+        "OPENAI_ORG_ID",
+        "OPENAI_PROJECT",
+        "OPENAI_PROJECT_ID",
+      ].includes(key.toUpperCase()),
+    ),
+    false,
   );
 
   const result = await spawnWindowedCaptureChunk(

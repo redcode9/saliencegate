@@ -8,6 +8,7 @@ from typing import Final
 import pytest
 from pydantic import ValidationError
 
+from saliencegate.capture import capabilities as capabilities_module
 from saliencegate.capture.capabilities import (
     CapabilitySupport,
     CaptureCapabilityError,
@@ -504,6 +505,7 @@ def test_registry_resource_is_canonical_strict_and_contains_only_the_four_profil
     decoded = json.loads(source.decode("utf-8"))
     registry = load_capture_capability_registry()
 
+    assert hashlib.sha256(source).hexdigest() == capabilities_module._REGISTRY_RESOURCE_SHA256
     assert canonical_json(decoded) == source
     assert registry == CaptureCapabilityRegistry.model_validate_json(source)
     assert registry.schema_version == "capture-capability-registry/v1"
@@ -520,7 +522,6 @@ def test_registry_resource_is_canonical_strict_and_contains_only_the_four_profil
         "opencode-plugin/v1",
         "pi-extension/v1",
     )
-
     with pytest.raises(ValidationError):
         CaptureCapabilityRegistry.model_validate({**decoded, "unexpected": True})
     with pytest.raises(ValidationError):
@@ -535,6 +536,20 @@ def test_registry_resource_is_canonical_strict_and_contains_only_the_four_profil
         )
     with pytest.raises(ValidationError, match="frozen"):
         registry.__setattr__("profiles", ())
+
+
+def test_registry_cache_returns_fresh_models_that_cannot_mutate_verified_state() -> None:
+    first = load_capture_capability_registry()
+    original_name = first.profiles[0].host_name
+
+    object.__setattr__(first, "schema_version", "mutated")
+    object.__setattr__(first.profiles[0], "host_name", "mutated")
+    second = load_capture_capability_registry()
+
+    assert second is not first
+    assert second.profiles[0] is not first.profiles[0]
+    assert second.schema_version == "capture-capability-registry/v1"
+    assert second.profiles[0].host_name == original_name
 
 
 @pytest.mark.parametrize("profile_id", tuple(CaptureProfile))

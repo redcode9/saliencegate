@@ -7,12 +7,9 @@ import json
 import os
 import re
 import shlex
-import shutil
 import stat
-import subprocess
-import threading
-import tomllib
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -46,12 +43,15 @@ from saliencegate.integrations.config_files import (
     plan_owned_config_install,
     read_config_bytes,
 )
+from saliencegate.integrations.environment import environment_without_provider_credentials
 from saliencegate.integrations.registry import (
     ProviderInstallationKind,
     ProviderInstallationSpec,
 )
 
 if TYPE_CHECKING:
+    import subprocess
+
     from saliencegate.integrations.hook import CaptureHookDependencies
 
 CODEX_HOST_VERSION: Final = "0.144.6"
@@ -127,7 +127,10 @@ class CodexVersionProbe:
             raise CodexIntegrationError()
 
 
-VersionRunner = Callable[..., subprocess.CompletedProcess[bytes]]
+if TYPE_CHECKING:
+    VersionRunner = Callable[..., subprocess.CompletedProcess[bytes]]
+else:
+    VersionRunner = Callable[..., object]
 
 
 def _bounded_version_runner(
@@ -140,6 +143,9 @@ def _bounded_version_runner(
     env: Mapping[str, str],
 ) -> subprocess.CompletedProcess[bytes]:
     """Run a version command while retaining at most one bounded chunk per stream."""
+
+    import subprocess
+    import threading
 
     if (
         type(command) is not tuple
@@ -215,11 +221,9 @@ def probe_codex_environment(
     """Resolve and probe the Codex executable selected by one explicit environment."""
 
     try:
-        environment = os.environ if environ is None else environ
-        if not isinstance(environment, Mapping) or any(
-            type(key) is not str or type(value) is not str for key, value in environment.items()
-        ):
-            raise CodexIntegrationError()
+        import shutil
+
+        environment = environment_without_provider_credentials(environ)
         configured_path = environment.get("PATH")
         if (configured_path is None and environ is not None) or (
             configured_path is not None and type(configured_path) is not str
@@ -253,6 +257,8 @@ def _hook_command(launcher: Path) -> str:
     try:
         raw = os.fspath(launcher)
         if os.name == "nt":  # pragma: no cover - exercised by native Windows R01
+            import subprocess
+
             return subprocess.list2cmdline((raw,))
         return shlex.quote(raw)
     except Exception:
@@ -300,6 +306,8 @@ def _validate_project_hook_policy(spec: ProviderInstallationSpec) -> None:
     """Preflight a project layer before any capture runtime state is created."""
 
     try:
+        import tomllib
+
         config_path = spec.config_path
         config = spec.config
         if config_path is None or config is None:
@@ -366,9 +374,7 @@ def provider_installation_spec(
         ):
             raise CodexIntegrationError()
         version_parts = _supported_version_parts(host_version)
-        environment = os.environ if environ is None else environ
-        if not isinstance(environment, Mapping):
-            raise CodexIntegrationError()
+        environment = environment_without_provider_credentials(environ)
         configured_home = environment.get("HOME")
         if configured_home is not None and type(configured_home) is not str:
             raise CodexIntegrationError()
@@ -455,6 +461,7 @@ class _CodexHookRuntime:
     registration: object
     installation: object
     connection: object
+    store: object
 
 
 def _discover_codex_project(document: Mapping[str, object]) -> Path:
@@ -502,8 +509,11 @@ def build_capture_hook_dependencies(
 ) -> CaptureHookDependencies:
     """Authenticate an installed Codex hook runtime before admitting native bytes."""
 
+    cached_store: object | None = None
+    preserve_store = False
     try:
-        from saliencegate.capture.connections import CaptureConnectionSummary
+        import weakref
+
         from saliencegate.capture.health import CaptureHealthCode
         from saliencegate.capture.locations import CaptureStoreLocations
         from saliencegate.capture.spool import CaptureSpool
@@ -511,14 +521,17 @@ def build_capture_hook_dependencies(
             CaptureConnectionState,
             CaptureStore,
             CaptureStoreMode,
+            _CaptureHookConnection,
         )
-        from saliencegate.commands.capture.connect import materialize_provider_launcher
         from saliencegate.integrations.hook import CaptureHookDependencies
         from saliencegate.integrations.installation import (
             InstallationState,
             InstallationStatus,
             derive_installation_identity,
             inspect_provider_installation,
+        )
+        from saliencegate.integrations.launcher_materialization import (
+            materialize_provider_launcher,
         )
         from saliencegate.integrations.registry import (
             BUILTIN_PROVIDER_REGISTRY,
@@ -534,11 +547,7 @@ def build_capture_hook_dependencies(
             or (environ is not None and not isinstance(environ, Mapping))
         ):
             raise CodexIntegrationError()
-        environment = dict(os.environ if environ is None else environ)
-        if any(
-            type(key) is not str or type(value) is not str for key, value in environment.items()
-        ):
-            raise CodexIntegrationError()
+        environment = environment_without_provider_credentials(environ)
         document = read_bounded_json(source, limits=CAPTURE_NATIVE_JSON_LIMITS)
         session_native = _exact_text(
             document.get("session_id"),
@@ -562,12 +571,13 @@ def build_capture_hook_dependencies(
         configured_home = environment.get("HOME")
         home = Path.home() if configured_home is None else Path(configured_home)
         locations = resolve_capture_store_locations(environ=environment, home=home)
-        with CaptureStore.open(
+        store_lease = CaptureStore.open(
             locations.database_path,
             installation_key=key,
             mode=CaptureStoreMode.HOOK,
-        ) as store:
-            connection = store.get_connection(connection_id)
+        )
+        cached_store = store_lease
+        connection = store_lease._get_hook_connection(connection_id)
         if (
             connection.project_digest != identity.project_digest
             or connection.profile_id is not CODEX_PROFILE
@@ -610,15 +620,30 @@ def build_capture_hook_dependencies(
             registration=registration,
             installation=installation,
             connection=connection,
+            store=store_lease,
         )
+        store_claimed = False
+        store_finalizer: weakref.finalize[[], CaptureHookDependencies] | None = None
+
+        def close_unclaimed_store() -> None:
+            nonlocal store_claimed
+            if store_claimed:
+                return
+            store_claimed = True
+            with suppress(Exception):
+                store_lease.close()
+            if store_finalizer is not None and store_finalizer.alive:
+                store_finalizer.detach()
 
         def checked_runtime(value: object) -> _CodexHookRuntime:
             if value is not runtime:
+                close_unclaimed_store()
                 raise CodexIntegrationError()
             return runtime
 
         def validate_registry(profile: CaptureProfile) -> object:
             if profile is not CODEX_PROFILE:
+                close_unclaimed_store()
                 raise CodexIntegrationError()
             return registration
 
@@ -632,6 +657,7 @@ def build_capture_hook_dependencies(
                 or candidate_connection_id != connection_id
                 or candidate_registry is not registration
             ):
+                close_unclaimed_store()
                 raise CodexIntegrationError()
             return installation
 
@@ -647,6 +673,7 @@ def build_capture_hook_dependencies(
                 or candidate_registry is not registration
                 or candidate_receipt is not installation
             ):
+                close_unclaimed_store()
                 raise CodexIntegrationError()
             return runtime
 
@@ -658,7 +685,7 @@ def build_capture_hook_dependencies(
 
         def resolve_adapter(candidate: object) -> CodexCaptureAdapter:
             selected = checked_runtime(candidate)
-            if type(selected.connection) is not CaptureConnectionSummary:
+            if type(selected.connection) is not _CaptureHookConnection:
                 raise CodexIntegrationError()
             return CodexCaptureAdapter(
                 connection_id=selected.connection.connection_id,
@@ -666,17 +693,20 @@ def build_capture_hook_dependencies(
             )
 
         def open_store(candidate: object) -> CaptureStore:
+            nonlocal store_claimed
             selected = checked_runtime(candidate)
             if (
                 type(selected.key) is not InstallationKey
                 or type(selected.locations) is not CaptureStoreLocations
+                or type(selected.store) is not CaptureStore
+                or store_claimed
             ):
+                close_unclaimed_store()
                 raise CodexIntegrationError()
-            return CaptureStore.open(
-                selected.locations.database_path,
-                installation_key=selected.key,
-                mode=CaptureStoreMode.HOOK,
-            )
+            store_claimed = True
+            if store_finalizer is not None and store_finalizer.alive:
+                store_finalizer.detach()
+            return selected.store
 
         def open_spool(candidate: object) -> CaptureSpool:
             selected = checked_runtime(candidate)
@@ -695,7 +725,7 @@ def build_capture_hook_dependencies(
                 type(code) is not CaptureHealthCode
                 or type(selected.key) is not InstallationKey
                 or type(selected.locations) is not CaptureStoreLocations
-                or type(selected.connection) is not CaptureConnectionSummary
+                or type(selected.connection) is not _CaptureHookConnection
             ):
                 raise CodexIntegrationError()
             with CaptureStore.open(
@@ -712,10 +742,10 @@ def build_capture_hook_dependencies(
         if (
             type(registration) is not ProviderRegistration
             or type(installation) is not InstallationStatus
-            or type(connection) is not CaptureConnectionSummary
+            or type(connection) is not _CaptureHookConnection
         ):
             raise CodexIntegrationError()
-        return CaptureHookDependencies(
+        dependencies = CaptureHookDependencies(
             validate_registry=validate_registry,
             validate_receipt=validate_receipt,
             validate_connection=validate_connection,
@@ -725,10 +755,21 @@ def build_capture_hook_dependencies(
             open_spool=open_spool,
             mark_health=mark_health,
         )
+        store_finalizer = weakref.finalize(dependencies, close_unclaimed_store)
+        preserve_store = True
+        return dependencies
     except CodexIntegrationError:
         raise
     except Exception:
         raise CodexIntegrationError() from None
+    finally:
+        if cached_store is not None and not preserve_store:
+            try:
+                close = getattr(cached_store, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
 
 
 def _exact_executable(path: Path) -> Path:
@@ -763,11 +804,7 @@ def probe_codex_version(
     try:
         if not callable(runner):
             raise CodexIntegrationError()
-        environment = dict(os.environ if environ is None else environ)
-        if any(
-            type(key) is not str or type(value) is not str for key, value in environment.items()
-        ):
-            raise CodexIntegrationError()
+        environment = environment_without_provider_credentials(environ)
         selected = _exact_executable(executable)
         completed = runner(
             (str(selected), "--version"),

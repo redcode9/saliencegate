@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from types import MappingProxyType
 from typing import Annotated, Literal, Self, TypeAlias
 from uuid import UUID
@@ -43,6 +43,18 @@ from saliencegate.domain.enums import (
     ValidityState,
 )
 from saliencegate.domain.ids import cycle_id as derive_cycle_id
+from saliencegate.domain.primitives import (
+    ComponentIdentifier as ComponentIdentifier,
+)
+from saliencegate.domain.primitives import (
+    Sha256Digest as Sha256Digest,
+)
+from saliencegate.domain.primitives import (
+    UtcDatetime as UtcDatetime,
+)
+from saliencegate.domain.primitives import (
+    _require_exact_string,
+)
 
 CURRENT_SCHEMA_VERSION: Literal["1.0"] = "1.0"
 SUPPORTED_SCHEMA_VERSIONS = (CURRENT_SCHEMA_VERSION,)
@@ -57,32 +69,12 @@ def _require_exact_uuid(value: UUID) -> UUID:
 UUID4 = Annotated[PYDANTIC_UUID4, AfterValidator(_require_exact_uuid)]
 
 
-def _require_exact_string(value: str) -> str:
-    if type(value) is not str:
-        raise ValueError("string subclasses are not accepted")
-    return value
-
-
 NonEmptyString = Annotated[
     str,
     StringConstraints(min_length=1),
     AfterValidator(_require_exact_string),
 ]
-EventMetadataIdentifier = Annotated[
-    str,
-    StringConstraints(
-        min_length=1,
-        max_length=256,
-        pattern=r"^[A-Za-z0-9_][A-Za-z0-9._:/+\-]*$",
-    ),
-    AfterValidator(_require_exact_string),
-]
-ComponentIdentifier = EventMetadataIdentifier
-Sha256Digest = Annotated[
-    str,
-    StringConstraints(pattern=r"^[0-9a-f]{64}$"),
-    AfterValidator(_require_exact_string),
-]
+EventMetadataIdentifier = ComponentIdentifier
 JsonPointer = Annotated[
     str,
     StringConstraints(max_length=1024, pattern=r"^(?:/(?:[^~/]|~[01])*)+$"),
@@ -102,19 +94,6 @@ NonNegativeInt = Annotated[int, Field(ge=0)]
 PositiveInt = Annotated[int, Field(ge=1)]
 Signed64Offset = Annotated[int, Field(ge=0, le=(1 << 63) - 1)]
 PositiveSigned64Offset = Annotated[int, Field(ge=1, le=(1 << 63) - 1)]
-
-
-def _require_utc(value: datetime) -> datetime:
-    if type(value) is not datetime:
-        raise ValueError("datetime subclasses are not accepted")
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("timestamp must be timezone-aware UTC")
-    if value.utcoffset() != timedelta(0):
-        raise ValueError("timestamp must use UTC rather than a non-zero offset")
-    return value.astimezone(UTC)
-
-
-UtcDatetime = Annotated[datetime, AfterValidator(_require_utc)]
 
 
 def _freeze_json(value: object) -> object:

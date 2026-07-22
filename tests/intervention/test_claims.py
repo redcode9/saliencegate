@@ -20,7 +20,9 @@ from saliencegate.domain import (
 from saliencegate.intervention import (
     CLAIM_SCHEMA_VERSION,
     ClaimInputError,
+    GroundingReceipt,
     InterventionProposal,
+    ProposalParseStatus,
     ProposedClaim,
     claim_fingerprint,
     grounded_claim_text,
@@ -423,3 +425,77 @@ def test_internal_materialization_and_fingerprint_failures_are_sanitized(
     assert "secret" not in str(digest_error.value)
     assert digest_error.value.__context__ is None
     assert digest_error.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    (
+        ({"model_call_index": None}, "provenance"),
+        (
+            {
+                "parse_status": ProposalParseStatus.VALID,
+                "proposal_action": InterventionAction.REMIND,
+                "claims": (),
+            },
+            "requires claims",
+        ),
+        (
+            {
+                "parse_status": ProposalParseStatus.VALID,
+                "proposal_action": InterventionAction.SILENCE,
+                "claims": (proposed(),),
+            },
+            "cannot carry claims",
+        ),
+        (
+            {
+                "parse_status": ProposalParseStatus.VALID,
+                "proposal_action": None,
+                "claims": (),
+            },
+            "proposal action",
+        ),
+        (
+            {
+                "parse_status": ProposalParseStatus.EMPTY_REMINDER,
+                "proposal_action": InterventionAction.SILENCE,
+                "claims": (),
+            },
+            "empty-reminder",
+        ),
+        (
+            {
+                "parse_status": ProposalParseStatus.CLAIM_OVER_LIMIT,
+                "proposal_action": InterventionAction.REMIND,
+                "claims": (proposed(),),
+            },
+            "over-limit",
+        ),
+        (
+            {
+                "parse_status": ProposalParseStatus.SCHEMA_INVALID,
+                "proposal_action": InterventionAction.REMIND,
+                "claims": (),
+                "confidence": 0.5,
+            },
+            "canonical rejection",
+        ),
+    ),
+)
+def test_grounding_receipt_direct_revalidation_covers_every_status_branch(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    receipt = GroundingReceipt.model_construct(
+        receipt_version="grounding-receipt/v1",
+        parse_status=ProposalParseStatus.SCHEMA_INVALID,
+        proposal_action=None,
+        claims=(),
+        confidence=1.0,
+        requested_delivery_target=None,
+        model_call_index=0,
+        model_call_digest="d" * 64,
+        selector_provenance=None,
+    ).model_copy(update=updates)
+    with pytest.raises(ValueError, match=message):
+        receipt.status_matches_sanitized_proposal()

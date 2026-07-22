@@ -38,6 +38,7 @@ from saliencegate.integrations.bootstrap import (
     IntegrationBootstrap,
     decode_integration_bootstrap,
 )
+from saliencegate.integrations.environment import environment_without_provider_credentials
 from saliencegate.integrations.registry import (
     ProviderInstallationKind,
     ProviderInstallationSpec,
@@ -871,11 +872,7 @@ def provider_installation_spec(
             or host_version != PI_HOST_VERSION
         ):
             raise PiIntegrationError()
-        environment = os.environ if environ is None else environ
-        if not isinstance(environment, Mapping) or any(
-            type(key) is not str or type(value) is not str for key, value in environment.items()
-        ):
-            raise PiIntegrationError()
+        environment = environment_without_provider_credentials(environ)
         configured_home = environment.get("HOME")
         home = Path.home() if configured_home is None else Path(configured_home)
         locations = resolve_capture_store_locations(environ=environment, home=home)
@@ -940,7 +937,6 @@ def build_capture_hook_dependencies(
             CaptureStore,
             CaptureStoreMode,
         )
-        from saliencegate.commands.capture.connect import materialize_provider_launcher
         from saliencegate.integrations.bootstrap import inspect_integration_bootstrap
         from saliencegate.integrations.hook import CaptureHookDependencies
         from saliencegate.integrations.installation import (
@@ -950,6 +946,9 @@ def build_capture_hook_dependencies(
             derive_installation_identity,
             inspect_installation_receipt,
             inspect_provider_installation,
+        )
+        from saliencegate.integrations.launcher_materialization import (
+            materialize_provider_launcher,
         )
         from saliencegate.integrations.registry import (
             BUILTIN_PROVIDER_REGISTRY,
@@ -965,11 +964,7 @@ def build_capture_hook_dependencies(
             or (environ is not None and not isinstance(environ, Mapping))
         ):
             raise PiIntegrationError()
-        environment = dict(os.environ if environ is None else environ)
-        if any(
-            type(key) is not str or type(value) is not str for key, value in environment.items()
-        ):
-            raise PiIntegrationError()
+        environment = environment_without_provider_credentials(environ)
         batch = _parse_batch(source)
         if (
             batch.bootstrap.profile is not PI_PROFILE

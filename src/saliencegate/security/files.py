@@ -22,6 +22,7 @@ from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from typing import Never
@@ -749,6 +750,45 @@ def _read_private_file_at(
         os.close(descriptor)
 
 
+@dataclass(frozen=True, slots=True)
+class _DarwinAclApi:
+    library: object
+    get_acl: Callable[[int, int], int | None]
+    get_entry: Callable[[int, int, object], int]
+    get_tag: Callable[[object, object], int]
+    free_acl: Callable[[int], int]
+
+
+@lru_cache(maxsize=1)
+def _darwin_acl_api() -> _DarwinAclApi:
+    """Bind the macOS ACL API once while retaining its owning library handle."""
+
+    library = ctypes.CDLL(None, use_errno=True)
+    get_acl = library.acl_get_fd_np
+    get_acl.argtypes = [ctypes.c_int, ctypes.c_int]
+    get_acl.restype = ctypes.c_void_p
+    get_entry = library.acl_get_entry
+    get_entry.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    get_entry.restype = ctypes.c_int
+    get_tag = library.acl_get_tag_type
+    get_tag.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    get_tag.restype = ctypes.c_int
+    free_acl = library.acl_free
+    free_acl.argtypes = [ctypes.c_void_p]
+    free_acl.restype = ctypes.c_int
+    return _DarwinAclApi(
+        library=library,
+        get_acl=get_acl,
+        get_entry=get_entry,
+        get_tag=get_tag,
+        free_acl=free_acl,
+    )
+
+
 def _darwin_acl_is_unsafe(descriptor: int, *, deny_only_allowed: bool) -> bool:
     """Fail-closed detection of unsafe macOS extended ACL entries.
 
@@ -760,26 +800,10 @@ def _darwin_acl_is_unsafe(descriptor: int, *, deny_only_allowed: bool) -> bool:
     if sys.platform != "darwin":
         return False
     try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        get_acl = libc.acl_get_fd_np
-        get_acl.argtypes = [ctypes.c_int, ctypes.c_int]
-        get_acl.restype = ctypes.c_void_p
-        get_entry = libc.acl_get_entry
-        get_entry.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.POINTER(ctypes.c_void_p),
-        ]
-        get_entry.restype = ctypes.c_int
-        get_tag = libc.acl_get_tag_type
-        get_tag.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
-        get_tag.restype = ctypes.c_int
-        free_acl = libc.acl_free
-        free_acl.argtypes = [ctypes.c_void_p]
-        free_acl.restype = ctypes.c_int
+        api = _darwin_acl_api()
 
         ctypes.set_errno(0)
-        acl = get_acl(descriptor, _DARWIN_ACL_TYPE_EXTENDED)
+        acl = api.get_acl(descriptor, _DARWIN_ACL_TYPE_EXTENDED)
         if acl is None:
             return ctypes.get_errno() != errno.ENOENT
 
@@ -790,7 +814,7 @@ def _darwin_acl_is_unsafe(descriptor: int, *, deny_only_allowed: bool) -> bool:
                 entry_id = _DARWIN_ACL_FIRST_ENTRY
                 while True:
                     ctypes.set_errno(0)
-                    result = get_entry(acl, entry_id, ctypes.byref(entry))
+                    result = api.get_entry(acl, entry_id, ctypes.byref(entry))
                     if result == -1:
                         unsafe = ctypes.get_errno() != errno.EINVAL
                         break
@@ -798,7 +822,7 @@ def _darwin_acl_is_unsafe(descriptor: int, *, deny_only_allowed: bool) -> bool:
                         unsafe = True
                         break
                     tag = ctypes.c_int()
-                    if get_tag(entry, ctypes.byref(tag)) != 0:
+                    if api.get_tag(entry, ctypes.byref(tag)) != 0:
                         unsafe = True
                         break
                     if tag.value != _DARWIN_ACL_EXTENDED_DENY:
@@ -806,7 +830,7 @@ def _darwin_acl_is_unsafe(descriptor: int, *, deny_only_allowed: bool) -> bool:
                         break
                     entry_id = _DARWIN_ACL_NEXT_ENTRY
         finally:
-            if free_acl(acl) != 0:
+            if api.free_acl(acl) != 0:
                 unsafe = True
         return unsafe
     except Exception:
@@ -1998,8 +2022,8 @@ def _create_private_delete_stage(
             stage_fd = os.open(name, flags, dir_fd=directory_fd)
             os.fchmod(stage_fd, 0o700)
             opened = os.fstat(stage_fd)
-            _require_safe_acl(stage_fd)
             identity = _StableIdentity.from_stat(opened)
+            _require_safe_acl(stage_fd)
             named = _named_stat(name, directory_fd)
             if not _private_delete_stage_matches(opened, identity) or not identity.matches(named):
                 _fail()

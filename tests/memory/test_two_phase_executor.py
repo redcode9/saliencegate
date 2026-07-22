@@ -102,6 +102,8 @@ from saliencegate.ports.two_phase import (
     TwoPhaseFailureReason,
     TwoPhaseModelProfile,
     TwoPhaseUsage,
+    _receipts_are_ordered,
+    call_policy_accepts_receipts,
     validated_two_phase_cycle_request,
 )
 from saliencegate.prompts import PAPER_TWO_PHASE_V1
@@ -1284,3 +1286,136 @@ async def test_executor_constructor_rejects_unreviewed_capabilities_and_profiles
 
     repaired = PaperTwoPhaseCycleExecutor(**(valid | {"call_policy": repair_policy}))
     assert isinstance(repaired, TwoPhaseCycleExecutor)
+
+
+@pytest.mark.asyncio
+async def test_call_receipt_validator_covers_each_state_and_phase_contradiction() -> None:
+    case = await _running_case()
+    prepared = await _prepare(
+        case,
+        operations=_operations(case, "create"),
+        selection=_selection(remind_created_memory=True),
+        assignment_pool=(CREATED_KNOWLEDGE_ID,),
+    )
+    outcome = await prepared.executor.execute(prepared.request)
+    assert type(outcome) is TwoPhaseCycleResult
+    memory_receipt = outcome.call_receipts[0]
+    base = memory_receipt.model_dump(mode="python")
+    invalid = (
+        {"attempt": memory_receipt.model_call_index + 1},
+        {"phase": StructuredCallPhase.INTERVENTION},
+        {"grounding_state_digest": "a" * 64},
+        {"completion_byte_count": None},
+        {"status": StructuredCallStatus.MODEL_ERROR},
+        {"parse_status": StructuredCallParseStatus.NOT_ATTEMPTED},
+        {
+            "status": StructuredCallStatus.MODEL_ERROR,
+            "parse_status": StructuredCallParseStatus.VALID,
+            "completion_digest": None,
+            "completion_byte_count": None,
+        },
+    )
+    for change in invalid:
+        with pytest.raises(ValidationError):
+            CallReceipt.model_validate(base | change)
+
+
+@pytest.mark.asyncio
+async def test_usage_and_receipt_ordering_cover_each_accounting_branch() -> None:
+    case = await _running_case()
+    prepared = await _prepare(
+        case,
+        operations=_operations(case, "create"),
+        selection=_selection(remind_created_memory=True),
+        assignment_pool=(CREATED_KNOWLEDGE_ID,),
+    )
+    outcome = await prepared.executor.execute(prepared.request)
+    assert type(outcome) is TwoPhaseCycleResult
+    first, second = outcome.call_receipts
+
+    usage_body = outcome.usage.model_dump(mode="python")
+    for change in (
+        {"provider_input_tokens": None},
+        {
+            "canonical_input_tokens": 1,
+            "canonical_output_tokens": 1,
+            "canonical_token_equivalents": None,
+        },
+        {
+            "canonical_input_tokens": 1,
+            "canonical_output_tokens": 1,
+            "canonical_token_equivalents": 3,
+        },
+        {"model_calls": 0, "schema_repairs": 1},
+    ):
+        with pytest.raises(ValidationError):
+            TwoPhaseUsage.model_validate(usage_body | change)
+
+    with pytest.raises(TwoPhaseBoundaryError):
+        TwoPhaseUsage.from_receipts([first])  # type: ignore[arg-type]
+    with pytest.raises(TwoPhaseBoundaryError):
+        TwoPhaseUsage.from_receipts((object(),))  # type: ignore[arg-type]
+
+    assert _receipts_are_ordered(outcome.call_receipts)
+    assert not _receipts_are_ordered((second, first))
+    duplicate_digest = second.model_copy(update={"request_digest": first.request_digest})
+    assert not _receipts_are_ordered((first, duplicate_digest))
+    intervention_first = second.model_copy(update={"model_call_index": 0})
+    memory_second = first.model_copy(update={"model_call_index": 1})
+    assert not _receipts_are_ordered((intervention_first, memory_second))
+    wrong_attempt = first.model_copy(update={"attempt": 1})
+    assert not _receipts_are_ordered((wrong_attempt,))
+    changed_binding = first.model_copy(
+        update={
+            "model_call_index": 1,
+            "attempt": 1,
+            "request_digest": "1" * 64,
+            "call_digest": "2" * 64,
+            "receipt_digest": "3" * 64,
+            "prompt_digest": "4" * 64,
+        }
+    )
+    assert not _receipts_are_ordered((first, changed_binding))
+
+
+@pytest.mark.asyncio
+async def test_call_policy_checks_each_visible_resource_limit() -> None:
+    case = await _running_case()
+    prepared = await _prepare(
+        case,
+        operations=_operations(case, "create"),
+        selection=_selection(remind_created_memory=True),
+        assignment_pool=(CREATED_KNOWLEDGE_ID,),
+    )
+    outcome = await prepared.executor.execute(prepared.request)
+    assert type(outcome) is TwoPhaseCycleResult
+    first, second = outcome.call_receipts
+
+    def policy(**changes: int) -> TwoPhaseCallPolicy:
+        body = _call_policy().model_dump(mode="python", exclude={"policy_digest"})
+        body.update(changes)
+        return TwoPhaseCallPolicy.model_validate(body)
+
+    assert not call_policy_accepts_receipts(_call_policy(), (first, second, first))
+    repaired_body = second.model_dump(mode="python", exclude={"receipt_digest"})
+    repaired_body["attempt"] = 1
+    repair_receipt = CallReceipt.model_validate(repaired_body)
+    assert not call_policy_accepts_receipts(_call_policy(), (repair_receipt,))
+    assert not call_policy_accepts_receipts(
+        policy(max_total_latency_us=0, max_call_latency_us=0),
+        (first,),
+    )
+    assert not call_policy_accepts_receipts(
+        policy(max_provider_input_tokens=0),
+        (first,),
+    )
+    assert not call_policy_accepts_receipts(
+        policy(max_provider_output_tokens=0),
+        (first,),
+    )
+    assert not call_policy_accepts_receipts(
+        policy(max_call_latency_us=0),
+        (first,),
+    )
+    with pytest.raises(TwoPhaseBoundaryError):
+        call_policy_accepts_receipts(object(), (first,))  # type: ignore[arg-type]

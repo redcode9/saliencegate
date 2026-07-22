@@ -10,10 +10,10 @@ import tarfile
 import tempfile
 import tomllib
 import unicodedata
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 DOCUMENTED_COMMAND_CASES = {
     "offline-demo": "saliencegate demo",
@@ -50,6 +50,18 @@ _ARTIFACT_BLOCK = re.compile(
 )
 _ENVIRONMENT_DIGEST = "e" * 64
 _WORKING_DIRECTORY = "/synthetic/workspace"
+_PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_ORGANIZATION",
+        "OPENAI_ORG_ID",
+        "OPENAI_PROJECT",
+        "OPENAI_PROJECT_ID",
+    }
+)
+_WINDOWS_INVALID_FILENAME_CHARACTERS = frozenset('<>:"|?*')
 
 
 @dataclass(frozen=True)
@@ -86,6 +98,7 @@ EXECUTED_COMMAND_CASES = frozenset(
     )
 )
 SUPPLEMENTAL_ARTIFACT_PROOFS = frozenset({"atif-one-call"})
+_WINDOWS_CLI_SHIM = b"from saliencegate.cli import entrypoint\nraise SystemExit(entrypoint())\n"
 
 
 def artifact_compatible_commands(text: str) -> tuple[str, ...]:
@@ -113,14 +126,19 @@ def _run(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
     capture_output: bool = False,
+    input_bytes: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
+    if input_bytes is not None and type(input_bytes) is not bytes:
+        raise RuntimeError("artifact proof stdin is invalid")
     try:
+        environment = _environment_without_provider_credentials(os.environ) if env is None else env
         return subprocess.run(
             tuple(os.fspath(item) for item in command),
             cwd=cwd,
-            env=env,
+            env=environment,
             check=True,
             capture_output=capture_output,
+            input=input_bytes,
             timeout=300,
         )
     except subprocess.CalledProcessError as error:
@@ -136,17 +154,26 @@ def _run(
 
 def _diagnostic_excerpt(payload: bytes | None) -> str:
     text = (payload or b"").decode("utf-8", errors="replace")
-    for credential in (
-        "provider-credential-read-must-fail",
-        os.environ.get("ANTHROPIC_API_KEY", ""),
-        os.environ.get("OPENAI_API_KEY", ""),
-    ):
-        if credential:
-            text = text.replace(credential, "<redacted>")
+    text = text.replace("provider-credential-read-must-fail", "<redacted>")
     limit = 4096
     if len(text) > limit:
         text = text[:limit] + "\n[output truncated]"
     return text
+
+
+def _normalize_transport_stdout(payload: bytes, *, platform: str | None = None) -> bytes:
+    if type(payload) is not bytes:
+        raise RuntimeError("artifact proof stdout is invalid")
+    selected_platform = os.name if platform is None else platform
+    if selected_platform == "posix":
+        return payload
+    if selected_platform != "nt":
+        raise RuntimeError("artifact proof platform is unsupported")
+    if b"\r" not in payload:
+        return payload
+    if not payload.endswith(b"\r\n") or payload.count(b"\r\n") != 1 or b"\r" in payload[:-2]:
+        raise RuntimeError("artifact proof stdout has a non-canonical Windows transport ending")
+    return payload[:-2] + b"\n"
 
 
 def _require_one_distribution(dist_dir: Path, suffix: str) -> Path:
@@ -172,6 +199,19 @@ def _canonical_archive_path(name: str) -> PurePosixPath:
         raise RuntimeError("source distribution contains an unsafe path")
     if path.as_posix() != name:
         raise RuntimeError("source distribution contains a non-canonical path")
+    for part in path.parts:
+        windows_part = PureWindowsPath(part)
+        if (
+            windows_part.drive
+            or windows_part.root
+            or windows_part.is_reserved()
+            or part.endswith((" ", "."))
+            or any(
+                character in _WINDOWS_INVALID_FILENAME_CHARACTERS or ord(character) < 32
+                for character in part
+            )
+        ):
+            raise RuntimeError("source distribution contains a Windows-unsafe path")
     return path
 
 
@@ -187,6 +227,38 @@ def _write_private(path: Path, payload: bytes) -> None:
             os.fsync(stream.fileno())
     finally:
         os.close(descriptor)
+
+
+def _publish_installed_private_file(
+    path: Path,
+    payload: bytes,
+    *,
+    python: Path,
+    guard: Path,
+    validator: Path,
+    cwd: Path,
+    environment: dict[str, str],
+    platform: str | None = None,
+) -> None:
+    selected_platform = os.name if platform is None else platform
+    if selected_platform == "posix":
+        _write_private(path, payload)
+        return
+    if selected_platform != "nt":
+        raise RuntimeError("artifact proof platform is unsupported")
+    completed = _run(
+        (python, "-I", guard, validator, "publish-private-file", path),
+        cwd=cwd,
+        env=environment,
+        capture_output=True,
+        input_bytes=payload,
+    )
+    if (
+        _normalize_transport_stdout(completed.stdout, platform=selected_platform)
+        != b"shadow-private-file-ok\n"
+        or completed.stderr
+    ):
+        raise RuntimeError("installed private file publication returned unexpected output")
 
 
 def _extract_sdist(sdist: Path, destination: Path) -> None:
@@ -214,14 +286,41 @@ def _extract_sdist(sdist: Path, destination: Path) -> None:
 
 def _hatchling_version(package_root: Path) -> str:
     lock = tomllib.loads((package_root / "uv.lock").read_text(encoding="utf-8"))
-    versions = {
-        item["version"]
-        for item in lock.get("package", ())
-        if isinstance(item, dict) and item.get("name") == "hatchling"
-    }
+    versions: set[str] = set()
+    for item in lock.get("package", ()):
+        if isinstance(item, dict) and item.get("name") == "hatchling":
+            version = item.get("version")
+            if not isinstance(version, str):
+                raise RuntimeError("locked Hatchling version is invalid")
+            versions.add(version)
     if len(versions) != 1:
         raise RuntimeError("locked Hatchling version is missing or ambiguous")
     return versions.pop()
+
+
+def _venv_python(environment_root: Path, *, platform: str | None = None) -> Path:
+    selected_platform = os.name if platform is None else platform
+    if selected_platform == "nt":
+        return environment_root / "Scripts" / "python.exe"
+    if selected_platform == "posix":
+        return environment_root / "bin" / "python"
+    raise RuntimeError("artifact proof platform is unsupported")
+
+
+def _installed_cli_script(
+    *,
+    python: Path,
+    case_root: Path,
+    platform: str | None = None,
+) -> Path:
+    selected_platform = os.name if platform is None else platform
+    if selected_platform == "posix":
+        return python.parent / "saliencegate"
+    if selected_platform != "nt":
+        raise RuntimeError("artifact proof platform is unsupported")
+    shim = case_root / "saliencegate-command.py"
+    _write_private(shim, _WINDOWS_CLI_SHIM)
+    return shim
 
 
 def _install_environment(
@@ -236,7 +335,7 @@ def _install_environment(
     is_sdist: bool,
 ) -> Path:
     _run((uv, "venv", "--python", python_version, environment_root))
-    python = environment_root / "bin" / "python"
+    python = _venv_python(environment_root)
     _run((uv, "pip", "install", "--python", python, "--require-hashes", "-r", runtime_requirements))
     if is_sdist:
         hatchling = _hatchling_version(package_root)
@@ -270,19 +369,64 @@ def _install_environment(
     return python
 
 
+def _environment_without_provider_credentials(source: Mapping[str, str]) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    try:
+        for key in source:
+            if type(key) is not str:
+                raise RuntimeError("artifact environment is invalid")
+            if key.upper() in _PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS:
+                continue
+            value = source[key]
+            if type(value) is not str:
+                raise RuntimeError("artifact environment is invalid")
+            environment[key] = value
+    except RuntimeError:
+        raise
+    except Exception:
+        raise RuntimeError("artifact environment is invalid") from None
+    return environment
+
+
 def _private_environment(root: Path) -> dict[str, str]:
     home = root / "home"
     config = root / "config"
-    home.mkdir(mode=0o700)
-    config.mkdir(mode=0o700)
-    environment = os.environ.copy()
+    cache = root / "cache"
+    data = root / "data"
+    state = root / "state"
+    appdata = root / "appdata"
+    localappdata = root / "localappdata"
+    temporary = root / "tmp"
+    for directory in (
+        home,
+        config,
+        cache,
+        data,
+        state,
+        appdata,
+        localappdata,
+        temporary,
+    ):
+        directory.mkdir(mode=0o700)
+    environment = _environment_without_provider_credentials(os.environ)
     environment.update(
         {
-            "ANTHROPIC_API_KEY": "provider-credential-read-must-fail",
             "HOME": os.fspath(home),
-            "OPENAI_API_KEY": "provider-credential-read-must-fail",
+            "USERPROFILE": os.fspath(home),
             "PYTHONPATH": "",
             "XDG_CONFIG_HOME": os.fspath(config),
+            "XDG_CACHE_HOME": os.fspath(cache),
+            "XDG_DATA_HOME": os.fspath(data),
+            "XDG_STATE_HOME": os.fspath(state),
+            "APPDATA": os.fspath(appdata),
+            "LOCALAPPDATA": os.fspath(localappdata),
+            "TEMP": os.fspath(temporary),
+            "TMP": os.fspath(temporary),
+            "TMPDIR": os.fspath(temporary),
+            **{
+                key: "provider-credential-read-must-fail"
+                for key in _PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS
+            },
         }
     )
     return environment
@@ -298,13 +442,24 @@ def _prove_documented_cases(
     case_root = work_root / label
     case_root.mkdir(mode=0o700)
     shadow_root = case_root / "shadow"
-    shadow_root.mkdir(mode=0o700)
     environment = _private_environment(case_root)
     guard = package_root / "scripts" / "run_without_sockets.py"
     import_smoke = package_root / "scripts" / "smoke_package_imports.py"
     validator = package_root / "scripts" / "smoke_shadow_installed.py"
     examples = package_root / "examples" / "atif-shadow"
-    saliencegate = python.parent / "saliencegate"
+    saliencegate = _installed_cli_script(python=python, case_root=case_root)
+
+    preparation = _run(
+        (python, "-I", guard, validator, "prepare-private-directory", shadow_root),
+        cwd=case_root,
+        env=environment,
+        capture_output=True,
+    )
+    if (
+        _normalize_transport_stdout(preparation.stdout) != b"shadow-private-directory-ok\n"
+        or preparation.stderr
+    ):
+        raise RuntimeError(f"{label} private directory setup returned unexpected output")
 
     imported = _run(
         (python, "-I", guard, import_smoke),
@@ -312,7 +467,8 @@ def _prove_documented_cases(
         env=environment,
         capture_output=True,
     )
-    if imported.stderr or re.fullmatch(rb"[0-9]+\.[0-9]+\.[0-9]+\n", imported.stdout) is None:
+    imported_stdout = _normalize_transport_stdout(imported.stdout)
+    if imported.stderr or re.fullmatch(rb"[0-9]+\.[0-9]+\.[0-9]+\n", imported_stdout) is None:
         raise RuntimeError(f"{label} core import smoke returned unexpected output")
 
     demo = _run(
@@ -340,7 +496,7 @@ def _prove_documented_cases(
         env=environment,
         capture_output=True,
     )
-    if trace.stdout != b"shadow-trace-ok\n" or trace.stderr:
+    if _normalize_transport_stdout(trace.stdout) != b"shadow-trace-ok\n" or trace.stderr:
         raise RuntimeError(f"{label} native trace setup returned unexpected output")
     native = _run(
         (
@@ -363,7 +519,15 @@ def _prove_documented_cases(
     )
     if native.stderr:
         raise RuntimeError(f"{label} native Shadow command wrote to stderr")
-    _write_private(native_command, native.stdout)
+    _publish_installed_private_file(
+        native_command,
+        _normalize_transport_stdout(native.stdout),
+        python=python,
+        guard=guard,
+        validator=validator,
+        cwd=case_root,
+        environment=environment,
+    )
     native_validation = _run(
         (
             python,
@@ -379,7 +543,10 @@ def _prove_documented_cases(
         env=environment,
         capture_output=True,
     )
-    if native_validation.stdout != b"shadow-installed-ok\n" or native_validation.stderr:
+    if (
+        _normalize_transport_stdout(native_validation.stdout) != b"shadow-installed-ok\n"
+        or native_validation.stderr
+    ):
         raise RuntimeError(f"{label} native Shadow validation returned unexpected output")
 
     one_call = _run(
@@ -400,7 +567,15 @@ def _prove_documented_cases(
         source = shadow_root / f"{case.name}.trajectory.json"
         report = shadow_root / f"{case.name}.report.json"
         command_report = shadow_root / f"{case.name}.command.json"
-        _write_private(source, (examples / case.source_name).read_bytes())
+        _publish_installed_private_file(
+            source,
+            (examples / case.source_name).read_bytes(),
+            python=python,
+            guard=guard,
+            validator=validator,
+            cwd=case_root,
+            environment=environment,
+        )
         completed = _run(
             (
                 python,
@@ -428,7 +603,15 @@ def _prove_documented_cases(
         )
         if completed.stderr:
             raise RuntimeError(f"{label} {case.name} command wrote to stderr")
-        _write_private(command_report, completed.stdout)
+        _publish_installed_private_file(
+            command_report,
+            _normalize_transport_stdout(completed.stdout),
+            python=python,
+            guard=guard,
+            validator=validator,
+            cwd=case_root,
+            environment=environment,
+        )
         _run(
             (
                 python,

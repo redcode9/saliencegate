@@ -530,14 +530,39 @@ test("per-session queues serialize one session while allowing independent sessio
 });
 
 test("launcher invocation keeps metacharacters in data and never enables a shell", () => {
+  const providerCredentials = {
+    ANTHROPIC_API_KEY: "anthropic-poison",
+    AZURE_OPENAI_API_KEY: "azure-poison",
+    OPENAI_API_KEY: "openai-poison",
+    OPENAI_ORGANIZATION: "organization-poison",
+    OPENAI_ORG_ID: "organization-id-poison",
+    OPENAI_PROJECT: "project-poison",
+    OPENAI_PROJECT_ID: "project-id-poison",
+    openai_api_key: "case-folded-api-key-poison",
+  };
   const posix = launcherInvocation({
     platform: "linux",
     launcherPath: "/tmp/project & $(touch nope)/capture-hook",
-    environment: { PATH: "/usr/bin" },
+    environment: { PATH: "/usr/bin", SAFE_MARKER: "preserved", ...providerCredentials },
   });
   assert.equal(posix.file, "/tmp/project & $(touch nope)/capture-hook");
   assert.deepEqual(posix.arguments, []);
   assert.equal(posix.options.shell, false);
+  assert.equal(posix.options.env.SAFE_MARKER, "preserved");
+  assert.equal(
+    Object.keys(posix.options.env).some((key) =>
+      [
+        "ANTHROPIC_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_ORGANIZATION",
+        "OPENAI_ORG_ID",
+        "OPENAI_PROJECT",
+        "OPENAI_PROJECT_ID",
+      ].includes(key.toUpperCase()),
+    ),
+    false,
+  );
 
   const windows = launcherInvocation({
     platform: "win32",
@@ -546,11 +571,16 @@ test("launcher invocation keeps metacharacters in data and never enables a shell
       SystemRoot: "C:\\Windows",
       PATH: "C:\\Windows\\System32",
       saliencegate_launcher: "C:\\attacker-controlled.cmd",
+      ...providerCredentials,
     },
   });
   assert.equal(windows.file, "C:\\Windows\\System32\\cmd.exe");
   assert.deepEqual(windows.arguments, ["/d", "/v:off", "/s", "/c", '"%SALIENCEGATE_LAUNCHER%"']);
   assert.equal(windows.options.env.SALIENCEGATE_LAUNCHER, "C:\\State & harmless\\capture-hook.cmd");
   assert.equal("saliencegate_launcher" in windows.options.env, false);
+  assert.equal(
+    Object.keys(windows.options.env).some((key) => key.toUpperCase().includes("OPENAI")),
+    false,
+  );
   assert.equal(windows.options.shell, false);
 });

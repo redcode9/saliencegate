@@ -7,6 +7,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+import saliencegate.prompts.contracts as contracts_module
 from saliencegate.domain import (
     EvidenceReference,
     EvidenceSource,
@@ -164,6 +165,15 @@ def test_quoted_data_text_and_memory_factories_sanitize_forged_inputs() -> None:
         forged_memory.record_is_exact_and_content_bound()
 
 
+def test_quoted_data_text_rejects_multibyte_input_that_exceeds_the_byte_limit() -> None:
+    source = "é" * (MAX_PROMPT_PAYLOAD_BYTES // 2 + 1)
+    assert len(source) <= MAX_PROMPT_PAYLOAD_BYTES
+    assert len(source.encode("utf-8")) > MAX_PROMPT_PAYLOAD_BYTES
+
+    with pytest.raises(ValidationError):
+        QuotedDataText.from_text(source)
+
+
 def test_active_bank_view_is_full_ordered_active_and_content_bound() -> None:
     status = _memory(1, MemoryKind.PRIVATE_STATUS, content="Finish the open migration.")
     knowledge = _memory(2, MemoryKind.KNOWLEDGE)
@@ -317,6 +327,69 @@ def test_bank_factory_rejects_wrong_types_limits_and_invalid_time_domains() -> N
             records=cast(tuple[MemoryRecord, ...], []),
         )
     assert error.value.code is PromptErrorCode.INVALID_BANK
+
+
+def test_active_bank_model_validator_fails_closed_for_each_record_invariant() -> None:
+    record = _memory(1, MemoryKind.KNOWLEDGE)
+    view = build_active_bank_prompt_view(
+        kind=BankViewKind.CURRENT,
+        run_id=RUN_ID,
+        as_of=NOW + timedelta(seconds=1),
+        source_projection_digest=_digest(),
+        records=(record,),
+    )
+    quoted = view.records[0]
+
+    candidates = (
+        view.model_copy(
+            update={"records": (quoted,) * (contracts_module.MAX_ACTIVE_BANK_RECORDS + 1)}
+        ),
+        view.model_copy(update={"records": (object(),)}),
+        view.model_copy(
+            update={
+                "records": tuple(
+                    QuotedMemoryRecord.from_memory_record(item)
+                    for item in (
+                        _memory(2, MemoryKind.PROCEDURAL),
+                        _memory(3, MemoryKind.KNOWLEDGE),
+                    )
+                )
+            }
+        ),
+        view.model_copy(
+            update={
+                "records": tuple(
+                    QuotedMemoryRecord.from_memory_record(_memory(index, MemoryKind.PRIVATE_STATUS))
+                    for index in (4, 5)
+                )
+            }
+        ),
+        view.model_copy(
+            update={
+                "records": (
+                    QuotedMemoryRecord.from_memory_record(
+                        _memory(
+                            6,
+                            MemoryKind.KNOWLEDGE,
+                            run_id=UUID("00000000-0000-4000-8000-000000003099"),
+                        )
+                    ),
+                )
+            }
+        ),
+        view.model_copy(
+            update={
+                "records": (
+                    QuotedMemoryRecord.from_memory_record(
+                        _memory(7, MemoryKind.KNOWLEDGE, validity=ValidityState.INVALIDATED)
+                    ),
+                )
+            }
+        ),
+    )
+    for candidate in candidates:
+        with pytest.raises(ValueError):
+            candidate.records_are_exact_active_and_ordered()
 
 
 def test_structured_prompt_payload_has_exact_roles_schema_and_mutable_wire_copy() -> None:
@@ -477,6 +550,26 @@ def test_prompt_envelope_is_canonical_unique_and_tamper_evident() -> None:
         assert error.value.code is PromptErrorCode.INVALID_ENVELOPE
 
 
+def test_prompt_envelope_parser_rechecks_the_canonical_render(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    envelope = PromptDataEnvelope(
+        data_schema_version="test-prompt-data/v1",
+        phase=StructuredCallPhase.MEMORY_EDIT,
+        sections=(PromptDataSection(name=PromptDataSectionName.TASK, payload={"ok": True}),),
+    )
+    rendered = render_untrusted_prompt_data(envelope)
+    monkeypatch.setattr(
+        contracts_module,
+        "render_untrusted_prompt_data",
+        lambda _envelope: "different-canonical-render",
+    )
+
+    with pytest.raises(PromptContractError) as error:
+        parse_untrusted_prompt_data(rendered)
+    assert error.value.code is PromptErrorCode.INVALID_ENVELOPE
+
+
 def test_structured_models_reject_bad_text_schema_and_attestation_digests() -> None:
     with pytest.raises(ValidationError):
         SystemPromptMessage(role="system", content="bad\rtext")
@@ -529,6 +622,43 @@ def test_strict_schema_normalizer_rejects_ambiguous_or_unsupported_composition()
             {
                 "type": "object",
                 "properties": {"value": {"allOf": [{"type": "string"}]}},
+            }
+        )
+
+
+def test_strict_schema_union_normalizer_handles_direct_tags_and_duplicate_keywords() -> None:
+    tagged_union = [
+        {
+            "type": "object",
+            "properties": {"kind": {"const": tag}},
+        }
+        for tag in ("left", "right")
+    ]
+    normalized = strict_provider_schema(
+        {
+            "type": "object",
+            "properties": {"choice": {"oneOf": tagged_union}},
+        }
+    )
+    assert "anyOf" in normalized["properties"]["choice"]  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="provably disjoint"):
+        strict_provider_schema(
+            {
+                "type": "object",
+                "properties": {"choice": {"oneOf": [1, tagged_union[0]]}},
+            }
+        )
+    with pytest.raises(ValueError, match="duplicate keyword"):
+        strict_provider_schema(
+            {
+                "type": "object",
+                "properties": {
+                    "choice": {
+                        "oneOf": tagged_union,
+                        "anyOf": ({"type": "string"}, {"type": "null"}),
+                    }
+                },
             }
         )
 

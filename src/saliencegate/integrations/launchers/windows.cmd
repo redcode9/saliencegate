@@ -39,6 +39,15 @@ if "%capture_profile%"=="pi-extension/v1" goto capture_profile_ok
 exit /b 0
 
 :capture_profile_ok
+rem Provider credentials are outside the capture protocol. Remove them before
+rem PowerShell creates the capture process so the child cannot read them.
+set "ANTHROPIC_API_KEY="
+set "AZURE_OPENAI_API_KEY="
+set "OPENAI_API_KEY="
+set "OPENAI_ORGANIZATION="
+set "OPENAI_ORG_ID="
+set "OPENAI_PROJECT="
+set "OPENAI_PROJECT_ID="
 set "SALIENCEGATE_CAPTURE_EXECUTABLE=%capture_executable%"
 set "SALIENCEGATE_CAPTURE_PROFILE=%capture_profile%"
 set "SALIENCEGATE_CAPTURE_CONNECTION=%capture_connection%"

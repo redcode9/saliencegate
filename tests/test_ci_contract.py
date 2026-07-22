@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import io
 import re
 import subprocess
 import sys
+import tarfile
+import textwrap
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
+import scripts.smoke_shadow_installed as shadow_smoke
 import scripts.verify_built_artifacts as artifact_verifier
+import scripts.verify_connector_artifacts as connector_artifact_verifier
 from scripts.verify_built_artifacts import (
     DOCUMENTED_COMMAND_CASES,
     EXECUTED_COMMAND_CASES,
@@ -30,9 +36,25 @@ PACKAGE_IMPORT_SMOKE = ROOT / "scripts" / "smoke_package_imports.py"
 SHADOW_INSTALLED_SMOKE = ROOT / "scripts" / "smoke_shadow_installed.py"
 SHADOW_TRACE_BENCHMARK = ROOT / "scripts" / "benchmark_shadow_trace.py"
 ARTIFACT_VERIFIER = ROOT / "scripts" / "verify_built_artifacts.py"
+CONNECTOR_ARTIFACT_VERIFIER = ROOT / "scripts" / "verify_connector_artifacts.py"
+CONNECTOR_NETWORK_GUARD = ROOT / "connectors" / "scripts" / "deny-network.mjs"
 FORBIDDEN_CORE_MODULES = ("anthropic", "harbor", "httpx", "openai", "openai_harmony")
+PROVIDER_CREDENTIAL_KEYS = (
+    "ANTHROPIC_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_ORGANIZATION",
+    "OPENAI_ORG_ID",
+    "OPENAI_PROJECT",
+    "OPENAI_PROJECT_ID",
+)
+NATIVE_RUNNER_MATRIX = (
+    ("ubuntu-24.04", "ubuntu-24.04"),
+    ("macos-15", "macos-15"),
+    ("windows-2025", "windows-2025"),
+)
 
-REQUIRED_TARGETS = (
+CORE_GATE_TARGETS = (
     "format",
     "lint",
     "typecheck",
@@ -41,7 +63,33 @@ REQUIRED_TARGETS = (
     "docs-check",
     "build",
     "audit",
+)
+CAPTURE_GATE_TARGETS = (
+    "capture-check",
+    "connector-node-preflight",
+    "connector-install",
+    "connector-source-check",
+    "connectors-check",
+    "connector-artifact-smoke",
+)
+REQUIRED_TARGETS = (
+    *CORE_GATE_TARGETS,
+    *CAPTURE_GATE_TARGETS,
     "check",
+)
+CHECK_DEPENDENCIES = (
+    "format",
+    "lint",
+    "typecheck",
+    "capture-check",
+    "test",
+    "coverage",
+    "docs-check",
+    "connectors-check",
+    "build",
+    "artifact-smoke",
+    "connector-artifact-smoke",
+    "audit",
 )
 
 
@@ -49,6 +97,349 @@ def _read(relative: str) -> str:
     path = ROOT / relative
     assert path.is_file(), f"required repository file is missing: {relative}"
     return path.read_text(encoding="utf-8")
+
+
+class _UnreadableProviderEnvironment(Mapping[str, str]):
+    def __init__(self) -> None:
+        self.read_keys: list[str] = []
+        self._keys = ("PATH", *(key.swapcase() for key in PROVIDER_CREDENTIAL_KEYS))
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._keys)
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def __getitem__(self, key: str) -> str:
+        self.read_keys.append(key)
+        if key.upper() in PROVIDER_CREDENTIAL_KEYS:
+            raise AssertionError("provider credential value was read")
+        if key == "PATH":
+            return "/synthetic/bin"
+        raise KeyError(key)
+
+
+def test_artifact_environment_projection_never_reads_provider_credentials() -> None:
+    core_environment = _UnreadableProviderEnvironment()
+    assert artifact_verifier._environment_without_provider_credentials(core_environment) == {
+        "PATH": "/synthetic/bin"
+    }
+    assert core_environment.read_keys == ["PATH"]
+
+    connector_environment = _UnreadableProviderEnvironment()
+    assert connector_artifact_verifier._project_environment_without_provider_values(
+        connector_environment
+    ) == {"PATH": "/synthetic/bin"}
+    assert connector_environment.read_keys == ["PATH"]
+
+
+def test_connector_artifact_verifier_materializes_native_launchers(tmp_path: Path) -> None:
+    posix_workspace = tmp_path / "posix"
+    posix_workspace.mkdir()
+    posix_launcher = connector_artifact_verifier._materialize_launcher(
+        posix_workspace,
+        platform="posix",
+    )
+    assert posix_launcher.name == "capture-launcher"
+    assert posix_launcher.read_bytes() == connector_artifact_verifier.POSIX_LAUNCHER_SOURCE
+    assert posix_launcher.stat().st_mode & 0o100
+    assert (posix_launcher.parent / "capture-launcher.mjs").is_file()
+
+    windows_workspace = tmp_path / "windows"
+    windows_workspace.mkdir()
+    windows_launcher = connector_artifact_verifier._materialize_launcher(
+        windows_workspace,
+        platform="nt",
+    )
+    assert windows_launcher.name == "capture-launcher.cmd"
+    assert windows_launcher.read_bytes() == connector_artifact_verifier.WINDOWS_LAUNCHER_SOURCE
+    assert windows_launcher.read_bytes().startswith(b"@echo off\r\n")
+    assert (windows_launcher.parent / "capture-launcher.mjs").is_file()
+
+    with pytest.raises(
+        connector_artifact_verifier.VerificationError,
+        match="platform is unsupported",
+    ):
+        connector_artifact_verifier._materialize_launcher(tmp_path / "unsupported", platform="vms")
+
+
+def test_connector_artifact_verifier_resolves_npm_cli_without_executing_cmd(
+    tmp_path: Path,
+) -> None:
+    tool_root = tmp_path / "toolchain"
+    node = tool_root / "node.exe"
+    npm = tool_root / "npm.cmd"
+    npm_cli = tool_root / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    package = npm_cli.parent.parent / "package.json"
+    npm_cli.parent.mkdir(parents=True)
+    node.write_bytes(b"synthetic-node")
+    npm.write_bytes(b"@echo off\r\n")
+    npm_cli.write_bytes(b"synthetic-npm-cli")
+    package.write_text('{"name":"npm","version":"10.9.3"}', encoding="utf-8")
+    node.chmod(0o700)
+    npm.chmod(0o700)
+
+    assert connector_artifact_verifier._resolve_regular_command(
+        str(node),
+        label="Node.js",
+    ) == node.resolve(strict=True)
+    assert connector_artifact_verifier._validated_npm_cli(str(npm)) == npm_cli.resolve(strict=True)
+
+    package.write_text('{"name":"npm","version":"10.9.2"}', encoding="utf-8")
+    with pytest.raises(
+        connector_artifact_verifier.VerificationError,
+        match=r"could not validate npm-cli\.js",
+    ):
+        connector_artifact_verifier._validated_npm_cli(str(npm))
+
+
+@pytest.mark.parametrize(
+    ("payload", "platform", "expected"),
+    (
+        (b'{"ok":true}\n', "posix", b'{"ok":true}\n'),
+        (b'{"ok":true}\n', "nt", b'{"ok":true}\n'),
+        (b'{"ok":true}\r\n', "nt", b'{"ok":true}\n'),
+    ),
+)
+def test_core_artifact_verifier_normalizes_only_one_windows_transport_ending(
+    payload: bytes,
+    platform: str,
+    expected: bytes,
+) -> None:
+    assert artifact_verifier._normalize_transport_stdout(payload, platform=platform) == expected
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        b'{"ok":true}\r\n\r\n',
+        b'{"ok":true}\r\nextra',
+        b'{"ok":true}\r\r\n',
+    ),
+)
+def test_core_artifact_verifier_rejects_noncanonical_windows_transport(
+    payload: bytes,
+) -> None:
+    with pytest.raises(RuntimeError, match="non-canonical Windows transport ending"):
+        artifact_verifier._normalize_transport_stdout(payload, platform="nt")
+
+
+def test_installed_shadow_smoke_routes_windows_private_io_through_security_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[str, Path, object]] = []
+    path = tmp_path / "private" / "payload.json"
+
+    def forbidden_posix_primitive(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("POSIX ownership primitive reached Windows branch")
+
+    monkeypatch.setattr(shadow_smoke.os, "getuid", forbidden_posix_primitive, raising=False)
+    monkeypatch.setattr(shadow_smoke.os, "fchmod", forbidden_posix_primitive, raising=False)
+    monkeypatch.setattr(
+        shadow_smoke,
+        "_authorize_windows_private_parent",
+        lambda parent: calls.append(("authorize", parent, None)),
+    )
+    monkeypatch.setattr(
+        shadow_smoke,
+        "_publish_windows_private_file",
+        lambda target, data: calls.append(("publish", target, data)),
+    )
+    monkeypatch.setattr(
+        shadow_smoke,
+        "_read_windows_private_file",
+        lambda target, *, maximum_bytes: (
+            calls.append(("read", target, maximum_bytes)),
+            b'{"ok":true}\n',
+        )[1],
+    )
+    monkeypatch.setattr(
+        shadow_smoke,
+        "_ensure_windows_smoke_directory",
+        lambda target: calls.append(("ensure", target, None)),
+    )
+
+    shadow_smoke._write_private(path, b'{"ok":true}\n', platform="nt")
+    assert shadow_smoke._read_private(path, maximum_bytes=64, platform="nt") == b'{"ok":true}\n'
+    shadow_smoke._prepare_private_directory(path.parent, platform="nt")
+
+    assert calls == [
+        ("authorize", path.parent, None),
+        ("publish", path, b'{"ok":true}\n'),
+        ("authorize", path.parent, None),
+        ("read", path, 64),
+        ("ensure", path.parent, None),
+    ]
+
+
+def test_core_artifact_verifier_routes_windows_private_publication_through_installed_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    payload = b'{"private":true}\n'
+    environment = {"PATH": "/synthetic/bin"}
+
+    def forbidden_outer_private_write(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("outer POSIX private writer reached Windows branch")
+
+    def fake_run(
+        command: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        normalized = tuple(str(item) for item in command)  # type: ignore[union-attr]
+        calls.append((normalized, kwargs))
+        return subprocess.CompletedProcess(
+            normalized,
+            0,
+            stdout=b"shadow-private-file-ok\r\n",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(artifact_verifier, "_write_private", forbidden_outer_private_write)
+    monkeypatch.setattr(artifact_verifier, "_run", fake_run)
+    artifact_verifier._publish_installed_private_file(
+        tmp_path / "shadow" / "report.json",
+        payload,
+        python=tmp_path / "venv" / "Scripts" / "python.exe",
+        guard=tmp_path / "package" / "scripts" / "run_without_sockets.py",
+        validator=tmp_path / "package" / "scripts" / "smoke_shadow_installed.py",
+        cwd=tmp_path / "case",
+        environment=environment,
+        platform="nt",
+    )
+
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert command[-2:] == (
+        "publish-private-file",
+        str(tmp_path / "shadow" / "report.json"),
+    )
+    assert kwargs == {
+        "cwd": tmp_path / "case",
+        "env": environment,
+        "capture_output": True,
+        "input_bytes": payload,
+    }
+    source = ARTIFACT_VERIFIER.read_text(encoding="utf-8")
+    proof_body = source.split("def _prove_documented_cases(", 1)[1].split(
+        "\ndef verify_built_artifacts(",
+        1,
+    )[0]
+    assert "_write_private(" not in proof_body
+    assert proof_body.count("_publish_installed_private_file(") == 3
+
+
+def test_installed_shadow_smoke_private_stdin_uses_platform_private_writer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = b'{"private":true}\n'
+    target = tmp_path / "private" / "payload.json"
+    writes: list[tuple[Path, bytes]] = []
+
+    class BinaryInput:
+        buffer = io.BytesIO(payload)
+
+    monkeypatch.setattr(shadow_smoke.sys, "stdin", BinaryInput())
+    monkeypatch.setattr(
+        shadow_smoke,
+        "_write_private",
+        lambda path, data: writes.append((path, data)),
+    )
+
+    shadow_smoke._publish_private_stdin(target)
+
+    assert writes == [(target, payload)]
+
+
+def test_installed_shadow_smoke_validates_windows_key_through_private_reader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import saliencegate.security as security
+
+    key_path = tmp_path / "config" / "saliencegate" / "installation.key"
+    guard = shadow_smoke._EnvironmentReadGuard({"HOME": str(tmp_path)})
+    assert guard["HOME"] == str(tmp_path)
+    reads: list[tuple[Path, int, str | None]] = []
+    monkeypatch.setattr(security, "default_installation_key_path", lambda: key_path)
+    monkeypatch.setattr(
+        shadow_smoke,
+        "_read_private",
+        lambda path, *, maximum_bytes, platform=None: (
+            reads.append((path, maximum_bytes, platform)),
+            b"k" * 32,
+        )[1],
+    )
+
+    shadow_smoke._validate_local_key(guard, platform="nt")
+    assert reads == [(key_path, 32, "nt")]
+
+
+def test_core_artifact_verifier_resolves_native_venv_and_cli_paths(tmp_path: Path) -> None:
+    environment = tmp_path / "venv"
+    assert artifact_verifier._venv_python(environment, platform="posix") == (
+        environment / "bin" / "python"
+    )
+    assert artifact_verifier._venv_python(environment, platform="nt") == (
+        environment / "Scripts" / "python.exe"
+    )
+
+    posix_case = tmp_path / "posix-case"
+    posix_case.mkdir()
+    posix_python = environment / "bin" / "python"
+    assert (
+        artifact_verifier._installed_cli_script(
+            python=posix_python,
+            case_root=posix_case,
+            platform="posix",
+        )
+        == environment / "bin" / "saliencegate"
+    )
+
+    windows_case = tmp_path / "windows-case"
+    windows_case.mkdir()
+    windows_cli = artifact_verifier._installed_cli_script(
+        python=environment / "Scripts" / "python.exe",
+        case_root=windows_case,
+        platform="nt",
+    )
+    assert windows_cli == windows_case / "saliencegate-command.py"
+    assert windows_cli.read_bytes() == artifact_verifier._WINDOWS_CLI_SHIM
+    assert b"raise SystemExit(entrypoint())" in windows_cli.read_bytes()
+
+    with pytest.raises(RuntimeError, match="platform is unsupported"):
+        artifact_verifier._venv_python(environment, platform="vms")
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    (
+        "saliencegate-0.1.0/C:/evil",
+        "saliencegate-0.1.0/name:stream",
+        "saliencegate-0.1.0/CON",
+        "saliencegate-0.1.0/aux/file.txt",
+        "saliencegate-0.1.0/trailing.",
+    ),
+)
+def test_core_artifact_extraction_rejects_windows_unsafe_members_on_every_platform(
+    tmp_path: Path,
+    member_name: str,
+) -> None:
+    sdist = tmp_path / "crafted.tar.gz"
+    payload = b"synthetic"
+    with tarfile.open(sdist, mode="w:gz") as archive:
+        member = tarfile.TarInfo(member_name)
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+
+    destination = tmp_path / "extracted"
+    with pytest.raises(RuntimeError, match="Windows-unsafe path"):
+        artifact_verifier._extract_sdist(sdist, destination)
+    assert destination.is_dir()
+    assert tuple(destination.iterdir()) == ()
 
 
 def _issue_field(text: str, field_id: str) -> str:
@@ -78,6 +469,30 @@ def _step_containing(job: str, needle: str) -> str:
     matches = [block for block in blocks if needle in block]
     assert len(matches) == 1, f"expected one CI step containing {needle!r}"
     return matches[0]
+
+
+def _assert_native_runner_matrix(job: str) -> None:
+    assert "runs-on: ${{ matrix.runner }}" in job
+    assert "fail-fast: false" in job
+    assert (
+        tuple(
+            zip(
+                re.findall(r"(?m)^          - platform: ([^\n]+)$", job),
+                re.findall(r"(?m)^            runner: ([^\n]+)$", job),
+                strict=True,
+            )
+        )
+        == NATIVE_RUNNER_MATRIX
+    )
+
+
+def _assert_inline_python_step(job: str, needle: str) -> None:
+    step = _step_containing(job, needle)
+    assert "shell: python" in step
+    marker = "        run: |\n"
+    assert marker in step
+    source = textwrap.dedent(step.split(marker, maxsplit=1)[1])
+    compile(source, f"<{needle}>", "exec")
 
 
 def _assert_installed_shadow_smoke(job: str, *, prefix: str) -> None:
@@ -143,6 +558,31 @@ def test_artifact_verifier_reports_captured_failures_without_credentials() -> No
     assert "<redacted>" in message
 
 
+def test_artifact_failure_diagnostics_never_read_ambient_provider_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hostile_environment = _UnreadableProviderEnvironment()
+
+    class HostileEnvironmentOS:
+        environ = hostile_environment
+
+        @staticmethod
+        def fspath(value: str | Path) -> str:
+            return str(value)
+
+    monkeypatch.setattr(artifact_verifier, "os", HostileEnvironmentOS)
+    source = "import sys; print('provider-credential-read-must-fail'); raise SystemExit(9)"
+
+    with pytest.raises(RuntimeError, match="exited with 9") as failure:
+        _run(
+            (sys.executable, "-I", "-c", source),
+            capture_output=True,
+        )
+
+    assert "provider-credential-read-must-fail" not in str(failure.value)
+    assert hostile_environment.read_keys == ["PATH"]
+
+
 def test_artifact_workspace_canonicalizes_a_symlinked_temp_root(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -193,7 +633,38 @@ def test_makefile_exposes_noninteractive_gates_in_the_authoritative_order() -> N
 
     check = re.search(r"(?m)^check\s*:\s*(?P<dependencies>[^\n]+)$", text)
     assert check is not None
-    assert tuple(check.group("dependencies").split()) == REQUIRED_TARGETS[:-1]
+    assert tuple(check.group("dependencies").split()) == CHECK_DEPENDENCIES
+
+    preflight = re.search(r"(?ms)^connector-node-preflight:\n(?P<body>.*?)(?=^[a-z-]+:)", text)
+    assert preflight is not None
+    assert "Node.js %s" in preflight.group("body")
+    assert "npm %s" in preflight.group("body")
+    assert 'test "$$node_version" = "v22.19.0"' in preflight.group("body")
+    assert 'test "$$npm_version" = "10.9.3"' in preflight.group("body")
+    assert re.search(r"(?m)^connector-install: connector-node-preflight$", text)
+    assert re.search(
+        r"(?m)^connector-source-check: "
+        r"connector-test connector-benchmark connector-build connector-audit$",
+        text,
+    )
+    assert "npx --yes --package=node@22.19.0 --package=npm@10.9.3 -c" in text
+    assert "$(CONNECTOR_TOOLCHAIN) 'make connector-source-check'" in text
+    assert "npm ci --no-audit --no-fund" in text
+    assert "npm run connector:test" in text
+    assert "npm run connector:benchmark -- --assert-budgets" in text
+    assert "npm run connector:build:check" in text
+    assert "npm run connector:audit" in text
+    for credential_key in PROVIDER_CREDENTIAL_KEYS:
+        assert (
+            f"$(CONNECTOR_GATE_TARGETS): export {credential_key} := "
+            "provider-credential-read-must-fail"
+        ) in text
+    assert "$(CONNECTOR_GATE_TARGETS): export" in text
+    assert "${" not in "\n".join(
+        line for line in text.splitlines() if "provider-credential-read-must-fail" in line
+    )
+    assert re.search(r"(?m)^artifact-smoke:\s*$", text)
+    assert re.search(r"(?m)^connector-artifact-smoke:\s*$", text)
 
     required_commands = (
         "ruff format --check .",
@@ -209,6 +680,12 @@ def test_makefile_exposes_noninteractive_gates_in_the_authoritative_order() -> N
         "SALIENCEGATE_REQUIRE_DISTRIBUTIONS=1",
         "pytest -q tests/test_package.py",
         "python scripts/verify_built_artifacts.py --dist-dir dist",
+        "python scripts/verify_connector_artifacts.py --dist-dir dist --node node --npm npm",
+        "python scripts/run_capture_hook_benchmark.py --assert-budgets",
+        "python scripts/benchmark_capture_report.py --assert-budgets",
+        "tests/capture/test_store_concurrency.py",
+        "tests/capture/test_properties.py",
+        "tests/test_capture_*benchmark.py",
         "set -eu",
         "pip-audit --strict",
         "--progress-spinner off",
@@ -265,10 +742,17 @@ def test_ci_is_least_privilege_pinned_and_covers_supported_python() -> None:
     assert text.count(second_sync) == 4
     benchmark_first_sync = "uv sync --locked --dev --no-install-project"
     benchmark_second_sync = "uv sync --locked --dev --no-build-isolation"
-    performance = _job_block(text, "shadow-trace-performance")
-    assert text.count(benchmark_first_sync) == 1
-    assert text.count(benchmark_second_sync) == 1
-    assert performance.index(benchmark_first_sync) < performance.index(benchmark_second_sync)
+    for job_id in (
+        "shadow-trace-performance",
+        "capture-performance",
+        "capture-platform-contract",
+    ):
+        performance = _job_block(text, job_id)
+        assert performance.count(benchmark_first_sync) == 1
+        assert performance.count(benchmark_second_sync) == 1
+        assert performance.index(benchmark_first_sync) < performance.index(benchmark_second_sync)
+    assert text.count(benchmark_first_sync) == 3
+    assert text.count(benchmark_second_sync) == 3
     build_command = "uv build --no-build-isolation --clear --no-create-gitignore"
     build = _job_block(text, "build")
     assert build.count(build_command) == 1
@@ -299,13 +783,18 @@ def test_ci_separates_static_quality_from_authoritative_coverage() -> None:
         "quality",
         "coverage",
         "shadow-trace-performance",
+        "capture-performance",
+        "connectors",
+        "capture-platform-contract",
     ]
 
     makefile = _read("Makefile")
     check = re.search(r"(?m)^check\s*:\s*(?P<dependencies>[^\n]+)$", makefile)
     assert check is not None
-    assert tuple(check.group("dependencies").split()) == REQUIRED_TARGETS[:-1]
+    assert tuple(check.group("dependencies").split()) == CHECK_DEPENDENCIES
     assert "pytest --cov=saliencegate --cov-branch" in makefile
+    assert "--cov-report=json:.coverage.json --cov-fail-under=0" in makefile
+    assert "python scripts/check_coverage_thresholds.py .coverage.json --minimum 95" in makefile
     assert "fail_under = 95" in _read("pyproject.toml")
 
 
@@ -338,6 +827,67 @@ def test_ci_gates_the_documented_shadow_trace_reference_budgets() -> None:
         "--assert-budgets",
     ):
         assert required in benchmark
+
+
+def test_ci_gates_registered_capture_and_connector_performance() -> None:
+    text = _read(".github/workflows/ci.yml")
+    capture = _job_block(text, "capture-performance")
+    connectors = _job_block(text, "connectors")
+    build = _job_block(text, "build")
+
+    assert "runs-on: ubuntu-24.04" in capture
+    assert 'python-version: "3.12"' in capture
+    assert re.search(r"(?m)^    timeout-minutes: 30$", capture)
+    assert "SALIENCEGATE_CAPTURE_BENCHMARK_RUNNER_IMAGE: ubuntu-24.04" in capture
+    assert (
+        "uv run --locked python scripts/run_capture_hook_benchmark.py --assert-budgets" in capture
+    )
+    assert "uv run --locked python scripts/benchmark_capture_report.py --assert-budgets" in capture
+    assert "provider-credential-read-must-fail" in capture
+
+    setup_node = "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e"
+    assert setup_node in connectors
+    assert "# v6.4.0" in connectors
+    assert "node-version: 22.19.0" in connectors
+    assert "check-latest: false" in connectors
+    assert "package-manager-cache: false" in connectors
+    assert "run: make connector-source-check" in connectors
+    assert "provider-credential-read-must-fail" in connectors
+    assert "- capture-performance" in build
+    assert "- connectors" in build
+
+    package = _read("package.json")
+    assert "connector:network-denial:selftest" in package
+    assert "connector:benchmark" in package
+    assert "connector:audit" in package
+    assert "--import ./connectors/scripts/deny-network.mjs" in package
+
+
+def test_ci_declares_targeted_native_capture_contracts_without_claiming_r01() -> None:
+    text = _read(".github/workflows/ci.yml")
+    platform = _job_block(text, "capture-platform-contract")
+    build = _job_block(text, "build")
+
+    _assert_native_runner_matrix(platform)
+    for test_path in (
+        "tests/security/test_windows.py",
+        "tests/capture/test_store_security.py",
+        "tests/capture/test_spool.py",
+        "tests/integrations/test_hook.py",
+        "tests/integrations/test_installation.py",
+        "tests/integrations/test_launcher_renderer.py",
+    ):
+        assert test_path in platform
+    assert "HOME: ${{ runner.temp }}/capture-platform-home" in platform
+    assert "USERPROFILE: ${{ runner.temp }}/capture-platform-home" in platform
+    assert "provider-credential-read-must-fail" in platform
+    assert "- capture-platform-contract" in build
+    assert "--disable-socket" in _read("pyproject.toml")
+
+    integration_docs = _read("docs/reference/integrations.md")
+    assert integration_docs.count("implementation ready, remote verification pending") == 1
+    assert "separate R01 gate" in integration_docs
+    assert "Local contract tests do not promote any platform" in integration_docs
 
 
 def test_ci_builds_once_and_gates_distribution_membership_before_upload() -> None:
@@ -377,19 +927,28 @@ def test_ci_proves_public_atif_semantics_from_artifacts_without_checkout() -> No
     artifact = _job_block(text, "artifact-only-atif")
 
     assert "needs:\n      - build" in artifact
-    assert "runs-on: ubuntu-24.04" in artifact
+    _assert_native_runner_matrix(artifact)
+    assert "Prove ATIF from artifacts only (${{ matrix.platform }})" in artifact
     assert 'PYTHONPATH: ""' in artifact
     assert "actions/download-artifact@" in artifact
     assert "actions/checkout@" not in artifact
     assert "GITHUB_WORKSPACE" not in artifact
     assert "tests/fixtures" not in artifact
     assert "${{ runner.temp }}/saliencegate-artifact-only" in artifact
-    assert 'tar -xzf "$ARTIFACT_ROOT"/dist/*.tar.gz --strip-components=1' in artifact
-    assert 'test -f "$ARTIFACT_ROOT/launcher/scripts/verify_built_artifacts.py"' in artifact
-    assert 'python "$ARTIFACT_ROOT/launcher/scripts/verify_built_artifacts.py"' in artifact
-    assert '--dist-dir "$ARTIFACT_ROOT/dist"' in artifact
-    assert '--work-dir "$ARTIFACT_ROOT/proof"' in artifact
-    assert "--python 3.12" in artifact
+    assert artifact.count("shell: python") == 2
+    _assert_inline_python_step(artifact, "Recover the shared artifact verifier")
+    _assert_inline_python_step(artifact, "Prove documented commands")
+    assert 'tarfile.open(sdists[0], mode="r:gz")' in artifact
+    assert '("scripts", "verify_built_artifacts.py")' in artifact
+    assert 'os.environ["ARTIFACT_ROOT"]' in artifact
+    assert "sys.executable" in artifact
+    assert '"--dist-dir",' in artifact
+    assert '"--work-dir",' in artifact
+    assert '"--python",' in artifact
+    assert '"3.12",' in artifact
+    assert "check=True" in artifact
+    for unix_only in ("tar -xzf", "find ", "mkdir -p", "chmod ", "umask "):
+        assert unix_only not in artifact
     assert " shadow analyze-atif " not in artifact
     assert " validate-public-atif " not in artifact
 
@@ -399,6 +958,85 @@ def test_ci_proves_public_atif_semantics_from_artifacts_without_checkout() -> No
     for path in (README, ROOT / "examples" / "atif-shadow" / "README.md"):
         documented.extend(artifact_compatible_commands(path.read_text(encoding="utf-8")))
     assert set(documented) == set(DOCUMENTED_COMMAND_CASES.values())
+
+    verifier = ARTIFACT_VERIFIER.read_text(encoding="utf-8")
+    installed_smoke = SHADOW_INSTALLED_SMOKE.read_text(encoding="utf-8")
+    assert '"prepare-private-directory"' in verifier
+    assert "_normalize_transport_stdout(native.stdout)" in verifier
+    assert "_normalize_transport_stdout(completed.stdout)" in verifier
+    assert 'sys.argv[1] == "prepare-private-directory"' in installed_smoke
+    for windows_security_boundary in (
+        "NativeWindowsSecurityOperations",
+        "authorize_windows_private_path",
+        "ensure_windows_private_directory",
+        "publish_private_file",
+        "read_private_file",
+    ):
+        assert windows_security_boundary in installed_smoke
+
+
+def test_ci_proves_connector_bundles_from_artifacts_without_checkout() -> None:
+    text = _read(".github/workflows/ci.yml")
+    artifact = _job_block(text, "artifact-only-connectors")
+
+    assert "needs:\n      - build" in artifact
+    _assert_native_runner_matrix(artifact)
+    assert "Prove connectors from artifacts only (${{ matrix.platform }})" in artifact
+    assert 'PYTHONPATH: ""' in artifact
+    assert "actions/download-artifact@" in artifact
+    assert "actions/checkout@" not in artifact
+    assert "GITHUB_WORKSPACE" not in artifact
+    assert "tests/fixtures" not in artifact
+    assert "${{ runner.temp }}/saliencegate-connector-artifact-only" in artifact
+    assert artifact.count("shell: python") == 2
+    _assert_inline_python_step(artifact, "Recover the connector artifact verifier")
+    _assert_inline_python_step(artifact, "Import byte-identical bundles")
+    assert 'tarfile.open(sdists[0], mode="r:gz")' in artifact
+    assert '("scripts", "verify_connector_artifacts.py")' in artifact
+    assert 'os.environ["ARTIFACT_ROOT"]' in artifact
+    assert "sys.executable" in artifact
+    assert '"--dist-dir",' in artifact
+    assert '"--work-dir",' in artifact
+    assert '"--node",' in artifact
+    assert '"node",' in artifact
+    assert '"--npm",' in artifact
+    assert '"npm",' in artifact
+    assert "check=True" in artifact
+    for unix_only in ("tar -xzf", "find ", "mkdir -p", "chmod ", "umask "):
+        assert unix_only not in artifact
+    assert "node-version: 22.19.0" in artifact
+    assert "package-manager-cache: false" in artifact
+    assert "provider-credential-read-must-fail" in artifact
+    assert "USERPROFILE:" in artifact
+    assert "APPDATA:" in artifact
+    assert "LOCALAPPDATA:" in artifact
+
+    assert CONNECTOR_ARTIFACT_VERIFIER.is_file()
+    assert CONNECTOR_NETWORK_GUARD.is_file()
+    assert connector_artifact_verifier.EXPECTED_NODE_VERSION == "v22.19.0"
+    assert connector_artifact_verifier.EXPECTED_NPM_VERSION == "10.9.3"
+    assert set(connector_artifact_verifier.BUNDLES) == {"opencode", "pi"}
+    assert connector_artifact_verifier.PROVIDER_CREDENTIAL_KEYS == PROVIDER_CREDENTIAL_KEYS
+    verifier = CONNECTOR_ARTIFACT_VERIFIER.read_text(encoding="utf-8")
+    assert "ERR_SALIENCEGATE_NETWORK_DISABLED" in verifier
+    assert "process.getBuiltinModule" in verifier
+    assert "wheel and sdist connector bundles are not byte-identical" in verifier
+    assert "dist must contain exactly one wheel and one sdist" in verifier
+    assert "persisted a poisoned credential" in verifier
+    assert "os.environ.copy()" not in verifier
+    assert "if key.upper() in PROVIDER_CREDENTIAL_KEY_SET" in verifier
+    assert "provider credential reached connector launcher" in verifier
+    assert "network denial was not inherited by connector launcher" in verifier
+    assert "openCodeHooks.event" in verifier
+    assert 'piHandlers.get("session_start")' in verifier
+    assert "built connector runtime did not exercise both launch paths" in verifier
+    assert "capture-launcher.cmd" in verifier
+    assert "WINDOWS_LAUNCHER_SOURCE" in verifier
+    assert "_validated_npm_cli" in verifier
+    assert '"npm-cli.js"' in verifier
+    assert '(resolved_node, npm_cli, "--version")' in verifier
+    assert '(npm, "--version")' not in verifier
+    assert "SALIENCEGATE_ARTIFACT_NODE" in verifier
 
 
 def test_ci_exercises_the_installed_core_wheel_without_optional_runtime() -> None:
@@ -603,7 +1241,7 @@ def test_ci_installed_jobs_share_only_the_built_distributions() -> None:
         for job_id in ("installed-core-wheel", "installed-sdist", "installed-model-runtime")
     )
 
-    assert text.count("actions/download-artifact@") == 4
+    assert text.count("actions/download-artifact@") == 5
     for job in installed:
         assert "name: python-distributions" in job
         assert "path: dist/" in job
@@ -723,7 +1361,7 @@ def test_contributing_documents_the_same_exact_gate_order() -> None:
     heading = "## Required gate order"
     assert heading in text
     section = text.split(heading, maxsplit=1)[1]
-    positions = [section.index(f"`make {target}`") for target in REQUIRED_TARGETS[:-1]]
+    positions = [section.index(f"`make {target}`") for target in CORE_GATE_TARGETS]
     assert positions == sorted(positions)
     assert "`make check` runs this sequence" in section
     first_sync = "uv sync --locked --all-extras --dev --no-install-project"
