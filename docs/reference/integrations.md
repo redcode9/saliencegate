@@ -1,9 +1,9 @@
 # Universal Shadow Capture integration contract
 
-This page freezes the normative provider contract for Universal Shadow Capture v1, targeted for
-SalienceGate 0.2.0. A connector conforms only when its installed package contains the matching
-audited capability manifest. Documentation alone is not evidence that a connector is installed or
-has observed an event; capture status must report that separately.
+This page freezes the normative provider contract for Universal Shadow Capture v1 in the
+unpublished local SalienceGate 0.2.0 candidate. A connector conforms only when its installed package
+contains the matching audited capability manifest. Documentation alone is not evidence that a
+connector is installed or has observed an event; capture status must report that separately.
 
 The contract was audited on **2026-07-19**. The allowlists below describe native fields with
 evidence authority; those fields may exist briefly in bounded memory. Provider identifiers and
@@ -52,8 +52,61 @@ config.
 SalienceGate validates the hook control surface it owns, not Claude Code's entire evolving settings
 schema. A malformed foreign setting can therefore cause Claude to reject that settings layer,
 including the appended handlers. Connect proves an authenticated installation, while status remains
-`INSTALLED_NOT_OBSERVED` until an actual lifecycle callback proves activation; this is the explicit
+`installed_not_observed` until an actual lifecycle callback proves activation; this is the explicit
 `host_rejected_foreign_settings_layer` coverage exclusion.
+
+## Operations, recovery, and uninstall
+
+Use the same project root for every lifecycle command:
+
+```text
+saliencegate connect PROVIDER --project PROJECT --dry-run
+saliencegate connect PROVIDER --project PROJECT
+saliencegate status PROVIDER --project PROJECT
+saliencegate disconnect PROVIDER --project PROJECT
+```
+
+The dry-run is the review boundary. It validates the provider-specific managed-file plan and
+collisions without creating a key, store, receipt, launcher, or provider file. Its read-only Git
+probe reports whether those not-yet-created paths are ignored, would be surfaced by Git, are already
+tracked, lie outside a work tree, or could not be classified. It never edits `.gitignore`; review
+the two project-local OpenCode or Pi assets before trusting the project. A normal connect creates
+owner-private operational state, registers an authenticated pending generation, publishes the
+integration, and enables event admission last. It does not launch an agent session or prove that
+the provider loaded the integration. `status` therefore distinguishes
+`installed_not_observed` from `active_observed` and reports exact drift and degradation codes
+without revealing paths.
+
+| Provider | Managed project surface | Activation, recovery, and version boundary |
+|---|---|---|
+| Codex | Owned marked hook span in `.codex/config.toml` | The project and hook must pass Codex trust review. Connect probes `0.144.6` or a newer `0.144.x` patch, rejects other lines and disabling policy, and records each accepted patch as a new generation. Rerun connect after an interrupted authenticated installation; disconnect removes only the owned span and restores otherwise unchanged bytes. Hosted/specialized tools and missing callbacks remain exclusions after recovery. |
+| Claude Code | One owned hook group per selected event in `.claude/settings.local.json` | Normal settings trust still applies. Connect probes `2.1.204` or a newer `2.1.x` patch and records non-baseline patches as schema-compatible but unverified. Rerun connect after an interrupted owned write; disconnect removes only authenticated owned groups. A foreign setting rejected by the host, `StopFailure` before the first prompt, and session-end/resume ambiguity remain coverage limits. |
+| OpenCode | `.opencode/plugins/saliencegate.js` and `.opencode/plugins/saliencegate.bootstrap.json` | The sealed connector is exact for `1.18.3`; connect does not launch OpenCode. Reload or start the trusted project and wait for an admitted callback before expecting `active_observed`. Rerun connect to finish an interrupted authenticated bridge publication; disconnect removes exactly the bound bundle and bootstrap. A batch lost before any chunk is received and session errors without the required session identity remain undetectable exclusions. |
+| Pi | `.pi/extensions/saliencegate.ts` and `.pi/extensions/saliencegate.bootstrap.json` | The project must be trusted before Pi loads the exact `0.80.10` connector. Reload or start Pi before expecting an observed status. Rerun connect to finish an interrupted authenticated bridge publication; disconnect removes exactly the bound extension and bootstrap. Missing shutdown, manual-compaction interruption, tool-less extension-triggered runs, and wholly lost batches remain exclusions. |
+
+Operational receipts, journals, locks, and launchers live below the private SalienceGate state root,
+under `integrations/<project-locator>/<provider>/`; the project locator is a SHA-256 location digest,
+not a portable public project identifier. Do not copy or hand-edit those files. A retry uses their
+authenticated identities to complete or reverse an interrupted operation. Unexpected drift,
+ownership ambiguity, an unrelated look-alike file, or a changed receipt fails closed for manual
+inspection; reconnecting cannot turn a missed callback, dropped batch, or prior gap into complete
+coverage.
+
+`disconnect` is the connector uninstall operation. It first stops admission and drains the bounded
+spool, then removes only authenticated owned configuration or bridge files and disables the local
+connection generation. It intentionally retains captured sessions, feedback, store health,
+deletion tombstones, the SQLite database, spool boundary, and installation key. Use `sessions` and
+`report` after disconnect to inspect retained evidence. Data removal is a separate explicit
+`delete SESSION_ID` or, after every provider is disconnected,
+`delete --all --project PROJECT --confirm` operation. There is no automatic retention period or
+time-to-live.
+
+For diagnosis, run `saliencegate doctor --capture` for a strictly read-only integrity check, then
+`status`. A missing or corrupted installation key is not regenerated over existing state because a
+new key could not authenticate that state. Back up the key, SQLite database, and spool together;
+include the provider operational directories when the installed connectors must also be
+recoverable. Restoring only one component is not a supported recovery path. HMAC recovery does not
+detect rollback of all components to an older internally valid snapshot.
 
 ## Evidence field allowlists
 

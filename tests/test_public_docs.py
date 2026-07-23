@@ -6,8 +6,12 @@ from pathlib import Path
 from tomllib import loads
 
 from scripts.check_public_docs import (
+    OBSERVATIONAL_CLAIM_DOCUMENTS,
     PUBLIC_DOCUMENT_EXCLUSIONS,
+    README_LOCAL_AMBIENT_CAPTURE_COMMAND,
+    README_LOCAL_CAPTURE_COMMANDS,
     _public_paths,
+    count_readme_local_capture_command,
     scan_text,
     validate_markdown_links,
 )
@@ -29,6 +33,7 @@ REQUIRED_DOCUMENTS = (
     "docs/reference/state-decay-v2-review.md",
     "docs/security.md",
     "examples/atif-shadow/README.md",
+    "examples/capture/README.md",
     ".github/pull_request_template.md",
     ".github/ISSUE_TEMPLATE/bug.yml",
     ".github/ISSUE_TEMPLATE/benchmark.yml",
@@ -80,13 +85,28 @@ def test_readme_uses_the_required_concrete_structure() -> None:
     assert readme.count("![") == 3
     for asset in (
         "docs/assets/readme/pipeline.svg",
-        "docs/assets/readme/atif-example-results.svg",
+        "docs/assets/readme/capture-headlines.svg",
         "docs/assets/readme/reference-run.svg",
     ):
         assert readme.count(asset) == 1
 
     assert readme.count("Artifact-compatible after installation:") >= 2
     assert readme.count("Run from a checkout:") >= 2
+    local_quickstart = readme.split("\n## Try it locally\n", maxsplit=1)[1].split(
+        "\n## Analyze a trajectory\n", maxsplit=1
+    )[0]
+    assert local_quickstart.count('VENV="$HOME/.local/share/saliencegate/quickstart-venv"') == 1
+    assert local_quickstart.count('SG="$VENV/bin/saliencegate"') == 1
+    assert sum(line.startswith("VENV=") for line in local_quickstart.splitlines()) == 1
+    assert sum(line.startswith("SG=") for line in local_quickstart.splitlines()) == 1
+    assert all(
+        count_readme_local_capture_command(local_quickstart, command) == 1
+        for command in README_LOCAL_CAPTURE_COMMANDS
+    )
+    expected_invocations = len(README_LOCAL_CAPTURE_COMMANDS)
+    assert local_quickstart.count("$SG") == expected_invocations
+    assert local_quickstart.count('"$SG"') == expected_invocations
+    assert README_LOCAL_AMBIENT_CAPTURE_COMMAND.search(local_quickstart) is None
     limits = readme.split("\n## Limits\n", maxsplit=1)[1].split("\n## Development\n", maxsplit=1)[0]
     assert sum(line.startswith("- ") for line in limits.splitlines()) <= 5
 
@@ -100,6 +120,27 @@ def test_public_prose_inventory_includes_examples_and_repository_templates() -> 
         Path(".artifacts"),
         Path("reports/generated"),
     ) == PUBLIC_DOCUMENT_EXCLUSIONS
+
+
+def test_capture_example_states_the_three_headlines_and_observational_boundary() -> None:
+    example = (ROOT / "examples/capture/README.md").read_text(encoding="utf-8")
+    flattened = " ".join(example.split())
+    for fragment in (
+        "opencode-plugin/v1",
+        "memory_review_suggested",
+        "no_current_evidence",
+        "insufficient_evidence",
+        "two `tool_error` signals",
+        "one `repeated_action` signal",
+        "`repeated_failure` is explicitly `unsupported`",
+        "`model_calls=0`",
+        "`decision_authority=false`",
+        "`confirmatory=false`",
+        "scripts/render_capture_headlines.py --check",
+        "tests/test_readme_visuals.py -k capture_headline",
+    ):
+        assert fragment in flattened
+    assert "do not establish task efficacy" in flattened
 
 
 def test_relative_markdown_links_require_exact_tracked_regular_targets(tmp_path: Path) -> None:
@@ -480,8 +521,13 @@ def test_checker_rejects_credentials_claims_and_icons() -> None:
         assert scan_text(Path("docs/reference/cli.md"), trailer)
 
 
-def test_checker_rejects_unqualified_shadow_efficacy_and_savings_claims() -> None:
-    path = Path("docs/reference/shadow-mode.md")
+def test_checker_rejects_unqualified_observational_claims_in_shadow_and_capture_docs() -> None:
+    assert {
+        "README.md",
+        "docs/reference/shadow-mode.md",
+        "docs/reference/evaluation.md",
+        "examples/capture/README.md",
+    } <= OBSERVATIONAL_CLAIM_DOCUMENTS
     for forbidden in (
         "Shadow Mode improves task success.",
         "Shadow Mode preserves task success.",
@@ -490,8 +536,11 @@ def test_checker_rejects_unqualified_shadow_efficacy_and_savings_claims() -> Non
         "Shadow Mode proves a causal effect.",
         "Shadow Mode is a calibrated trigger.",
         "The report estimates population prevalence.",
+        "The agent needs memory.",
+        "A reminder would help.",
     ):
-        assert scan_text(path, forbidden)
+        assert scan_text(Path("docs/reference/shadow-mode.md"), forbidden)
+        assert scan_text(Path("examples/capture/README.md"), forbidden)
 
 
 def test_public_documents_pass_the_repository_checker() -> None:

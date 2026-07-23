@@ -54,6 +54,12 @@ def test_default_key_path_uses_windows_appdata(
     resolved = keys_module.default_installation_key_path(environ={"APPDATA": str(appdata)})
     assert resolved.value == appdata / "saliencegate" / "installation.key"  # type: ignore[attr-defined]
 
+    xdg = PureWindowsPath(r"C:\Users\fixture\XdgConfig")
+    overridden = keys_module.default_installation_key_path(
+        environ={"APPDATA": str(appdata), "XDG_CONFIG_HOME": str(xdg)}
+    )
+    assert overridden.value == xdg / "saliencegate" / "installation.key"  # type: ignore[attr-defined]
+
 
 def test_key_file_rejects_foreign_posix_owner(tmp_path: Path) -> None:
     metadata = SimpleNamespace(

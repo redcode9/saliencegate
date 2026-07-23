@@ -4,6 +4,23 @@ SalienceGate feedback is local human annotation for a captured session. It does 
 agent, select memory, inject context, enable a reminder, or establish that an intervention would
 have helped. Capture reports remain descriptive observational evidence with no decision authority.
 
+## Current evidence state
+
+The checked-in [capture example](../../examples/capture/README.md) is synthetic. It exercises the
+authenticated normalization and report contracts for all three headlines:
+`memory_review_suggested`, `no_current_evidence`, and `insufficient_evidence`. Its repeated-action
+and structured-failure case is constructed to emit a signal; its clean closed case is constructed
+to meet an absence minimum; and its incomplete case is constructed to preserve an explicit limit.
+Every result remains `confirmatory=false`, `decision_authority=false`, and `model_calls=0`.
+
+That fixture demonstrates deterministic mechanics only. It is not a sampled provider population,
+has no independently adjudicated task outcome, and cannot estimate prevalence, precision, recall,
+false-positive rate, usefulness, or an intervention-attributable outcome. No real-world feedback
+dataset or accepted E01 assessment is committed here. The current evidence status is therefore
+exactly
+`insufficient_real_world_evidence`, regardless of whether the synthetic rows reproduce their
+expected headlines.
+
 ## Record local feedback
 
 Artifact-compatible after installation:

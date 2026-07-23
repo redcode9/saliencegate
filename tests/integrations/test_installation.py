@@ -20,10 +20,12 @@ from saliencegate.capture.identities import CaptureDigestContext
 from saliencegate.integrations.bootstrap import inspect_integration_bootstrap
 from saliencegate.integrations.config_files import ConfigSyntax, OwnedConfigSpec
 from saliencegate.integrations.installation import (
+    GitProjectFileDisposition,
     InstallationDisposition,
     InstallationError,
     InstallationState,
     derive_installation_identity,
+    git_project_file_review,
     git_tracked_project_files,
     inspect_provider_installation,
     install_provider,
@@ -96,6 +98,13 @@ def _write_new_private_file(path: Path, data: bytes) -> None:
         assert published.data == data
         return
     path.write_bytes(data)
+
+
+def _trusted_test_git(project_root: Path) -> str:
+    executable = installation_module._resolved_git_executable(project_root)
+    if executable is None:
+        pytest.skip("trusted Git executable is unavailable under the platform policy")
+    return executable
 
 
 def _make_spec(
@@ -1618,48 +1627,99 @@ def test_upgrade_rejects_nonprivate_bootstrap_before_transaction_publication(
 
 def test_git_probe_is_read_only_and_reports_only_managed_project_files(tmp_path: Path) -> None:
     spec = _make_spec(tmp_path)
-    if subprocess.run(("git", "--version"), capture_output=True, check=False).returncode != 0:
-        pytest.skip("git is unavailable")
-    subprocess.run(("git", "init", "--quiet"), cwd=spec.project_root, check=True)
+    git = _trusted_test_git(spec.project_root)
+    subprocess.run((git, "init", "--quiet"), cwd=spec.project_root, check=True)
     _make_private_directory(spec.config_path.parent)
     _write_new_private_file(spec.config_path, b"{}")
     subprocess.run(
-        ("git", "add", spec.config_path.relative_to(spec.project_root).as_posix()),
+        (git, "add", spec.config_path.relative_to(spec.project_root).as_posix()),
         cwd=spec.project_root,
         check=True,
     )
     before = subprocess.run(
-        ("git", "status", "--porcelain=v1"),
+        (git, "status", "--porcelain=v1"),
         cwd=spec.project_root,
         capture_output=True,
         check=True,
     ).stdout
 
+    review = git_project_file_review(spec)
     tracked = git_tracked_project_files(spec)
 
     after = subprocess.run(
-        ("git", "status", "--porcelain=v1"),
+        (git, "status", "--porcelain=v1"),
         cwd=spec.project_root,
         capture_output=True,
         check=True,
     ).stdout
     assert tracked == (spec.config_path,)
+    assert review.disposition is GitProjectFileDisposition.UNIGNORED
+    assert review.project_local_files == spec.project_local_paths
+    assert review.unignored_files == spec.project_local_paths
+    assert review.tracked_files == (spec.config_path,)
     assert after == before
     assert not (spec.project_root / ".gitignore").exists()
 
 
+def test_git_probe_distinguishes_unignored_ignored_and_non_repository_plans(
+    tmp_path: Path,
+) -> None:
+    unignored_root = tmp_path / "unignored"
+    unignored_root.mkdir()
+    unignored = _make_spec(unignored_root)
+    git = _trusted_test_git(unignored.project_root)
+    subprocess.run((git, "init", "--quiet"), cwd=unignored.project_root, check=True)
+    before = subprocess.run(
+        (git, "status", "--porcelain=v1"),
+        cwd=unignored.project_root,
+        capture_output=True,
+        check=True,
+    ).stdout
+    review = git_project_file_review(unignored)
+    after = subprocess.run(
+        (git, "status", "--porcelain=v1"),
+        cwd=unignored.project_root,
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert review.disposition is GitProjectFileDisposition.UNIGNORED
+    assert review.unignored_files == unignored.project_local_paths
+    assert review.tracked_files == ()
+    assert before == after == b""
+    assert not (unignored.project_root / ".gitignore").exists()
+
+    ignored_root = tmp_path / "ignored"
+    ignored_root.mkdir()
+    ignored = _make_spec(ignored_root)
+    subprocess.run((git, "init", "--quiet"), cwd=ignored.project_root, check=True)
+    (ignored.project_root / ".gitignore").write_text(".synthetic/\n", encoding="utf-8")
+    before_ignore = (ignored.project_root / ".gitignore").read_bytes()
+    ignored_review = git_project_file_review(ignored)
+    assert ignored_review.disposition is GitProjectFileDisposition.ALL_IGNORED
+    assert ignored_review.unignored_files == ()
+    assert ignored_review.tracked_files == ()
+    assert (ignored.project_root / ".gitignore").read_bytes() == before_ignore
+
+    outside_root = tmp_path / "outside"
+    outside_root.mkdir()
+    outside = _make_spec(outside_root)
+    outside_review = git_project_file_review(outside)
+    assert outside_review.disposition is GitProjectFileDisposition.NOT_REPOSITORY
+    assert outside_review.unignored_files == ()
+    assert outside_review.tracked_files == ()
+
+
 def test_command_hook_git_probe_has_no_synthetic_bridge_candidates(tmp_path: Path) -> None:
     spec = _make_command_hook_spec(tmp_path)
-    if subprocess.run(("git", "--version"), capture_output=True, check=False).returncode != 0:
-        pytest.skip("git is unavailable")
-    subprocess.run(("git", "init", "--quiet"), cwd=spec.project_root, check=True)
+    git = _trusted_test_git(spec.project_root)
+    subprocess.run((git, "init", "--quiet"), cwd=spec.project_root, check=True)
     _make_private_directory(spec.config_path.parent)
     _write_new_private_file(spec.config_path, b"{}")
     unrelated = spec.config_path.parent / "foreign.js"
     _write_new_private_file(unrelated, b"foreign")
     subprocess.run(
         (
-            "git",
+            git,
             "add",
             spec.config_path.relative_to(spec.project_root).as_posix(),
             unrelated.relative_to(spec.project_root).as_posix(),
@@ -1668,7 +1728,7 @@ def test_command_hook_git_probe_has_no_synthetic_bridge_candidates(tmp_path: Pat
         check=True,
     )
     before = subprocess.run(
-        ("git", "status", "--porcelain=v1"),
+        (git, "status", "--porcelain=v1"),
         cwd=spec.project_root,
         capture_output=True,
         check=True,
@@ -1677,7 +1737,7 @@ def test_command_hook_git_probe_has_no_synthetic_bridge_candidates(tmp_path: Pat
     tracked = git_tracked_project_files(spec)
 
     after = subprocess.run(
-        ("git", "status", "--porcelain=v1"),
+        (git, "status", "--porcelain=v1"),
         cwd=spec.project_root,
         capture_output=True,
         check=True,

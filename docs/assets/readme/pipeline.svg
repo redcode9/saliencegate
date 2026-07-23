@@ -1,72 +1,75 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 820" width="100%" role="img" aria-labelledby="pipeline-title pipeline-desc" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
-  <title id="pipeline-title">Shadow analysis pipeline</title>
-  <desc id="pipeline-desc">The Shadow path seals a mapping, redacts and detects, atomically appends any missing suffix to an authenticated ledger with a no-op when complete, then emits a content-addressed provenance report.</desc>
-  <rect data-surface="true" x="0" y="0" width="1600" height="820" fill="#f6f1e8"/>
-  <text x="60" y="72" fill="#22211f" font-size="52" font-weight="700">One observational path</text>
-  <text x="60" y="118" fill="#22211f" font-size="30">Bounded input, deterministic evidence, no behavioral authority</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 840" width="100%" role="img" aria-labelledby="pipeline-title pipeline-desc" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+  <title id="pipeline-title">Universal Shadow Capture pipeline</title>
+  <desc id="pipeline-desc">Four provider connectors reduce bounded lifecycle events, apply HMAC pseudonyms, preserve authenticated local evidence, run deterministic Shadow analysis, and emit a bounded report with one of three content-free headlines.</desc>
+  <rect data-surface="true" x="0" y="0" width="1600" height="840" fill="#f6f1e8"/>
+  <text x="60" y="72" fill="#22211f" font-size="52" font-weight="700">Capture first; conclude only within the evidence</text>
+  <text x="60" y="118" fill="#22211f" font-size="30">Provider lifecycle events become a bounded local report, never an agent control path</text>
 
-  <rect data-surface="true" x="50" y="170" width="260" height="390" rx="12" fill="#ffffff" stroke="#315f6f" stroke-width="4"/>
+  <rect data-surface="true" x="50" y="170" width="260" height="410" rx="12" fill="#ffffff" stroke="#315f6f" stroke-width="4"/>
   <rect x="50" y="170" width="260" height="12" rx="6" fill="#315f6f"/>
-  <text x="76" y="222" fill="#22211f" font-size="28" font-weight="700">1 / Input trace</text>
-  <text x="76" y="304" fill="#22211f" font-size="28">Native NDJSON</text>
-  <text x="76" y="344" fill="#22211f" font-size="28">or ATIF bytes</text>
-  <line x1="76" y1="390" x2="284" y2="390" stroke="#c7c0b4" stroke-width="3"/>
-  <text x="76" y="446" fill="#22211f" font-size="28" font-weight="700">Read only</text>
-  <text x="76" y="492" fill="#22211f" font-size="28">Never executed</text>
+  <text x="76" y="222" fill="#22211f" font-size="28" font-weight="700">1 / Lifecycle</text>
+  <text x="76" y="258" fill="#22211f" font-size="28" font-weight="700">events</text>
+  <text data-metric="pipeline.profile_count" x="76" y="342" fill="#22211f" font-size="52" font-weight="700">4</text>
+  <text x="76" y="384" fill="#22211f" font-size="28">profiles</text>
+  <text x="76" y="462" fill="#22211f" font-size="28">Audited fields</text>
+  <text x="76" y="504" fill="#22211f" font-size="28">Bounded bytes</text>
+  <text x="76" y="546" fill="#22211f" font-size="28">No transcript</text>
 
-  <line x1="310" y1="365" x2="332" y2="365" stroke="#315f6f" stroke-width="6"/>
-  <polygon points="332,353 350,365 332,377" fill="#315f6f"/>
+  <line x1="310" y1="375" x2="332" y2="375" stroke="#315f6f" stroke-width="6"/>
+  <polygon points="332,363 350,375 332,387" fill="#315f6f"/>
 
-  <rect data-surface="true" x="350" y="170" width="260" height="390" rx="12" fill="#dce9e9" stroke="#315f6f" stroke-width="4"/>
+  <rect data-surface="true" x="350" y="170" width="260" height="410" rx="12" fill="#dce9e9" stroke="#315f6f" stroke-width="4"/>
   <rect x="350" y="170" width="260" height="12" rx="6" fill="#315f6f"/>
-  <text x="376" y="222" fill="#22211f" font-size="28" font-weight="700">2 / Sealed</text>
-  <text x="376" y="258" fill="#22211f" font-size="28" font-weight="700">mapping</text>
-  <text data-metric="pipeline.profile_count" x="376" y="340" fill="#22211f" font-size="52" font-weight="700">2</text>
-  <text x="376" y="382" fill="#22211f" font-size="28">sealed profiles</text>
-  <text data-metric="pipeline.max_records" x="376" y="470" fill="#22211f" font-size="42" font-weight="700">1,000</text>
-  <text x="376" y="512" fill="#22211f" font-size="28">record cap</text>
+  <text x="376" y="222" fill="#22211f" font-size="28" font-weight="700">2 / Reduce and</text>
+  <text x="376" y="258" fill="#22211f" font-size="28" font-weight="700">pseudonymize</text>
+  <text x="376" y="330" fill="#22211f" font-size="28">Closed adapter</text>
+  <text x="376" y="372" fill="#22211f" font-size="28">HMAC identities</text>
+  <text x="376" y="448" fill="#22211f" font-size="28">Raw persisted</text>
+  <text data-metric="pipeline.raw_content_persisted" x="376" y="496" fill="#22211f" font-size="36" font-weight="700">false</text>
+  <text x="376" y="546" fill="#22211f" font-size="28">Raw discarded</text>
 
-  <line x1="610" y1="365" x2="632" y2="365" stroke="#315f6f" stroke-width="6"/>
-  <polygon points="632,353 650,365 632,377" fill="#315f6f"/>
+  <line x1="610" y1="375" x2="632" y2="375" stroke="#315f6f" stroke-width="6"/>
+  <polygon points="632,363 650,375 632,387" fill="#315f6f"/>
 
-  <rect data-surface="true" x="650" y="170" width="260" height="390" rx="12" fill="#f1e0c6" stroke="#9b5c13" stroke-width="4"/>
+  <rect data-surface="true" x="650" y="170" width="260" height="410" rx="12" fill="#f1e0c6" stroke="#9b5c13" stroke-width="4"/>
   <rect x="650" y="170" width="260" height="12" rx="6" fill="#9b5c13"/>
-  <text x="676" y="222" fill="#22211f" font-size="28" font-weight="700">3 / Redact</text>
-  <text x="676" y="258" fill="#22211f" font-size="28" font-weight="700">and detect</text>
-  <text data-metric="pipeline.detector_count" x="676" y="340" fill="#22211f" font-size="52" font-weight="700">4</text>
-  <text x="676" y="382" fill="#22211f" font-size="28">detectors</text>
-  <text x="676" y="466" fill="#22211f" font-size="28">Typed outcomes</text>
-  <text x="676" y="508" fill="#22211f" font-size="28">Abstentions</text>
+  <text x="676" y="222" fill="#22211f" font-size="28" font-weight="700">3 / Local</text>
+  <text x="676" y="258" fill="#22211f" font-size="28" font-weight="700">evidence</text>
+  <text x="676" y="330" fill="#22211f" font-size="28">SQLite ledger</text>
+  <text x="676" y="372" fill="#22211f" font-size="28">Busy-only spool</text>
+  <text x="676" y="448" fill="#22211f" font-size="28">HMAC mutation</text>
+  <text x="676" y="490" fill="#22211f" font-size="28">detection</text>
+  <text x="676" y="546" fill="#22211f" font-size="28">Project bound</text>
 
-  <line x1="910" y1="365" x2="932" y2="365" stroke="#9b5c13" stroke-width="6"/>
-  <polygon points="932,353 950,365 932,377" fill="#9b5c13"/>
+  <line x1="910" y1="375" x2="932" y2="375" stroke="#9b5c13" stroke-width="6"/>
+  <polygon points="932,363 950,375 932,387" fill="#9b5c13"/>
 
-  <rect data-surface="true" x="950" y="170" width="260" height="390" rx="12" fill="#ffffff" stroke="#9b5c13" stroke-width="4"/>
+  <rect data-surface="true" x="950" y="170" width="260" height="410" rx="12" fill="#ffffff" stroke="#9b5c13" stroke-width="4"/>
   <rect x="950" y="170" width="260" height="12" rx="6" fill="#9b5c13"/>
-  <text x="976" y="222" fill="#22211f" font-size="28" font-weight="700">4 / Missing</text>
-  <text x="976" y="258" fill="#22211f" font-size="28" font-weight="700">suffix</text>
-  <text x="976" y="334" fill="#22211f" font-size="28">Atomic append</text>
-  <text x="976" y="376" fill="#22211f" font-size="28">to the ledger</text>
-  <text x="976" y="424" fill="#22211f" font-size="28" font-weight="700">No-op</text>
-  <text x="976" y="462" fill="#22211f" font-size="28" font-weight="700">when complete</text>
-  <text x="976" y="508" fill="#22211f" font-size="28">Resume:</text>
-  <text x="976" y="544" fill="#22211f" font-size="28">suffix only</text>
+  <text x="976" y="222" fill="#22211f" font-size="28" font-weight="700">4 / Normalize</text>
+  <text x="976" y="258" fill="#22211f" font-size="28" font-weight="700">and detect</text>
+  <text data-metric="pipeline.signal_type_count" x="976" y="342" fill="#22211f" font-size="52" font-weight="700">9</text>
+  <text x="976" y="384" fill="#22211f" font-size="28">declared signals</text>
+  <text x="976" y="462" fill="#22211f" font-size="28">Profile support</text>
+  <text x="976" y="504" fill="#22211f" font-size="28">Explicit limits</text>
+  <text x="976" y="546" fill="#22211f" font-size="28">Gap abstention</text>
 
-  <line x1="1210" y1="365" x2="1232" y2="365" stroke="#315f6f" stroke-width="6"/>
-  <polygon points="1232,353 1250,365 1232,377" fill="#315f6f"/>
+  <line x1="1210" y1="375" x2="1232" y2="375" stroke="#315f6f" stroke-width="6"/>
+  <polygon points="1232,363 1250,375 1232,387" fill="#315f6f"/>
 
-  <rect data-surface="true" x="1250" y="170" width="300" height="390" rx="12" fill="#dce9e9" stroke="#315f6f" stroke-width="4"/>
+  <rect data-surface="true" x="1250" y="170" width="300" height="410" rx="12" fill="#dce9e9" stroke="#315f6f" stroke-width="4"/>
   <rect x="1250" y="170" width="300" height="12" rx="6" fill="#315f6f"/>
-  <text x="1276" y="222" fill="#22211f" font-size="28" font-weight="700">5 / Provenance</text>
+  <text x="1276" y="222" fill="#22211f" font-size="28" font-weight="700">5 / Bounded</text>
   <text x="1276" y="258" fill="#22211f" font-size="28" font-weight="700">report</text>
-  <text x="1276" y="316" fill="#22211f" font-size="28">Content-addressed</text>
-  <text data-metric="pipeline.model_calls" x="1276" y="398" fill="#22211f" font-size="48" font-weight="700">0</text>
-  <text x="1276" y="438" fill="#22211f" font-size="28">model calls</text>
-  <text data-metric="pipeline.decision_authority" x="1276" y="500" fill="#22211f" font-size="34" font-weight="700">false</text>
-  <text x="1276" y="538" fill="#22211f" font-size="28">decision authority</text>
+  <text data-metric="pipeline.headline_count" x="1276" y="342" fill="#22211f" font-size="52" font-weight="700">3</text>
+  <text x="1276" y="384" fill="#22211f" font-size="28">report headlines</text>
+  <text data-metric="pipeline.model_calls" x="1276" y="456" fill="#22211f" font-size="42" font-weight="700">0</text>
+  <text x="1276" y="494" fill="#22211f" font-size="28">model calls</text>
+  <text data-metric="pipeline.decision_authority" x="1276" y="542" fill="#22211f" font-size="32" font-weight="700">false</text>
+  <text x="1370" y="542" fill="#22211f" font-size="28">authority</text>
 
-  <line x1="60" y1="624" x2="1540" y2="624" stroke="#c7c0b4" stroke-width="3"/>
-  <text x="60" y="684" fill="#22211f" font-size="30" font-weight="700">Authenticated ledger; content-addressed report</text>
-  <text x="60" y="730" fill="#22211f" font-size="28">The report describes admitted evidence. It does not prove task efficacy or producer truth.</text>
-  <text x="60" y="774" fill="#22211f" font-size="28">Provider-free observation; no runtime decision authority.</text>
+  <line x1="60" y1="638" x2="1540" y2="638" stroke="#c7c0b4" stroke-width="3"/>
+  <text x="60" y="696" fill="#22211f" font-size="30" font-weight="700">Observation only: no action control, memory edit, reminder, or provider call.</text>
+  <text x="60" y="744" fill="#22211f" font-size="28">Provider identity is same-user untrusted; local receipt order is not provider causal order.</text>
+  <text x="60" y="790" fill="#22211f" font-size="28">HMAC integrity is not encryption and does not detect rollback to an older valid store.</text>
 </svg>

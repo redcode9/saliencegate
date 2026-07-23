@@ -548,6 +548,7 @@ test("launcher invocation keeps metacharacters in data and never enables a shell
   assert.equal(posix.file, "/tmp/project & $(touch nope)/capture-hook");
   assert.deepEqual(posix.arguments, []);
   assert.equal(posix.options.shell, false);
+  assert.equal(posix.options.windowsVerbatimArguments, undefined);
   assert.equal(posix.options.env.SAFE_MARKER, "preserved");
   assert.equal(
     Object.keys(posix.options.env).some((key) =>
@@ -575,7 +576,13 @@ test("launcher invocation keeps metacharacters in data and never enables a shell
     },
   });
   assert.equal(windows.file, "C:\\Windows\\System32\\cmd.exe");
-  assert.deepEqual(windows.arguments, ["/d", "/v:off", "/s", "/c", '"%SALIENCEGATE_LAUNCHER%"']);
+  assert.deepEqual(windows.arguments, [
+    "/d",
+    "/v:off",
+    "/s",
+    "/c",
+    '""%SALIENCEGATE_LAUNCHER%""',
+  ]);
   assert.equal(windows.options.env.SALIENCEGATE_LAUNCHER, "C:\\State & harmless\\capture-hook.cmd");
   assert.equal("saliencegate_launcher" in windows.options.env, false);
   assert.equal(
@@ -583,4 +590,5 @@ test("launcher invocation keeps metacharacters in data and never enables a shell
     false,
   );
   assert.equal(windows.options.shell, false);
+  assert.equal(windows.options.windowsVerbatimArguments, true);
 });

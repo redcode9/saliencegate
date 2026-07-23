@@ -18,10 +18,11 @@ Long-option abbreviations are disabled. `--help` and `--version` exit successful
 
 ## Output and exit contract
 
-Successful commands write only to standard output. With `--json`, the output is one compact,
-canonical UTF-8 JSON object followed by a newline. Errors remain value-free text on standard
-error, even when `--json` was requested; paths, payloads, endpoints, and exception details are
-not echoed.
+Successful command summaries write only to standard output; explicit artifact destinations and
+the documented capture lifecycle may also mutate their bounded local files. With `--json`, stdout
+is one compact, canonical UTF-8 JSON object followed by a newline. Errors remain value-free text on
+standard error, even when `--json` was requested; paths, payloads, endpoints, and exception details
+are not echoed.
 
 `doctor` is the one command that writes its structured report before returning a non-zero health
 status. A reader closing a pipe early is treated as success. A keyboard interruption returns
@@ -36,6 +37,181 @@ status. A reader closing a pipe early is treated as success. A keyboard interrup
 | `5` | Corrupt artifact, digest mismatch, or unmet evidence requirement |
 | `70` | Unexpected internal error, reported without input values |
 | `130` | Keyboard interruption |
+
+Capture commands use the same table with these fixed categories: invalid command input exits 2;
+an unsafe or unusable local configuration exits 3; a missing installed integration exits 4; and an
+authenticated-store, spool, receipt, journal, or managed-file integrity failure exits 5. Capture
+errors never echo project paths, provider-native identifiers, input values, or exception details.
+
+## Passive capture lifecycle
+
+Universal Shadow Capture is project-bound and local. The supported provider aliases are exactly
+`codex`, `claude-code`, `opencode`, and `pi`. `connect`, `disconnect`, and `status` accept an
+explicit `--project`; otherwise they use the current directory. `sessions`, `report`, and
+`feedback` always use the current directory as the project boundary. None of these commands calls a
+model, reads a transcript, or gains decision authority.
+
+The intended operator sequence is:
+
+1. inspect `connect PROVIDER --dry-run` and the provider-specific managed files;
+2. keep the provider's ordinary project trust enabled, then run `connect PROVIDER`;
+3. run one provider session and distinguish installation from observation with `status`;
+4. select a short SalienceGate session identifier with `sessions` and inspect it with `report`;
+5. run `disconnect PROVIDER` to stop admission while retaining existing evidence;
+6. use `delete` only when the retained local records are no longer required.
+
+The complete provider paths, selected callbacks, version policy, exclusions, and recovery rules are
+in the [integration contract](integrations.md).
+
+## `connect`
+
+Artifact-compatible after installation:
+
+```text
+saliencegate connect codex|claude-code|opencode|pi
+  [--project PATH]
+  [--dry-run]
+  [--json]
+```
+
+`connect` plans or installs one authenticated project-local integration. A dry-run validates the
+requested project, provider contract, collision rules, and managed-file plan, but it does not
+create the installation key, capture store, receipt, launcher, or provider configuration. A normal
+connect probes the live Codex or Claude Code version, preflights the provider side, registers a
+pending local connection, publishes the managed integration, and enables admission last. OpenCode
+and Pi use exact pinned versions in their sealed connector specifications rather than launching the
+host during connect.
+
+The operation preserves unrelated configuration and fails closed on malformed selected config,
+ownership ambiguity, an unsafe path, unexpected managed-file drift, an unsupported host version,
+or provider policy that disables the selected hook surface. Repeating the same valid connection is
+idempotent. A supported patch-version change creates an authenticated connection generation rather
+than silently treating it as the audited baseline.
+
+Human output reports the provider, install disposition, whether capture is enabled, and the
+read-only Git review result for every managed project file. It distinguishes an absent Git work
+tree, an unavailable probe, files ignored by repository rules, files Git would surface, and files
+already tracked. JSON is one canonical `capture-connect/v1` record with the same bounded result and
+counts. Neither mode changes `.gitignore` or includes a project path, command, identifier, or
+digest.
+
+## `disconnect`
+
+Artifact-compatible after installation:
+
+```text
+saliencegate disconnect codex|claude-code|opencode|pi
+  [--project PATH]
+  [--json]
+```
+
+`disconnect` disables admission, drains the authenticated spool, reverses only the owned provider
+configuration or bridge files, and marks the matching local connections disabled. It restores an
+otherwise unchanged Codex or Claude Code config and removes the owned OpenCode or Pi bundle and
+bootstrap. Receipt and journal bindings prevent an unrelated look-alike file from being removed.
+Drift or ambiguous ownership fails closed for manual inspection.
+
+Disconnect is the connector uninstall operation; it deliberately retains the installation key,
+SQLite observations, spool boundary, disabled connection receipts, session records, feedback, and
+deletion tombstones. It does not imply data deletion. JSON uses `capture-disconnect/v1`.
+
+## `status`
+
+Artifact-compatible after installation:
+
+```text
+saliencegate status [codex|claude-code|opencode|pi]
+  [--project PATH]
+  [--json]
+```
+
+Without a provider argument, `status` returns all four profiles. It drains an available spool,
+authenticates the project connection and managed installation, and reports one of
+`not_installed`, `installed_not_observed`, `active_observed`, `degraded`, or `drifted`. The
+`installed` enum value is reserved for a future host-attested state and is not emitted by v1.
+Installation alone is not observation: `installed_not_observed` remains explicit until a lifecycle
+callback is actually admitted.
+
+For each provider, the result includes connector availability, connection state, session and
+quarantine counts, queued and dropped spool-event counts, the oldest short SalienceGate session
+identifier, total local capture bytes, and closed drift codes. It reports neither storage paths nor
+provider-native identifiers. JSON uses `capture-status/v1` with four bounded
+`capture-provider-status/v1` records when no provider is selected.
+
+## `sessions`
+
+Artifact-compatible after installation:
+
+```text
+saliencegate sessions
+  [--provider codex|claude-code|opencode|pi]
+  [--state open|closed|quarantined]
+  [--limit 1..100]
+  [--json]
+```
+
+`sessions` drains capture state and lists only sessions bound to the current project. The default
+limit is 20. Each item exposes a short SalienceGate session identifier, provider, state, bounded
+event count, coverage-degraded flag, and local observation times. It never exposes the
+provider-native session identifier. No configured store is a successful empty list; corrupted or
+unusable existing state fails. JSON uses `capture-sessions/v1` and
+`capture-session-list-item/v1`.
+
+## `report`
+
+Artifact-compatible after installation:
+
+```text
+saliencegate report (--latest | SESSION_ID)
+  [--output PATH]
+  [--replace]
+  [--json]
+```
+
+`report` selects one current-project session, verifies the authenticated snapshot, drains the
+matching spool boundary, normalizes only admitted structured records, and evaluates the installed
+capability matrix. `--latest` selects the latest session for the current project; an explicit short
+identifier must belong to that project. The complete report is canonical
+`capture-session-report/v1` JSON. Human output is content-free and includes the same headline,
+support, denominators, exclusions, limits, and fixed authority declarations.
+
+The headline vocabulary is closed:
+
+| Headline | Exact boundary |
+|---|---|
+| `memory_review_suggested` | At least one supported deterministic signal was observed and no quarantine or integrity failure blocks the positive conclusion. |
+| `no_current_evidence` | The session is closed, the spool is authenticated and cleanly drained, an applicable detector met its absence minimum, no signal was observed, and no report limit remains. |
+| `insufficient_evidence` | No supported signal was detected and an explicit limit blocks the negative conclusion, or quarantine/integrity failure blocks a positive signal; limits include open or quarantined state, gaps, drops, unavailable or pending spool, no applicable detector, insufficient applicable evidence, and unverified compatibility. |
+
+All three remain `descriptive_observational`, `confirmatory=false`, `decision_authority=false`, and
+`model_calls=0`. A positive headline is not an instruction; a negative headline is not proof that
+memory was unnecessary.
+
+`--output` atomically publishes an owner-private canonical file in an already controlled parent.
+Existing output is preserved unless `--replace` is present, and replacement requires a valid report
+for the same session. `--replace` without `--output` is invalid. The canonical report is bounded to
+4 MiB at the command publication boundary.
+
+## `delete`
+
+Artifact-compatible after installation:
+
+```text
+saliencegate delete SESSION_ID [--json]
+saliencegate delete --all --project PATH --confirm [--json]
+```
+
+The first form deletes one current-project session, including its captured events and feedback, and
+retains a content-free authenticated tombstone so the same request is retry-safe. The second form
+deletes every capture connection, session, feedback row, health row, transport receipt, and
+tombstone for exactly one explicitly named project. Every provider connection for that project must
+first be disabled with `disconnect`; otherwise the command exits 3 with the bounded recovery
+instruction.
+
+Both forms enable SQLite secure-delete, drain under spool maintenance, checkpoint and truncate the
+WAL, and return one `capture-delete/v1` receipt. This is application-level deletion, not a guarantee
+that backups, filesystem snapshots, storage-device remanence, or previously exported reports were
+erased. Deletion never removes another project's records or the installation key.
 
 ## `feedback`
 
@@ -73,6 +249,7 @@ saliencegate doctor \
   [--repository PATH_OR_:memory:] \
   [--key ABSOLUTE_PATH] \
   [--endpoint HTTP_BASE_URL] \
+  [--capture] \
   [--json]
 ```
 
@@ -96,6 +273,12 @@ produces an optional `skip` result. `doctor` does not create a repository or key
 
 JSON uses `doctor/v1`, containing `status`, `ok`, and six `doctor-check/v1` records. A required
 Python, SQLite, or FTS5 failure exits 4; another required failure exits 3.
+
+`--capture` adds one strictly read-only project capture check. It does not open mutable SQLite or
+spool handles, create a key, launch a provider, install a connector, or drain events. The added
+check reports `not_configured` as an optional skip, `ready` after the store, spool, installation,
+and managed files pass their read-only integrity checks, or `degraded` as a required failure. JSON
+uses the enclosing `capture-doctor/v1` report.
 
 ## `demo`
 

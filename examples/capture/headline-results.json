@@ -1,0 +1,240 @@
+{
+  "schema_version": "capture-headline-examples/v1",
+  "profile_id": "opencode-plugin/v1",
+  "host_version": "1.18.3",
+  "provenance": "fully_synthetic_no_provider_or_model_call",
+  "report_invariants": {
+    "evidence_level": "descriptive_observational",
+    "model_calls": 0,
+    "decision_authority": false,
+    "confirmatory": false
+  },
+  "cases": [
+    {
+      "id": "memory-review-suggested",
+      "native_session_id": "synthetic-repeated-session",
+      "summary": "Repeated exact action plus two structured tool failures",
+      "events": [
+        {
+          "kind": "tool_started",
+          "session_id": "synthetic-repeated-session",
+          "event_id": "repeated-start-1",
+          "call_id": "repeated-call-1",
+          "tool": "read",
+          "input": {
+            "path": "synthetic-public-example.txt"
+          },
+          "identity_authority": "exact"
+        },
+        {
+          "kind": "tool_finished",
+          "session_id": "synthetic-repeated-session",
+          "event_id": "repeated-finish-1",
+          "call_id": "repeated-call-1",
+          "outcome": "failed"
+        },
+        {
+          "kind": "tool_started",
+          "session_id": "synthetic-repeated-session",
+          "event_id": "repeated-start-2",
+          "call_id": "repeated-call-2",
+          "tool": "read",
+          "input": {
+            "path": "synthetic-public-example.txt"
+          },
+          "identity_authority": "exact"
+        },
+        {
+          "kind": "tool_finished",
+          "session_id": "synthetic-repeated-session",
+          "event_id": "repeated-finish-2",
+          "call_id": "repeated-call-2",
+          "outcome": "failed"
+        },
+        {
+          "kind": "session_finished",
+          "session_id": "synthetic-repeated-session",
+          "event_id": "repeated-close"
+        }
+      ],
+      "expected": {
+        "headline": "memory_review_suggested",
+        "shadow_disposition": "flagged",
+        "session_state": "closed",
+        "counts": {
+          "captured_events": 6,
+          "projected_events": 6,
+          "action_identities": 2,
+          "structured_results": 2,
+          "detected_signals": 3,
+          "ignored_records": 0
+        },
+        "coverage": {
+          "coverage_degraded": false,
+          "limits": []
+        },
+        "detectors": {
+          "tool_error": {
+            "support": "supported",
+            "disposition": "flagged",
+            "detected_count": 2
+          },
+          "repeated_action": {
+            "support": "conditional",
+            "disposition": "flagged",
+            "detected_count": 1
+          },
+          "repeated_failure": {
+            "support": "unsupported",
+            "disposition": "not_applicable",
+            "detected_count": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "no-current-evidence",
+      "native_session_id": "synthetic-clean-session",
+      "summary": "Closed clean window with two distinct successful actions",
+      "events": [
+        {
+          "kind": "tool_started",
+          "session_id": "synthetic-clean-session",
+          "event_id": "clean-start-1",
+          "call_id": "clean-call-1",
+          "tool": "read",
+          "input": {
+            "path": "synthetic-public-alpha.txt"
+          },
+          "identity_authority": "exact"
+        },
+        {
+          "kind": "tool_finished",
+          "session_id": "synthetic-clean-session",
+          "event_id": "clean-finish-1",
+          "call_id": "clean-call-1",
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "tool_started",
+          "session_id": "synthetic-clean-session",
+          "event_id": "clean-start-2",
+          "call_id": "clean-call-2",
+          "tool": "read",
+          "input": {
+            "path": "synthetic-public-beta.txt"
+          },
+          "identity_authority": "exact"
+        },
+        {
+          "kind": "tool_finished",
+          "session_id": "synthetic-clean-session",
+          "event_id": "clean-finish-2",
+          "call_id": "clean-call-2",
+          "outcome": "succeeded"
+        },
+        {
+          "kind": "session_finished",
+          "session_id": "synthetic-clean-session",
+          "event_id": "clean-close"
+        }
+      ],
+      "expected": {
+        "headline": "no_current_evidence",
+        "shadow_disposition": "not_flagged",
+        "session_state": "closed",
+        "counts": {
+          "captured_events": 6,
+          "projected_events": 6,
+          "action_identities": 2,
+          "structured_results": 2,
+          "detected_signals": 0,
+          "ignored_records": 0
+        },
+        "coverage": {
+          "coverage_degraded": false,
+          "limits": []
+        },
+        "detectors": {
+          "tool_error": {
+            "support": "supported",
+            "disposition": "not_flagged",
+            "detected_count": 0
+          },
+          "repeated_action": {
+            "support": "conditional",
+            "disposition": "not_flagged",
+            "detected_count": 0
+          },
+          "repeated_failure": {
+            "support": "unsupported",
+            "disposition": "not_applicable",
+            "detected_count": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "insufficient-evidence",
+      "native_session_id": "synthetic-incomplete-session",
+      "summary": "Open window with one unresolved action and a transport gap",
+      "events": [
+        {
+          "kind": "tool_started",
+          "session_id": "synthetic-incomplete-session",
+          "event_id": "incomplete-start",
+          "call_id": "incomplete-call",
+          "tool": "read",
+          "input": {
+            "path": "synthetic-public-open.txt"
+          },
+          "identity_authority": "exact"
+        },
+        {
+          "kind": "coverage_degraded",
+          "session_id": "synthetic-incomplete-session",
+          "reason": "transport_gap"
+        }
+      ],
+      "expected": {
+        "headline": "insufficient_evidence",
+        "shadow_disposition": "indeterminate",
+        "session_state": "open",
+        "counts": {
+          "captured_events": 3,
+          "projected_events": 2,
+          "action_identities": 1,
+          "structured_results": 0,
+          "detected_signals": 0,
+          "ignored_records": 1
+        },
+        "coverage": {
+          "coverage_degraded": true,
+          "limits": [
+            "capture_degraded",
+            "detector_minimum_not_met",
+            "gap_detected",
+            "session_open"
+          ]
+        },
+        "detectors": {
+          "tool_error": {
+            "support": "supported",
+            "disposition": "indeterminate",
+            "detected_count": 0
+          },
+          "repeated_action": {
+            "support": "conditional",
+            "disposition": "indeterminate",
+            "detected_count": 0
+          },
+          "repeated_failure": {
+            "support": "unsupported",
+            "disposition": "not_applicable",
+            "detected_count": 0
+          }
+        }
+      }
+    }
+  ]
+}

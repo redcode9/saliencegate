@@ -732,13 +732,15 @@ test("shared launcher treats metacharacters as data and absorbs spawn errors", a
     "/v:off",
     "/s",
     "/c",
-    '"%SALIENCEGATE_LAUNCHER%"',
+    '""%SALIENCEGATE_LAUNCHER%""',
   ]);
   assert.equal(
     invocation.options.env.SALIENCEGATE_LAUNCHER,
     "C:\\State & Data\\saliencegate.cmd",
   );
   assert.equal(invocation.options.env.KEEP, "value");
+  assert.equal(invocation.options.shell, false);
+  assert.equal(invocation.options.windowsVerbatimArguments, true);
   assert.equal(
     Object.keys(invocation.options.env).some((key) =>
       [

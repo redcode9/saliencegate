@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import subprocess
+import tempfile
 from collections.abc import Mapping
 from io import BytesIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -2247,9 +2249,12 @@ def test_launcher_materialization_success_and_failure_edges(
         CaptureLauncherPlatform.POSIX
     ).is_absolute()
 
-    for invalid in (None, object(), tmp_path / "missing", project):
-        if invalid is None:
-            monkeypatch.setattr(launcher_materialization.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        launcher_materialization.sysconfig,
+        "get_path",
+        lambda _name: str(tmp_path / "missing-scripts"),
+    )
+    for invalid in (None, object(), tmp_path / "missing", project, Path("relative-hook")):
         with pytest.raises(Exception) as raised:
             launcher_materialization.materialize_provider_launcher(
                 spec,
@@ -2262,3 +2267,144 @@ def test_launcher_materialization_success_and_failure_edges(
     with pytest.raises(Exception) as raised:
         launcher_materialization._trusted_launcher_watchdog(CaptureLauncherPlatform.POSIX)
     assert raised.type.__name__ == "CaptureCommandUnavailableError"
+
+
+def test_launcher_materialization_ignores_hostile_cwd_and_path_for_default_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    spec = opencode.provider_installation_spec(
+        project,
+        environ={"HOME": str(tmp_path / "home"), "XDG_STATE_HOME": str(tmp_path / "state")},
+    )
+    trusted_scripts = tmp_path / "trusted scripts"
+    trusted_scripts.mkdir()
+    executable_name = (
+        "saliencegate-capture-hook.exe"
+        if launcher_materialization.os.name == "nt"
+        else "saliencegate-capture-hook"
+    )
+    trusted = trusted_scripts / executable_name
+    trusted.write_bytes(b"#!/bin/sh\nexit 0\n")
+    trusted.chmod(0o700)
+    hostile = project / executable_name
+    hostile.write_bytes(b"#!/bin/sh\nexit 99\n")
+    hostile.chmod(0o700)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("PATH", os.fspath(project))
+    monkeypatch.setattr(
+        launcher_materialization.sysconfig,
+        "get_path",
+        lambda name: str(trusted_scripts) if name == "scripts" else None,
+    )
+    monkeypatch.setattr(
+        launcher_materialization,
+        "_posix_executable_boundary_is_trusted",
+        lambda candidate: candidate == trusted.resolve(),
+    )
+    monkeypatch.setattr(
+        launcher_materialization,
+        "_windows_executable_boundary_is_trusted",
+        lambda candidate: candidate == trusted.resolve(),
+    )
+
+    materialized = launcher_materialization.materialize_provider_launcher(spec, KEY)
+    rendered = materialized.launcher_bytes.decode("utf-8")
+
+    assert str(trusted.resolve()) in rendered
+    assert str(hostile.resolve()) not in rendered
+
+
+def test_interpreter_hook_boundary_uses_exact_windows_console_script_name(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    scripts = tmp_path / "Scripts"
+    project.mkdir()
+    scripts.mkdir()
+    command_wrapper = scripts / "saliencegate-capture-hook.cmd"
+    command_wrapper.write_bytes(b"synthetic wrapper")
+
+    with pytest.raises(Exception) as raised:
+        launcher_materialization._interpreter_capture_executable(
+            project_root=project,
+            scripts_directory=scripts,
+            native_windows=True,
+            candidate_is_trusted=lambda _candidate: True,
+        )
+    assert raised.type.__name__ == "CaptureCommandUnavailableError"
+
+    executable = scripts / "saliencegate-capture-hook.exe"
+    executable.write_bytes(b"synthetic executable")
+
+    assert (
+        launcher_materialization._interpreter_capture_executable(
+            project_root=project,
+            scripts_directory=scripts,
+            native_windows=True,
+            candidate_is_trusted=lambda _candidate: True,
+        )
+        == executable.resolve()
+    )
+
+
+def test_interpreter_hook_boundary_rejects_project_local_virtual_environment(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    scripts = project / ".venv" / "bin"
+    scripts.mkdir(parents=True)
+    executable = scripts / "saliencegate-capture-hook"
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    observed: list[Path] = []
+
+    with pytest.raises(Exception) as raised:
+        launcher_materialization._interpreter_capture_executable(
+            project_root=project,
+            scripts_directory=scripts,
+            native_windows=False,
+            candidate_is_trusted=lambda candidate: observed.append(candidate) is None,
+        )
+
+    assert raised.type.__name__ == "CaptureCommandUnavailableError"
+    assert observed == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership and mode boundary")
+def test_interpreter_hook_boundary_rejects_world_writable_ancestry(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    with tempfile.TemporaryDirectory(prefix="saliencegate-hostile-hook-", dir="/tmp") as raw:
+        scripts = Path(raw)
+        executable = scripts / "saliencegate-capture-hook"
+        executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
+
+        with pytest.raises(Exception) as raised:
+            launcher_materialization._interpreter_capture_executable(
+                project_root=project,
+                scripts_directory=scripts,
+                native_windows=False,
+            )
+
+    assert raised.type.__name__ == "CaptureCommandUnavailableError"
+
+
+def test_explicit_windows_capture_executable_preserves_com_support(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "capture-hook.com"
+    executable.write_bytes(b"synthetic executable")
+
+    assert (
+        launcher_materialization._explicit_capture_executable(
+            executable,
+            native_windows=True,
+        )
+        == executable.resolve()
+    )

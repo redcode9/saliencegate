@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" width="100%" role="img" aria-labelledby="capture-headlines-title capture-headlines-desc" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+  <title id="capture-headlines-title">Three synthetic OpenCode capture report headlines</title>
+  <desc id="capture-headlines-desc">Synthetic replay produces Memory review suggested, No current evidence, or Insufficient evidence while preserving zero model calls and no decision authority.</desc>
+  <rect data-surface="true" x="0" y="0" width="1600" height="1000" fill="#f6f1e8"/>
+  <text x="60" y="72" fill="#22211f" font-size="52" font-weight="700">Three bounded capture headlines</text>
+  <text x="60" y="118" fill="#22211f" font-size="30">Fully synthetic OpenCode contract replay; not a real-world efficacy result</text>
+  <rect data-surface="true" x="60" y="165" width="460" height="610" rx="14" fill="#dce9e9" stroke="#315f6f" stroke-width="4"/>
+  <rect data-series="memory-review-suggested" aria-label="Memory review suggested headline lane" x="60" y="165" width="460" height="14" rx="7" fill="#315f6f"/>
+  <text x="90" y="226" fill="#22211f" font-size="28" font-weight="700">Memory review suggested</text>
+  <text data-metric="memory-review-suggested.headline" x="90" y="270" fill="#22211f" font-size="28" font-weight="700">memory_review_suggested</text>
+  <text data-summary="memory-review-suggested" data-estimated-width="327" x="90" y="320" fill="#22211f" font-size="28">Repeated exact action</text>
+  <text data-summary="memory-review-suggested" data-estimated-width="354" x="90" y="356" fill="#22211f" font-size="28">plus two structured tool</text>
+  <text data-summary="memory-review-suggested" data-estimated-width="116" x="90" y="392" fill="#22211f" font-size="28">failures</text>
+  <text x="90" y="432" fill="#22211f" font-size="28">actions</text>
+  <text data-metric="memory-review-suggested.action_identities" x="90" y="470" fill="#22211f" font-size="40" font-weight="700">2</text>
+  <text x="234" y="432" fill="#22211f" font-size="28">results</text>
+  <text data-metric="memory-review-suggested.structured_results" x="234" y="470" fill="#22211f" font-size="40" font-weight="700">2</text>
+  <text x="378" y="432" fill="#22211f" font-size="28">signals</text>
+  <text data-metric="memory-review-suggested.detected_signals" x="378" y="470" fill="#22211f" font-size="40" font-weight="700">3</text>
+  <line x1="90" y1="492" x2="490" y2="492" stroke="#c7c0b4" stroke-width="3"/>
+  <text x="90" y="536" fill="#22211f" font-size="28">repeated_action</text>
+  <text data-metric="memory-review-suggested.repeated_action.detected" x="450" y="536" fill="#22211f" font-size="28" font-weight="700">1</text>
+  <text x="90" y="578" fill="#22211f" font-size="28">tool_error</text>
+  <text data-metric="memory-review-suggested.tool_error.detected" x="450" y="578" fill="#22211f" font-size="28" font-weight="700">2</text>
+  <text x="90" y="620" fill="#22211f" font-size="28">repeated_failure</text>
+  <text data-metric="memory-review-suggested.repeated_failure.support" x="90" y="654" fill="#22211f" font-size="28" font-weight="700">unsupported</text>
+  <text x="90" y="700" fill="#22211f" font-size="28">coverage degraded</text>
+  <text data-metric="memory-review-suggested.coverage_degraded" x="395" y="700" fill="#22211f" font-size="28" font-weight="700">false</text>
+  <text x="90" y="744" fill="#22211f" font-size="28">report limits</text>
+  <text data-metric="memory-review-suggested.limit_count" x="450" y="744" fill="#22211f" font-size="28" font-weight="700">0</text>
+  <rect data-surface="true" x="570" y="165" width="460" height="610" rx="14" fill="#ffffff" stroke="#315f6f" stroke-width="4"/>
+  <rect data-series="no-current-evidence" aria-label="No current evidence headline lane" x="570" y="165" width="460" height="14" rx="7" fill="#315f6f"/>
+  <text x="600" y="226" fill="#22211f" font-size="28" font-weight="700">No current evidence</text>
+  <text data-metric="no-current-evidence.headline" x="600" y="270" fill="#22211f" font-size="28" font-weight="700">no_current_evidence</text>
+  <text data-summary="no-current-evidence" data-estimated-width="312" x="600" y="320" fill="#22211f" font-size="28">Closed clean window</text>
+  <text data-summary="no-current-evidence" data-estimated-width="254" x="600" y="356" fill="#22211f" font-size="28">with two distinct</text>
+  <text data-summary="no-current-evidence" data-estimated-width="279" x="600" y="392" fill="#22211f" font-size="28">successful actions</text>
+  <text x="600" y="432" fill="#22211f" font-size="28">actions</text>
+  <text data-metric="no-current-evidence.action_identities" x="600" y="470" fill="#22211f" font-size="40" font-weight="700">2</text>
+  <text x="744" y="432" fill="#22211f" font-size="28">results</text>
+  <text data-metric="no-current-evidence.structured_results" x="744" y="470" fill="#22211f" font-size="40" font-weight="700">2</text>
+  <text x="888" y="432" fill="#22211f" font-size="28">signals</text>
+  <text data-metric="no-current-evidence.detected_signals" x="888" y="470" fill="#22211f" font-size="40" font-weight="700">0</text>
+  <line x1="600" y1="492" x2="1000" y2="492" stroke="#c7c0b4" stroke-width="3"/>
+  <text x="600" y="536" fill="#22211f" font-size="28">repeated_action</text>
+  <text data-metric="no-current-evidence.repeated_action.detected" x="960" y="536" fill="#22211f" font-size="28" font-weight="700">0</text>
+  <text x="600" y="578" fill="#22211f" font-size="28">tool_error</text>
+  <text data-metric="no-current-evidence.tool_error.detected" x="960" y="578" fill="#22211f" font-size="28" font-weight="700">0</text>
+  <text x="600" y="620" fill="#22211f" font-size="28">repeated_failure</text>
+  <text data-metric="no-current-evidence.repeated_failure.support" x="600" y="654" fill="#22211f" font-size="28" font-weight="700">unsupported</text>
+  <text x="600" y="700" fill="#22211f" font-size="28">coverage degraded</text>
+  <text data-metric="no-current-evidence.coverage_degraded" x="905" y="700" fill="#22211f" font-size="28" font-weight="700">false</text>
+  <text x="600" y="744" fill="#22211f" font-size="28">report limits</text>
+  <text data-metric="no-current-evidence.limit_count" x="960" y="744" fill="#22211f" font-size="28" font-weight="700">0</text>
+  <rect data-surface="true" x="1080" y="165" width="460" height="610" rx="14" fill="#f1e0c6" stroke="#9b5c13" stroke-width="4"/>
+  <rect data-series="insufficient-evidence" aria-label="Insufficient evidence headline lane" x="1080" y="165" width="460" height="14" rx="7" fill="#9b5c13"/>
+  <text x="1110" y="226" fill="#22211f" font-size="28" font-weight="700">Insufficient evidence</text>
+  <text data-metric="insufficient-evidence.headline" x="1110" y="270" fill="#22211f" font-size="28" font-weight="700">insufficient_evidence</text>
+  <text data-summary="insufficient-evidence" data-estimated-width="329" x="1110" y="320" fill="#22211f" font-size="28">Open window with one</text>
+  <text data-summary="insufficient-evidence" data-estimated-width="350" x="1110" y="356" fill="#22211f" font-size="28">unresolved action and a</text>
+  <text data-summary="insufficient-evidence" data-estimated-width="194" x="1110" y="392" fill="#22211f" font-size="28">transport gap</text>
+  <text x="1110" y="432" fill="#22211f" font-size="28">actions</text>
+  <text data-metric="insufficient-evidence.action_identities" x="1110" y="470" fill="#22211f" font-size="40" font-weight="700">1</text>
+  <text x="1254" y="432" fill="#22211f" font-size="28">results</text>
+  <text data-metric="insufficient-evidence.structured_results" x="1254" y="470" fill="#22211f" font-size="40" font-weight="700">0</text>
+  <text x="1398" y="432" fill="#22211f" font-size="28">signals</text>
+  <text data-metric="insufficient-evidence.detected_signals" x="1398" y="470" fill="#22211f" font-size="40" font-weight="700">0</text>
+  <line x1="1110" y1="492" x2="1510" y2="492" stroke="#c7c0b4" stroke-width="3"/>
+  <text x="1110" y="536" fill="#22211f" font-size="28">repeated_action</text>
+  <text data-metric="insufficient-evidence.repeated_action.detected" x="1470" y="536" fill="#22211f" font-size="28" font-weight="700">0</text>
+  <text x="1110" y="578" fill="#22211f" font-size="28">tool_error</text>
+  <text data-metric="insufficient-evidence.tool_error.detected" x="1470" y="578" fill="#22211f" font-size="28" font-weight="700">0</text>
+  <text x="1110" y="620" fill="#22211f" font-size="28">repeated_failure</text>
+  <text data-metric="insufficient-evidence.repeated_failure.support" x="1110" y="654" fill="#22211f" font-size="28" font-weight="700">unsupported</text>
+  <text x="1110" y="700" fill="#22211f" font-size="28">coverage degraded</text>
+  <text data-metric="insufficient-evidence.coverage_degraded" x="1415" y="700" fill="#22211f" font-size="28" font-weight="700">true</text>
+  <text x="1110" y="744" fill="#22211f" font-size="28">report limits</text>
+  <text data-metric="insufficient-evidence.limit_count" x="1470" y="744" fill="#22211f" font-size="28" font-weight="700">4</text>
+  <rect data-surface="true" x="60" y="810" width="1480" height="140" rx="12" fill="#ffffff"/>
+  <text x="100" y="858" fill="#22211f" font-size="28">model calls</text>
+  <text data-metric="examples.model_calls" x="100" y="910" fill="#22211f" font-size="40" font-weight="700">0</text>
+  <text x="520" y="858" fill="#22211f" font-size="28">decision authority</text>
+  <text data-metric="examples.decision_authority" x="520" y="910" fill="#22211f" font-size="40" font-weight="700">false</text>
+  <text x="960" y="858" fill="#22211f" font-size="28">confirmatory</text>
+  <text data-metric="examples.confirmatory" x="960" y="910" fill="#22211f" font-size="40" font-weight="700">false</text>
+  <text x="1160" y="858" fill="#22211f" font-size="28">evidence</text>
+  <text data-metric="examples.evidence_level" x="1160" y="910" fill="#22211f" font-size="28" font-weight="700">descriptive_observational</text>
+</svg>

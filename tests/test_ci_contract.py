@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import io
+import json
+import os
 import re
 import subprocess
 import sys
@@ -8,8 +11,10 @@ import tarfile
 import textwrap
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import scripts.smoke_capture_installed as capture_smoke
 import scripts.smoke_shadow_installed as shadow_smoke
 import scripts.verify_built_artifacts as artifact_verifier
 import scripts.verify_connector_artifacts as connector_artifact_verifier
@@ -34,6 +39,8 @@ MODEL_RUNTIME_SMOKE = ROOT / "scripts" / "smoke_model_runtime.py"
 LAUNCH_CONTRACT_SMOKE = ROOT / "scripts" / "smoke_launch_contracts.py"
 PACKAGE_IMPORT_SMOKE = ROOT / "scripts" / "smoke_package_imports.py"
 SHADOW_INSTALLED_SMOKE = ROOT / "scripts" / "smoke_shadow_installed.py"
+CAPTURE_INSTALLED_SMOKE = ROOT / "scripts" / "smoke_capture_installed.py"
+ARTIFACT_SOCKET_GUARD = ROOT / "scripts" / "artifact_socket_guard.py"
 SHADOW_TRACE_BENCHMARK = ROOT / "scripts" / "benchmark_shadow_trace.py"
 ARTIFACT_VERIFIER = ROOT / "scripts" / "verify_built_artifacts.py"
 CONNECTOR_ARTIFACT_VERIFIER = ROOT / "scripts" / "verify_connector_artifacts.py"
@@ -132,16 +139,393 @@ def test_artifact_environment_projection_never_reads_provider_credentials() -> N
     ) == {"PATH": "/synthetic/bin"}
     assert connector_environment.read_keys == ["PATH"]
 
+    capture_environment = _UnreadableProviderEnvironment()
+    projected = capture_smoke._subprocess_environment(capture_environment)
+    assert projected["PATH"] == "/synthetic/bin"
+    assert projected["SALIENCEGATE_ARTIFACT_SOCKET_DENIAL"] == "1"
+    assert all(
+        projected[key] == capture_smoke._POISONED_CREDENTIAL for key in PROVIDER_CREDENTIAL_KEYS
+    )
+    assert capture_environment.read_keys == ["PATH"]
+
+
+def test_artifact_startup_guard_rejects_provider_credential_keys(tmp_path: Path) -> None:
+    startup_log = tmp_path / "artifact-startups.log"
+    site_packages = tmp_path / "site-packages"
+    site_packages.mkdir()
+    (site_packages / "saliencegate_artifact_socket_guard.py").write_bytes(
+        ARTIFACT_SOCKET_GUARD.read_bytes()
+    )
+    (site_packages / "saliencegate_artifact_socket_guard.pth").write_bytes(
+        b"import saliencegate_artifact_socket_guard\n"
+    )
+    environment = artifact_verifier._environment_without_provider_credentials(os.environ)
+    environment.update(
+        {
+            "SALIENCEGATE_ARTIFACT_SOCKET_DENIAL": "1",
+            "SALIENCEGATE_ARTIFACT_SOCKET_STARTUP_LOG": str(startup_log),
+        }
+    )
+    command = (
+        sys.executable,
+        "-I",
+        "-S",
+        "-c",
+        "import site,sys; site.addsitedir(sys.argv[1]); print('artifact-pth-continued')",
+        str(site_packages),
+    )
+
+    for credential_key in PROVIDER_CREDENTIAL_KEYS:
+        sentinel = f"credential-value-sentinel-{credential_key}".encode()
+        poisoned_environment = {**environment, credential_key.swapcase(): sentinel.decode()}
+        rejected = subprocess.run(
+            command,
+            env=poisoned_environment,
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+        assert rejected.returncode != 0
+        assert b"artifact-pth-continued" not in rejected.stdout + rejected.stderr
+        assert b"retained provider credentials" in rejected.stderr
+        assert sentinel not in rejected.stdout + rejected.stderr
+        assert not startup_log.exists()
+
+    accepted = subprocess.run(
+        command,
+        env=environment,
+        check=False,
+        capture_output=True,
+        timeout=10,
+    )
+    assert accepted.returncode == 0
+    assert accepted.stdout == b"artifact-pth-continued\n"
+    assert accepted.stderr == b""
+    assert startup_log.read_bytes() == b"installed-artifact-socket-denial-active\n"
+
+
+def test_artifact_guard_canary_receives_a_scrubbed_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    observed: list[dict[str, str]] = []
+
+    def fake_run(command: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        observed.append(environment)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=b"installed-artifact-child-network-and-credential-denial-ok\n",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(artifact_verifier, "_run", fake_run)
+    source_environment = {
+        "PATH": "/synthetic/bin",
+        "SALIENCEGATE_ARTIFACT_SOCKET_DENIAL": "1",
+        "SALIENCEGATE_ARTIFACT_SOCKET_STARTUP_LOG": str(tmp_path / "startups.log"),
+        **{key.swapcase(): "credential-value-must-not-be-read" for key in PROVIDER_CREDENTIAL_KEYS},
+    }
+
+    artifact_verifier._prove_artifact_socket_guard(
+        python=tmp_path / "python",
+        cwd=tmp_path,
+        environment=source_environment,
+    )
+
+    assert len(observed) == 1
+    assert observed[0]["PATH"] == "/synthetic/bin"
+    assert observed[0]["SALIENCEGATE_ARTIFACT_SOCKET_DENIAL"] == "1"
+    assert all(key.upper() not in PROVIDER_CREDENTIAL_KEYS for key in observed[0])
+
+
+def test_artifact_failure_diagnostics_redact_all_controlled_capture_sentinels() -> None:
+    sentinels = (
+        artifact_verifier._POISONED_PROVIDER_CREDENTIAL,
+        *artifact_verifier._CONTROLLED_CAPTURE_SENTINELS,
+    )
+    diagnostic = artifact_verifier._diagnostic_excerpt(("visible " + " ".join(sentinels)).encode())
+
+    assert diagnostic.startswith("visible ")
+    assert diagnostic.count("<redacted>") == len(sentinels)
+    assert all(sentinel not in diagnostic for sentinel in sentinels)
+
+
+@pytest.mark.parametrize(
+    "sentinel",
+    (
+        artifact_verifier._POISONED_PROVIDER_CREDENTIAL,
+        artifact_verifier._CONTROLLED_CAPTURE_SENTINELS[0],
+    ),
+)
+def test_capture_quickstart_rejects_sensitive_data_in_successful_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    sentinel: str,
+) -> None:
+    monkeypatch.setattr(
+        artifact_verifier,
+        "_run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            (),
+            0,
+            stdout=f"status {sentinel}\n".encode(),
+            stderr=b"",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="exposed sensitive native data") as raised:
+        artifact_verifier._run_capture_cli(
+            label="wheel",
+            python=tmp_path / "python",
+            guard=tmp_path / "guard.py",
+            saliencegate=tmp_path / "saliencegate",
+            arguments=("status",),
+            cwd=tmp_path,
+            environment={},
+        )
+
+    assert sentinel not in str(raised.value)
+
+
+def test_installed_capture_artifact_proof_has_the_closed_provider_matrix() -> None:
+    source = CAPTURE_INSTALLED_SMOKE.read_text(encoding="utf-8")
+    assert "sys.flags.isolated != 1" in source
+    assert 'os.environ.get("PYTHONPATH", "")' in source
+    assert "socket.AF_INET" in source
+    assert "did not import the installed package" in source
+    assert "runtime unexpectedly exposes Node or npm" in source
+    assert "probe_host=True" in inspect.getsource(capture_smoke._exercise_provider)
+    assert "probe_host=True" in inspect.getsource(capture_smoke._emit_codex_fixture)
+    assert "_UnreadableCredentialEnvironment" in source
+    assert "capture-session-report/v1" in source
+    assert "capture artifact report evidence is invalid" in source
+    assert "hmac_sha256_local_mutation_detection" in source
+    assert "report-after-disconnect.json" in source
+    assert "persisted a raw sentinel" in source
+    assert '"installed-e2e"' in source
+    assert "capture-installed-connectors-e2e-ok" in source
+    assert "capture-installed-bridge-callbacks-ok" in source
+    assert 'import { fileURLToPath } from "node:url";' in source
+    assert "fileURLToPath(imported.saliencegateBootstrap)" in source
+    assert "fileURLToPath(bootstrapHref)" in source
+    assert "saliencegateBootstrap.href !== bootstrapHref" not in source
+    assert "SALIENCEGATE_ARTIFACT_SOCKET_DENIAL" in source
+    socket_guard = ARTIFACT_SOCKET_GUARD.read_text(encoding="utf-8")
+    assert "installed artifact child retained provider credentials" in socket_guard
+    assert "PROVIDER_CREDENTIAL_DENIAL_ACTIVE" in socket_guard
+    assert "for await (const chunk of process.stdin)" in source
+    assert "Windows launcher metacharacter proof is incomplete" in source
+    assert 'status.providers[0].status.value != "active_observed"' in source
+    assert "status.providers[0].drift" in source
+    for callback in (
+        'invoke("session_start"',
+        'invoke("before_agent_start"',
+        'invoke("tool_execution_start"',
+        'invoke("tool_execution_end"',
+        'invoke("agent_settled"',
+        'invoke("session_shutdown"',
+    ):
+        assert callback in source
+    for provider in ("codex", "claude-code", "opencode", "pi"):
+        assert f'"{provider}"' in source
+
+    verifier = ARTIFACT_VERIFIER.read_text(encoding="utf-8")
+    assert '"scripts/smoke_capture_installed.py"' in verifier
+    assert 'b"capture-installed-artifact-ok\\n"' in verifier
+    assert '"capture-lifecycle"' in verifier
+    assert '"capture-quickstart"' in verifier
+    assert '"emit-codex-fixture"' in verifier
+    assert '"validate-codex-report"' in verifier
+    for command_arguments in (
+        '("connect", "codex", "--project", project, "--dry-run")',
+        '("connect", "codex", "--project", project)',
+        '("doctor", "--capture")',
+        '("status", "codex", "--project", project)',
+        '("sessions", "--limit", "20")',
+        '("report", "--latest", "--output", report_path)',
+        '("disconnect", "codex", "--project", project)',
+    ):
+        assert command_arguments in verifier
+    assert '"codex.cmd"' in verifier
+    assert '"claude.cmd"' in verifier
+    assert "os.pathsep.join((os.fspath(fake_hosts), os.fspath(python.parent)))" in verifier
+    assert "_environment_without_provider_credentials(environment)" in inspect.getsource(
+        artifact_verifier._prove_artifact_socket_guard
+    )
+    connector_e2e = inspect.getsource(artifact_verifier._prove_installed_connector_e2e)
+    assert 'del lifecycle_environment["SALIENCEGATE_ARTIFACT_SOCKET_DENIAL"]' in connector_e2e
+    assert "env=lifecycle_environment" in connector_e2e
+
+    connector_verifier = CONNECTOR_ARTIFACT_VERIFIER.read_text(encoding="utf-8")
+    assert 'NATIVE_SECRET_SENTINEL = "connector-native-secret-sentinel"' in connector_verifier
+    assert "persisted sensitive native data" in connector_verifier
+
+
+def test_installed_callback_command_is_platform_exact(tmp_path: Path) -> None:
+    launcher = tmp_path / "capture hook"
+    launcher.write_bytes(b"synthetic launcher")
+    launcher.chmod(0o700)
+
+    posix = capture_smoke._launcher_command(
+        launcher,
+        environment={},
+        platform="posix",
+    )
+    assert posix == capture_smoke._InstalledCommandCallback(
+        command=(str(launcher.resolve(strict=True)),)
+    )
+
+    system_root = tmp_path / "Windows Root & Data"
+    command = system_root / "System32" / "cmd.exe"
+    command.parent.mkdir(parents=True)
+    command.write_bytes(b"synthetic command interpreter")
+    windows = capture_smoke._launcher_command(
+        launcher,
+        environment={"SystemRoot": str(system_root)},
+        platform="nt",
+    )
+    resolved_command = str(command.resolve(strict=True))
+    resolved_launcher = str(launcher.resolve(strict=True))
+    assert windows == capture_smoke._InstalledCommandCallback(
+        command=(f'"{resolved_command}" /d /v:off /s /c ""%SALIENCEGATE_LAUNCHER%""'),
+        executable=resolved_command,
+        launcher_environment=resolved_launcher,
+    )
+    naive_sequence = (
+        resolved_command,
+        "/d",
+        "/v:off",
+        "/s",
+        "/c",
+        '""%SALIENCEGATE_LAUNCHER%""',
+    )
+    assert subprocess.list2cmdline(naive_sequence) == (
+        f'"{resolved_command}" /d /v:off /s /c '
+        r"\"\"%SALIENCEGATE_LAUNCHER%\"\""
+    )
+    assert subprocess.list2cmdline(naive_sequence) != windows.command
+
+    with pytest.raises(RuntimeError, match="platform is invalid"):
+        capture_smoke._launcher_command(launcher, environment={}, platform="vms")
+
+
+def test_installed_windows_callback_passes_raw_command_line_and_executable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    launcher = tmp_path / "launcher path & data" / "capture-hook.cmd"
+    launcher.parent.mkdir()
+    launcher.write_bytes(b"@exit /b 0\r\n")
+    launcher.chmod(0o700)
+    system_root = tmp_path / "Windows Root & Data"
+    command = system_root / "System32" / "cmd.exe"
+    command.parent.mkdir(parents=True)
+    command.write_bytes(b"synthetic command interpreter")
+    callback = capture_smoke._launcher_command(
+        launcher,
+        environment={"SystemRoot": str(system_root)},
+        platform="nt",
+    )
+    observed: list[tuple[object, dict[str, object]]] = []
+
+    def fake_run(
+        invoked: object,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        observed.append((invoked, kwargs))
+        return subprocess.CompletedProcess(invoked, 0, stdout=b"", stderr=b"")
+
+    starts = iter((7, 8))
+    monkeypatch.setattr(capture_smoke.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        capture_smoke,
+        "_socket_guard_start_count",
+        lambda _environment: next(starts),
+    )
+
+    capture_smoke._invoke_installed_command_callback(
+        callback=callback,
+        payload=b'{"hook_event_name":"SessionStart"}\n',
+        project=tmp_path,
+        environment={"SystemRoot": str(system_root)},
+    )
+
+    assert len(observed) == 1
+    invoked, kwargs = observed[0]
+    assert invoked == callback.command
+    assert isinstance(invoked, str)
+    assert kwargs["executable"] == str(command.resolve(strict=True))
+    assert kwargs["shell"] is False
+    process_environment = kwargs["env"]
+    assert isinstance(process_environment, dict)
+    assert process_environment["SALIENCEGATE_LAUNCHER"] == str(launcher.resolve(strict=True))
+
+
+def test_installed_codex_callback_is_derived_from_the_managed_config(tmp_path: Path) -> None:
+    launcher = tmp_path / "capture-hook"
+    launcher.write_bytes(b"synthetic launcher")
+    launcher.chmod(0o700)
+    config_path = tmp_path / "config.toml"
+    marker = "saliencegate-managed-codex-hooks-v1"
+
+    def config(command: str) -> bytes:
+        groups = []
+        for event_name in ("SessionStart", "PreToolUse", "PostToolUse"):
+            groups.extend(
+                (
+                    f"[[hooks.{event_name}]]",
+                    f"[[hooks.{event_name}.hooks]]",
+                    'type = "command"',
+                    f"command = {json.dumps(command)}",
+                    "timeout = 3",
+                )
+            )
+        return (f"# {marker}\n" + "\n".join(groups) + "\n").encode()
+
+    spec = SimpleNamespace(
+        bootstrap_path=None,
+        bundle_path=None,
+        config=SimpleNamespace(marker=marker),
+        config_path=config_path,
+        launcher_path=launcher,
+    )
+    config_path.write_bytes(config(str(launcher.resolve(strict=True))))
+    callbacks = capture_smoke._installed_command_callbacks(
+        capture_smoke._CASES[0],
+        spec,
+        environment={},
+    )
+    assert set(callbacks) == {"SessionStart", "PreToolUse", "PostToolUse"}
+    assert all(
+        callback.command == (str(launcher.resolve(strict=True)),) for callback in callbacks.values()
+    )
+
+    config_path.write_bytes(config(str(tmp_path / "wrong-launcher")))
+    with pytest.raises(RuntimeError, match="config binding is invalid"):
+        capture_smoke._installed_command_callbacks(
+            capture_smoke._CASES[0],
+            spec,
+            environment={},
+        )
+
 
 def test_connector_artifact_verifier_materializes_native_launchers(tmp_path: Path) -> None:
     posix_workspace = tmp_path / "posix"
     posix_workspace.mkdir()
     posix_launcher = connector_artifact_verifier._materialize_launcher(
         posix_workspace,
+        connector="opencode",
         platform="posix",
     )
-    assert posix_launcher.name == "capture-launcher"
-    assert posix_launcher.read_bytes() == connector_artifact_verifier.POSIX_LAUNCHER_SOURCE
+    assert posix_launcher.name == "capture-launcher-opencode"
+    assert posix_launcher.read_bytes() == connector_artifact_verifier.POSIX_LAUNCHER_SOURCE.replace(
+        b"{provider}",
+        b"opencode",
+    )
+    assert posix_launcher.read_bytes().endswith(b'"opencode"\n')
     assert posix_launcher.stat().st_mode & 0o100
     assert (posix_launcher.parent / "capture-launcher.mjs").is_file()
 
@@ -149,18 +533,61 @@ def test_connector_artifact_verifier_materializes_native_launchers(tmp_path: Pat
     windows_workspace.mkdir()
     windows_launcher = connector_artifact_verifier._materialize_launcher(
         windows_workspace,
+        connector="pi",
         platform="nt",
     )
-    assert windows_launcher.name == "capture-launcher.cmd"
-    assert windows_launcher.read_bytes() == connector_artifact_verifier.WINDOWS_LAUNCHER_SOURCE
+    assert windows_launcher.name == "capture-launcher-pi.cmd"
+    assert windows_launcher.read_bytes() == (
+        connector_artifact_verifier.WINDOWS_LAUNCHER_SOURCE.replace(b"{provider}", b"pi")
+    )
     assert windows_launcher.read_bytes().startswith(b"@echo off\r\n")
-    assert (windows_launcher.parent / "capture-launcher.mjs").is_file()
+    assert windows_launcher.read_bytes().endswith(b'"pi"\r\n')
+    assert b"%~n0" not in windows_launcher.read_bytes()
+    assert windows_launcher.parent.name == "launcher path & data"
+    assert " " in str(windows_launcher)
+    assert "&" in str(windows_launcher)
+    assert (windows_workspace / "proof" / "capture-launcher.mjs").is_file()
 
     with pytest.raises(
         connector_artifact_verifier.VerificationError,
         match="platform is unsupported",
     ):
-        connector_artifact_verifier._materialize_launcher(tmp_path / "unsupported", platform="vms")
+        connector_artifact_verifier._materialize_launcher(
+            tmp_path / "unsupported",
+            connector="opencode",
+            platform="vms",
+        )
+
+
+def test_connector_artifact_launch_log_requires_both_exact_providers(tmp_path: Path) -> None:
+    launch_log = tmp_path / "launches.ndjson"
+
+    def record(provider: str) -> str:
+        return json.dumps(
+            {
+                "network_denial": True,
+                "provider": provider,
+                "provider_credential_keys_present": [],
+                "schema_version": "connector-artifact-launch/v1",
+                "stdin_bytes": 1,
+            }
+        )
+
+    launch_log.write_text(
+        "\n".join(record("opencode") for _ in range(3)) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        connector_artifact_verifier.VerificationError,
+        match="did not exercise both launch paths",
+    ):
+        connector_artifact_verifier._validate_launch_log(launch_log)
+
+    launch_log.write_text(
+        "\n".join((record("opencode"), record("opencode"), record("pi"))) + "\n",
+        encoding="utf-8",
+    )
+    connector_artifact_verifier._validate_launch_log(launch_log)
 
 
 def test_connector_artifact_verifier_resolves_npm_cli_without_executing_cmd(
@@ -193,6 +620,73 @@ def test_connector_artifact_verifier_resolves_npm_cli_without_executing_cmd(
         connector_artifact_verifier._validated_npm_cli(str(npm))
 
 
+def test_connector_artifact_timeout_and_redaction_are_content_free(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    node = tmp_path / "node"
+    npm_cli = tmp_path / "npm-cli.js"
+    monkeypatch.setattr(
+        connector_artifact_verifier,
+        "_resolve_regular_command",
+        lambda *_args, **_kwargs: node,
+    )
+    monkeypatch.setattr(
+        connector_artifact_verifier,
+        "_validated_npm_cli",
+        lambda *_args, **_kwargs: npm_cli,
+    )
+    calls = 0
+
+    def fake_run(*args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(args[0], 0, "v22.19.0\n", "")
+        if calls == 2:
+            return subprocess.CompletedProcess(args[0], 0, "10.9.3\n", "")
+        raise subprocess.TimeoutExpired(
+            args[0],
+            30,
+            output=connector_artifact_verifier.NATIVE_SECRET_SENTINEL,
+            stderr=connector_artifact_verifier.POISONED_CREDENTIAL,
+        )
+
+    monkeypatch.setattr(connector_artifact_verifier.subprocess, "run", fake_run)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    guard = tmp_path / "deny-network.mjs"
+
+    with pytest.raises(
+        connector_artifact_verifier.VerificationError,
+        match="connector artifact smoke timed out",
+    ) as raised:
+        connector_artifact_verifier._run_node_smoke(
+            node="node",
+            npm="npm",
+            guard=guard,
+            assets={"opencode": tmp_path / "opencode.js", "pi": tmp_path / "pi.js"},
+            launch_log=tmp_path / "launches.ndjson",
+            workspace=workspace,
+        )
+
+    rendered = str(raised.value)
+    assert connector_artifact_verifier.NATIVE_SECRET_SENTINEL not in rendered
+    assert connector_artifact_verifier.POISONED_CREDENTIAL not in rendered
+    assert calls == 3
+    assert (
+        connector_artifact_verifier._redacted(
+            " ".join(
+                (
+                    connector_artifact_verifier.NATIVE_SECRET_SENTINEL,
+                    connector_artifact_verifier.POISONED_CREDENTIAL,
+                )
+            )
+        )
+        == "<redacted> <redacted>"
+    )
+
+
 @pytest.mark.parametrize(
     ("payload", "platform", "expected"),
     (
@@ -222,6 +716,30 @@ def test_core_artifact_verifier_rejects_noncanonical_windows_transport(
 ) -> None:
     with pytest.raises(RuntimeError, match="non-canonical Windows transport ending"):
         artifact_verifier._normalize_transport_stdout(payload, platform="nt")
+
+
+@pytest.mark.parametrize(
+    ("payload", "platform", "expected"),
+    (
+        (b"first\nsecond\n", "posix", b"first\nsecond\n"),
+        (b"first\nsecond\n", "nt", b"first\nsecond\n"),
+        (b"first\r\nsecond\r\n", "nt", b"first\nsecond\n"),
+    ),
+)
+def test_core_artifact_verifier_normalizes_multiline_terminal_output(
+    payload: bytes,
+    platform: str,
+    expected: bytes,
+) -> None:
+    assert artifact_verifier._normalize_terminal_stdout(payload, platform=platform) == expected
+
+
+@pytest.mark.parametrize("payload", (b"first\rsecond\n", b"first\r\r\n"))
+def test_core_artifact_verifier_rejects_noncanonical_windows_terminal_output(
+    payload: bytes,
+) -> None:
+    with pytest.raises(RuntimeError, match="non-canonical Windows ending"):
+        artifact_verifier._normalize_terminal_stdout(payload, platform="nt")
 
 
 def test_installed_shadow_smoke_routes_windows_private_io_through_security_helpers(
@@ -322,11 +840,7 @@ def test_core_artifact_verifier_routes_windows_private_publication_through_insta
         "capture_output": True,
         "input_bytes": payload,
     }
-    source = ARTIFACT_VERIFIER.read_text(encoding="utf-8")
-    proof_body = source.split("def _prove_documented_cases(", 1)[1].split(
-        "\ndef verify_built_artifacts(",
-        1,
-    )[0]
+    proof_body = inspect.getsource(artifact_verifier._prove_documented_cases)
     assert "_write_private(" not in proof_body
     assert proof_body.count("_publish_installed_private_file(") == 3
 
@@ -611,6 +1125,38 @@ def test_artifact_workspace_canonicalizes_a_symlinked_temp_root(
     assert alias.is_symlink()
 
 
+def test_artifact_main_places_default_workspace_beside_distribution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dist_dir = tmp_path / "checkout" / "dist"
+    dist_dir.mkdir(parents=True)
+    created = dist_dir.parent / "synthetic-smoke"
+    observed: dict[str, object] = {}
+
+    def make_temp_directory(*, prefix: str, **options: object) -> str:
+        observed["prefix"] = prefix
+        observed["parent"] = options.get("dir")
+        created.mkdir(mode=0o700)
+        return str(created)
+
+    def verify(**options: object) -> None:
+        observed["work_root"] = options["work_root"]
+        observed["dist_dir"] = options["dist_dir"]
+
+    monkeypatch.setattr(artifact_verifier.tempfile, "mkdtemp", make_temp_directory)
+    monkeypatch.setattr(artifact_verifier, "verify_built_artifacts", verify)
+
+    assert artifact_verifier.main(("--dist-dir", str(dist_dir))) == 0
+    assert observed == {
+        "prefix": "saliencegate-artifact-smoke-",
+        "parent": dist_dir.parent.resolve(strict=True),
+        "work_root": created.resolve(),
+        "dist_dir": dist_dir.resolve(strict=True),
+    }
+    assert not created.exists()
+
+
 def test_makefile_exposes_noninteractive_gates_in_the_authoritative_order() -> None:
     text = _read("Makefile")
 
@@ -681,6 +1227,10 @@ def test_makefile_exposes_noninteractive_gates_in_the_authoritative_order() -> N
         "pytest -q tests/test_package.py",
         "python scripts/verify_built_artifacts.py --dist-dir dist",
         "python scripts/verify_connector_artifacts.py --dist-dir dist --node node --npm npm",
+        (
+            "python scripts/verify_built_artifacts.py --dist-dir dist --node node "
+            "--capture-connectors-only"
+        ),
         "python scripts/run_capture_hook_benchmark.py --assert-budgets",
         "python scripts/benchmark_capture_report.py --assert-budgets",
         "tests/capture/test_store_concurrency.py",
@@ -989,10 +1539,11 @@ def test_ci_proves_connector_bundles_from_artifacts_without_checkout() -> None:
     assert "tests/fixtures" not in artifact
     assert "${{ runner.temp }}/saliencegate-connector-artifact-only" in artifact
     assert artifact.count("shell: python") == 2
-    _assert_inline_python_step(artifact, "Recover the connector artifact verifier")
-    _assert_inline_python_step(artifact, "Import byte-identical bundles")
+    _assert_inline_python_step(artifact, "Recover the connector artifact verifiers")
+    _assert_inline_python_step(artifact, "Prove installed callbacks and bundles")
     assert 'tarfile.open(sdists[0], mode="r:gz")' in artifact
     assert '("scripts", "verify_connector_artifacts.py")' in artifact
+    assert '("scripts", "verify_built_artifacts.py")' in artifact
     assert 'os.environ["ARTIFACT_ROOT"]' in artifact
     assert "sys.executable" in artifact
     assert '"--dist-dir",' in artifact
@@ -1001,15 +1552,21 @@ def test_ci_proves_connector_bundles_from_artifacts_without_checkout() -> None:
     assert '"node",' in artifact
     assert '"--npm",' in artifact
     assert '"npm",' in artifact
+    assert '"--capture-connectors-only",' in artifact
+    assert '"3.12",' in artifact
     assert "check=True" in artifact
     for unix_only in ("tar -xzf", "find ", "mkdir -p", "chmod ", "umask "):
         assert unix_only not in artifact
     assert "node-version: 22.19.0" in artifact
     assert "package-manager-cache: false" in artifact
+    assert "astral-sh/setup-uv@" in artifact
+    assert 'version: "0.11.28"' in artifact
     assert "provider-credential-read-must-fail" in artifact
     assert "USERPROFILE:" in artifact
     assert "APPDATA:" in artifact
     assert "LOCALAPPDATA:" in artifact
+    installed_verifier = ARTIFACT_VERIFIER.read_text(encoding="utf-8")
+    assert 'case_root = work_root / label / "launcher path & data"' in installed_verifier
 
     assert CONNECTOR_ARTIFACT_VERIFIER.is_file()
     assert CONNECTOR_NETWORK_GUARD.is_file()
@@ -1022,7 +1579,8 @@ def test_ci_proves_connector_bundles_from_artifacts_without_checkout() -> None:
     assert "process.getBuiltinModule" in verifier
     assert "wheel and sdist connector bundles are not byte-identical" in verifier
     assert "dist must contain exactly one wheel and one sdist" in verifier
-    assert "persisted a poisoned credential" in verifier
+    assert "persisted sensitive native data" in verifier
+    assert connector_artifact_verifier.NATIVE_SECRET_SENTINEL in verifier
     assert "os.environ.copy()" not in verifier
     assert "if key.upper() in PROVIDER_CREDENTIAL_KEY_SET" in verifier
     assert "provider credential reached connector launcher" in verifier
@@ -1030,13 +1588,46 @@ def test_ci_proves_connector_bundles_from_artifacts_without_checkout() -> None:
     assert "openCodeHooks.event" in verifier
     assert 'piHandlers.get("session_start")' in verifier
     assert "built connector runtime did not exercise both launch paths" in verifier
-    assert "capture-launcher.cmd" in verifier
+    assert "if observed_providers != set(RUNTIME_PROFILES)" in verifier
+    assert "launcher = _materialize_launcher(workspace, connector=connector)" in verifier
+    assert 'f"capture-launcher-{connector}.cmd"' in verifier
+    assert '"launcher path & data"' in verifier
     assert "WINDOWS_LAUNCHER_SOURCE" in verifier
     assert "_validated_npm_cli" in verifier
     assert '"npm-cli.js"' in verifier
     assert '(resolved_node, npm_cli, "--version")' in verifier
     assert '(npm, "--version")' not in verifier
     assert "SALIENCEGATE_ARTIFACT_NODE" in verifier
+
+
+def test_artifact_sentinel_failures_are_content_free(tmp_path: Path) -> None:
+    capture_sentinel = b"artifact-codex-raw-content-sentinel"
+    capture_path = tmp_path / "capture" / "state.sqlite3"
+    capture_path.parent.mkdir()
+    capture_path.write_bytes(capture_sentinel)
+    with pytest.raises(RuntimeError, match="persisted a raw sentinel") as capture_failure:
+        capture_smoke._scan_for_sentinels(tmp_path / "capture", (capture_sentinel,))
+    assert capture_sentinel.decode() not in str(capture_failure.value)
+    capture_path.unlink()
+
+    sibling_state = tmp_path / "state" / "saliencegate" / "capture.sqlite3"
+    sibling_state.parent.mkdir(parents=True)
+    sibling_state.write_bytes(capture_sentinel)
+    with pytest.raises(RuntimeError, match="persisted a raw sentinel"):
+        capture_smoke._scan_for_sentinels(tmp_path, (capture_sentinel,))
+
+    connector_path = tmp_path / "connector" / "launches.ndjson"
+    connector_path.parent.mkdir()
+    connector_path.write_text(
+        connector_artifact_verifier.NATIVE_SECRET_SENTINEL,
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        connector_artifact_verifier.VerificationError,
+        match="persisted sensitive native data",
+    ) as connector_failure:
+        connector_artifact_verifier._assert_poison_absent(tmp_path / "connector")
+    assert connector_artifact_verifier.NATIVE_SECRET_SENTINEL not in str(connector_failure.value)
 
 
 def test_ci_exercises_the_installed_core_wheel_without_optional_runtime() -> None:
@@ -1249,6 +1840,15 @@ def test_ci_installed_jobs_share_only_the_built_distributions() -> None:
         for line in job.splitlines():
             if '/bin/saliencegate"' in line or '/bin/saliencegate-review"' in line:
                 assert "scripts/run_without_sockets.py" in line
+
+
+def test_ci_fetches_complete_head_history_for_the_public_tree_guard() -> None:
+    text = _read(".github/workflows/ci.yml")
+    checkout_count = text.count("uses: actions/checkout@")
+
+    assert checkout_count > 0
+    assert text.count("persist-credentials: false") == checkout_count
+    assert text.count("fetch-depth: 0") == checkout_count
 
 
 def test_socket_guard_allows_only_local_socket_pairs(tmp_path: Path) -> None:

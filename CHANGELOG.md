@@ -70,3 +70,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 - Locked quality gates, branch-aware coverage, dependency auditing, least-privilege CI across
   Python 3.11-3.13, installed wheel and source-distribution smoke tests, a dedicated 90-minute
   coverage job, public CLI and artifact references, and reproducible evidence reports.
+- Project-local passive-capture integrations for Codex, Claude Code, OpenCode, and Pi, pinned to
+  audited provider shapes and limited to selected lifecycle events.
+- A content-minimizing capture store with domain-separated HMAC pseudonyms, authenticated SQLite
+  records, a bounded recovery spool, and reversible installation receipts.
+- Top-level commands to connect providers; inspect capture status and sessions; and report, record
+  local feedback, disconnect, or delete without model calls or active reminders.
+- Deterministic, content-free captured-session reports with synthetic examples for the three
+  bounded headlines and an explicit descriptive-evidence boundary.
+- Installed wheel and source-distribution verification for the local capture lifecycle, alongside
+  offline connector bundle and network-denial checks.

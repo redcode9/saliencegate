@@ -70,6 +70,50 @@ evaluations, or evidence-sufficient applicable evaluations. Capture scope is cal
 provenance and never changes the fixed declarations `representativeness_supported=false`,
 `task_efficacy_supported=false`, or `counterfactual_effect_supported=false`.
 
+## Universal capture projection
+
+Universal Shadow Capture applies the same deterministic signal definitions to a narrower live-event
+surface. It is not transcript ingestion and it is not an automatic conversion of a provider session
+into a complete `shadow-input/v1` trace. Each Codex, Claude Code, OpenCode, or Pi adapter first
+validates one audited callback shape. Unlisted fields are discarded; provider session, call, tool,
+workspace, subagent, and lineage values that remain useful for correlation are reduced with an
+installation-key-bound HMAC before durable storage. The adapters do not call provider history,
+message, transcript, RPC, or session-file APIs to fill gaps.
+
+At report time, SalienceGate authenticates a project-bound capture snapshot and its bounded spool,
+then deterministically projects admitted records into redacted internal `TraceEvent` values. Exact
+action starts become action evidence only when the provider surface establishes the required
+identity. Structured result or controller-failure events become outcome evidence only when the
+profile assigns that event discriminator authority. Lifecycle-only events can close windows or
+record coverage boundaries without becoming detector evidence. Ignored source records remain in an
+explicit denominator.
+
+The capability manifest constrains the detector matrix before evaluation. For example, Codex v1
+can conditionally support repeated-action evidence but gives `PostToolUse` no success or failure
+authority; Claude Code v1 supports tool-error evidence but treats pre-tool hooks as proposals;
+OpenCode v1 supports tool errors and conditional repeated actions; and Pi v1 cannot distinguish an
+execution failure from several pre-execution errors. Unsupported detectors remain
+`not_applicable`, while conditional detectors report their omissions and exact authorized,
+unresolved, and detected counts. Missing callbacks, gaps, dropped batches, ambiguous correlation,
+open windows, and unverified versions cannot be repaired by inference.
+
+Capture uses its authenticated capture store and emits `capture-session-report/v1`; it does not
+write the separate Shadow ledger or claim that provider receipt order is causal order. The report's
+`shadow_disposition` is summarized by one closed headline:
+
+| Capture headline | Shadow projection boundary |
+|---|---|
+| `memory_review_suggested` | At least one supported signal is detected and no quarantine or integrity failure blocks the positive result. |
+| `no_current_evidence` | At least one applicable detector has sufficient absence evidence in a closed window, the authenticated spool is clean and drained, no signal is detected, and no report limit remains. |
+| `insufficient_evidence` | Explicit limits prevent either of the preceding results. |
+
+These headlines inherit the observational boundary: `evidence_level=descriptive_observational`,
+`confirmatory=false`, `decision_authority=false`, and `model_calls=0`. In particular,
+`memory_review_suggested` does not authorize a reminder and `no_current_evidence` does not establish
+that memory was unnecessary. Provider paths, selected callbacks, version policy, and exclusions are
+frozen in the [integration contract](integrations.md); local storage and retention are described in
+the [security model](../security.md).
+
 ## ATIF one-call API
 
 `analyze_atif_bytes` turns one trajectory into a complete immutable report. It accepts bytes rather

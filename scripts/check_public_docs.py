@@ -26,6 +26,7 @@ PUBLIC_DOCUMENTS = (
     Path("docs/reference/state-decay-v2-review.md"),
     Path("docs/security.md"),
     Path("examples/atif-shadow/README.md"),
+    Path("examples/capture/README.md"),
     Path(".github/pull_request_template.md"),
     Path(".github/ISSUE_TEMPLATE/bug.yml"),
     Path(".github/ISSUE_TEMPLATE/benchmark.yml"),
@@ -57,14 +58,38 @@ README_HEADINGS = (
 )
 README_IMAGE_TARGETS = (
     "docs/assets/readme/pipeline.svg",
-    "docs/assets/readme/atif-example-results.svg",
+    "docs/assets/readme/capture-headlines.svg",
     "docs/assets/readme/reference-run.svg",
 )
+README_LOCAL_CAPTURE_COMMANDS = (
+    '"$SG" connect codex --project "$PROJECT" --dry-run',
+    '"$SG" connect codex --project "$PROJECT"',
+    '"$SG" doctor --capture',
+    '"$SG" status codex --project "$PROJECT"',
+    '"$SG" sessions --limit 20',
+    '"$SG" report --latest --output "$PROJECT/.saliencegate/reports/capture-report.json"',
+    '"$SG" disconnect codex --project "$PROJECT"',
+    '"$SG" delete SESSION_ID',
+    '"$SG" delete --all --project "$PROJECT" --confirm',
+)
+README_LOCAL_AMBIENT_CAPTURE_COMMAND = re.compile(
+    r'(?:^|[\s`])["\']?[^ \t\r\n`"\']*saliencegate["\']?\s+'
+    r"(?:connect|doctor|status|sessions|report|disconnect|delete)\b",
+    re.MULTILINE,
+)
+
+
+def count_readme_local_capture_command(text: str, command: str) -> int:
+    return len(re.findall(rf"{re.escape(command)}(?=$|[\n`])", text))
+
+
 FORBIDDEN_PATTERNS = (
     (
         re.compile(
-            r"(?im)^(?:co-" + r"authored-by|signed-off-by|generated-" + r"by|assisted-" + r"by|"
-            r"pair-programmed-by|reviewed-by|acked-by|tested-by):"
+            r"(?im)^(?:co-"
+            + r"authored-by|signed-off-by|generated-"
+            + r"by|assisted-"
+            + r"by|pair-programmed-by|reviewed-by|acked-by|tested-by):"
         ),
         "attribution trailer",
     ),
@@ -92,13 +117,31 @@ FORBIDDEN_PATTERNS = (
     (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "Google API-key-like value"),
     (re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"), "private key"),
 )
-SHADOW_FORBIDDEN_PATTERNS = (
+OBSERVATIONAL_FORBIDDEN_PATTERNS = (
     (re.compile(r"(?i)\b(?:improves|preserves)\s+task success\b"), "task-success claim"),
     (re.compile(r"(?i)\bsaves?\s+tokens?\b"), "token-savings claim"),
     (re.compile(r"(?i)\btoken savings?\b"), "token-savings claim"),
     (re.compile(r"(?i)\bcausal effect\b"), "causal claim"),
     (re.compile(r"(?i)\bcalibrated trigger\b"), "calibration claim"),
     (re.compile(r"(?i)\bpopulation prevalence\b"), "prevalence claim"),
+    (re.compile(r"(?i)\bthe agent (?:needs|requires) memory\b"), "memory-need certainty"),
+    (
+        re.compile(r"(?i)\breminders? (?:will|would) (?:help|improve)\b"),
+        "reminder-effect claim",
+    ),
+)
+OBSERVATIONAL_CLAIM_DOCUMENTS = frozenset(
+    {
+        "README.md",
+        "docs/package-description.md",
+        "docs/research-claims.md",
+        "docs/reference/cli.md",
+        "docs/reference/evaluation.md",
+        "docs/reference/integrations.md",
+        "docs/reference/shadow-mode.md",
+        "docs/security.md",
+        "examples/capture/README.md",
+    }
 )
 SHADOW_REQUIRED_FRAGMENTS = (
     "any-detected-signal-baseline/v1",
@@ -129,8 +172,8 @@ def scan_text(path: Path, text: str) -> list[str]:
             if any(unicodedata.category(character) == "So" for character in line):
                 findings.append(f"{path}:{line_number}: decorative symbol")
 
-    if path.as_posix() == "docs/reference/shadow-mode.md":
-        for pattern, description in SHADOW_FORBIDDEN_PATTERNS:
+    if path.as_posix() in OBSERVATIONAL_CLAIM_DOCUMENTS:
+        for pattern, description in OBSERVATIONAL_FORBIDDEN_PATTERNS:
             for match in pattern.finditer(text):
                 findings.append(f"{path}:{_line_number(text, match.start())}: {description}")
 
@@ -322,6 +365,36 @@ def validate_public_docs(root: Path = ROOT) -> list[str]:
         for label in ("Artifact-compatible after installation:", "Run from a checkout:"):
             if readme_text.count(label) < 2:
                 findings.append(f"README.md: expected at least two command labels {label!r}")
+        if "\n## Try it locally\n" in readme_text and "\n## Analyze a trajectory\n" in readme_text:
+            local_quickstart = readme_text.split("\n## Try it locally\n", maxsplit=1)[1].split(
+                "\n## Analyze a trajectory\n", maxsplit=1
+            )[0]
+            for variable, assignment in (
+                ("VENV", 'VENV="$HOME/.local/share/saliencegate/quickstart-venv"'),
+                ("SG", 'SG="$VENV/bin/saliencegate"'),
+            ):
+                assignment_lines = sum(
+                    line.startswith(f"{variable}=") for line in local_quickstart.splitlines()
+                )
+                if local_quickstart.count(assignment) != 1 or assignment_lines != 1:
+                    findings.append(
+                        f"README.md: expected one local capture assignment {assignment!r}"
+                    )
+            for command in README_LOCAL_CAPTURE_COMMANDS:
+                if count_readme_local_capture_command(local_quickstart, command) != 1:
+                    findings.append(f"README.md: expected one local capture command {command!r}")
+            expected_invocations = len(README_LOCAL_CAPTURE_COMMANDS)
+            if (
+                local_quickstart.count("$SG") != expected_invocations
+                or local_quickstart.count('"$SG"') != expected_invocations
+            ):
+                findings.append(
+                    'README.md: every local capture invocation must use quoted "$SG" exactly once'
+                )
+            if README_LOCAL_AMBIENT_CAPTURE_COMMAND.search(local_quickstart):
+                findings.append(
+                    "README.md: local capture commands must not use an ambient executable"
+                )
         if "\n## Limits\n" in readme_text and "\n## Development\n" in readme_text:
             limits = readme_text.split("\n## Limits\n", maxsplit=1)[1].split(
                 "\n## Development\n", maxsplit=1

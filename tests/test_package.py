@@ -4,6 +4,7 @@ import base64
 import csv
 import hashlib
 import io
+import json
 import os
 import re
 import stat
@@ -486,6 +487,36 @@ def test_package_exposes_a_semantic_version() -> None:
     assert re.fullmatch(r"\d+\.\d+\.\d+(?:[.-][0-9A-Za-z.-]+)?", saliencegate.__version__)
 
 
+def test_release_candidate_versions_are_consistent() -> None:
+    expected = "0.2.0"
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
+    citation = (ROOT / "CITATION.cff").read_text(encoding="utf-8")
+    package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+    package_lock = json.loads((ROOT / "package-lock.json").read_text(encoding="utf-8"))
+    workspace_manifests = [
+        json.loads((ROOT / workspace / "package.json").read_text(encoding="utf-8"))
+        for workspace in package["workspaces"]
+    ]
+
+    locked_project = [item["version"] for item in lock["package"] if item["name"] == "saliencegate"]
+    workspace_versions = {
+        value["version"]
+        for path, value in package_lock["packages"].items()
+        if path == "" or path.startswith("connectors/")
+    }
+
+    assert saliencegate.__version__ == expected
+    assert project["project"]["version"] == expected
+    assert locked_project == [expected]
+    assert re.search(r"(?m)^version: 0\.2\.0$", citation)
+    assert "date-released:" not in citation
+    assert package["version"] == expected
+    assert {item["version"] for item in workspace_manifests} == {expected}
+    assert package_lock["version"] == expected
+    assert workspace_versions == {expected}
+
+
 def test_package_declares_typing_support() -> None:
     assert resources.files("saliencegate").joinpath("py.typed").is_file()
 
@@ -643,6 +674,7 @@ def test_built_sdist_has_exact_reviewable_membership_and_payloads(
         "benchmarks/shadow_trace/reference-macos-26.5.2-arm64-cpython-3.12.3.json",
         "benchmarks/shadow_trace/reference-macos-26.5.2-arm64-cpython-3.12.3.manifest.json",
         "docs/assets/readme/atif-example-results.svg",
+        "docs/assets/readme/capture-headlines.svg",
         "docs/assets/readme/pipeline.svg",
         "docs/assets/readme/reference-run.svg",
         "docs/benchmarks/foundation-evidence.md",
@@ -657,12 +689,17 @@ def test_built_sdist_has_exact_reviewable_membership_and_payloads(
         "examples/atif-shadow/codex-minimal.trajectory.json",
         "examples/atif-shadow/one_call.py",
         "examples/atif-shadow/terminus-minimal.trajectory.json",
+        "examples/capture/README.md",
+        "examples/capture/headline-results.json",
         "examples/shadow_asyncio.py",
         "scripts/benchmark_shadow_trace.py",
         "scripts/benchmark_capture_hook.py",
         "scripts/benchmark_capture_report.py",
+        "scripts/artifact_socket_guard.py",
         "scripts/run_capture_hook_benchmark.py",
         "scripts/run_without_sockets.py",
+        "scripts/render_capture_headlines.py",
+        "scripts/smoke_capture_installed.py",
         "scripts/smoke_core_imports.py",
         "scripts/smoke_launch_contracts.py",
         "scripts/smoke_model_runtime.py",
@@ -736,7 +773,7 @@ def test_distribution_metadata_is_identical_and_keeps_the_runtime_optional(
     assert metadata["Metadata-Version"] == "2.4"
     assert metadata["Name"] == "saliencegate"
     assert metadata["Version"] == saliencegate.__version__
-    assert metadata["Requires-Python"] == ">=3.11"
+    assert metadata["Requires-Python"] == "<3.14,>=3.11"
     assert metadata.get_all("Provides-Extra") == ["model-runtime"]
     assert metadata.get_all("Requires-Dist") == [
         "pydantic<3,>=2.11",

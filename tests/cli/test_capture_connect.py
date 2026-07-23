@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from saliencegate.capture import (
     CaptureConnectionState,
@@ -20,6 +21,7 @@ from saliencegate.capture import (
 )
 from saliencegate.commands.capture.common import CaptureCommandConfigurationError
 from saliencegate.commands.capture.connect import (
+    CaptureConnectReport,
     materialize_provider_launcher,
     project_provider_artifacts_present,
     render_connect_human,
@@ -28,6 +30,8 @@ from saliencegate.commands.capture.connect import (
 )
 from saliencegate.integrations.config_files import ConfigSyntax, OwnedConfigSpec
 from saliencegate.integrations.installation import (
+    GitProjectFileDisposition,
+    InstallationDisposition,
     derive_installation_identity,
     ensure_private_installation_directory,
     install_provider,
@@ -132,11 +136,78 @@ def test_connect_dry_run_writes_nothing_and_renders_only_safe_summary(tmp_path: 
     assert report.dry_run is True
     assert report.capture_enabled is False
     assert report.project_local_files == 3
+    assert report.git_disposition is GitProjectFileDisposition.NOT_REPOSITORY
+    assert report.git_unignored_files == 0
+    assert report.git_tracked_files == 0
     assert before == {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
     assert json.loads(render_connect_json(report)) == report.model_dump(mode="json")
     human = render_connect_human(report)
     assert str(spec.project_root) not in human
     assert spec.capability_digest not in human
+    assert "Review 3 project-local managed file(s)" in human
+    assert "no Git work tree was detected" in human
+    assert ".gitignore was not changed" in human
+
+
+@pytest.mark.parametrize(
+    ("disposition", "unignored", "tracked", "expected"),
+    (
+        (GitProjectFileDisposition.UNIGNORED, 2, 0, "Git will surface 2 (0 already tracked)"),
+        (GitProjectFileDisposition.ALL_IGNORED, 0, 0, "are ignored by Git"),
+        (GitProjectFileDisposition.NOT_REPOSITORY, 0, 0, "no Git work tree was detected"),
+        (GitProjectFileDisposition.UNAVAILABLE, 0, 0, "could not be determined"),
+    ),
+)
+def test_connect_human_output_covers_every_git_review_disposition(
+    disposition: GitProjectFileDisposition,
+    unignored: int,
+    tracked: int,
+    expected: str,
+) -> None:
+    report = CaptureConnectReport(
+        provider=ProviderAlias.OPENCODE,
+        disposition=InstallationDisposition.PLANNED,
+        dry_run=True,
+        capture_enabled=False,
+        project_local_files=2,
+        git_disposition=disposition,
+        git_unignored_files=unignored,
+        git_tracked_files=tracked,
+    )
+
+    rendered = render_connect_human(report)
+
+    assert rendered.startswith("opencode capture: would install; disabled during dry-run.")
+    assert expected in rendered
+    assert ".gitignore was not changed" in rendered
+
+
+@pytest.mark.parametrize(
+    ("disposition", "unignored", "tracked"),
+    (
+        (GitProjectFileDisposition.UNIGNORED, 0, 0),
+        (GitProjectFileDisposition.ALL_IGNORED, 1, 0),
+        (GitProjectFileDisposition.NOT_REPOSITORY, 0, 1),
+        (GitProjectFileDisposition.UNAVAILABLE, 2, 1),
+        (GitProjectFileDisposition.UNIGNORED, 1, 2),
+    ),
+)
+def test_connect_report_rejects_inconsistent_git_review_counts(
+    disposition: GitProjectFileDisposition,
+    unignored: int,
+    tracked: int,
+) -> None:
+    with pytest.raises(ValidationError):
+        CaptureConnectReport(
+            provider=ProviderAlias.CODEX,
+            disposition=InstallationDisposition.PLANNED,
+            dry_run=True,
+            capture_enabled=False,
+            project_local_files=2,
+            git_disposition=disposition,
+            git_unignored_files=unignored,
+            git_tracked_files=tracked,
+        )
 
 
 def test_command_hook_connect_installs_only_config_and_private_launcher(tmp_path: Path) -> None:
@@ -152,6 +223,8 @@ def test_command_hook_connect_installs_only_config_and_private_launcher(tmp_path
 
     assert report.capture_enabled is True
     assert report.project_local_files == 1
+    assert report.git_disposition is GitProjectFileDisposition.NOT_REPOSITORY
+    assert report.git_unignored_files == 0
     assert report.git_tracked_files == 0
     assert spec.project_local_paths == (spec.config_path,)
     assert spec.config_path.is_file()
@@ -191,6 +264,8 @@ def test_configless_bridge_connect_installs_only_auto_discovered_assets(
 
     assert report.capture_enabled is True
     assert report.project_local_files == 2
+    assert report.git_disposition is GitProjectFileDisposition.NOT_REPOSITORY
+    assert report.git_unignored_files == 0
     assert report.git_tracked_files == 0
     assert spec.config_path is None
     assert spec.config is None

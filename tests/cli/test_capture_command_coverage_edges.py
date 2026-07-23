@@ -478,7 +478,15 @@ def test_connect_maps_invalid_install_result_and_preserves_integrity_errors(
         "materialize_provider_launcher",
         lambda value, *_a, **_k: value,
     )
-    monkeypatch.setattr(connect_module, "git_tracked_project_files", lambda _spec: ())
+    monkeypatch.setattr(
+        connect_module,
+        "git_project_file_review",
+        lambda _spec: SimpleNamespace(
+            disposition=connect_module.GitProjectFileDisposition.NOT_REPOSITORY,
+            unignored_files=(),
+            tracked_files=(),
+        ),
+    )
     monkeypatch.setattr(
         connect_module,
         "_key_for_connect",

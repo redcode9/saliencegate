@@ -88,7 +88,7 @@ artifact-smoke:
 	uv run --locked python scripts/verify_built_artifacts.py --dist-dir dist
 
 connector-artifact-smoke:
-	$(CONNECTOR_TOOLCHAIN) 'make connector-node-preflight && uv run --locked python scripts/verify_connector_artifacts.py --dist-dir dist --node node --npm npm'
+	$(CONNECTOR_TOOLCHAIN) 'make connector-node-preflight && uv run --locked python scripts/verify_connector_artifacts.py --dist-dir dist --node node --npm npm && uv run --locked python scripts/verify_built_artifacts.py --dist-dir dist --node node --capture-connectors-only'
 
 audit:
 	@set -eu; \

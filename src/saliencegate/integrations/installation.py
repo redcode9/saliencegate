@@ -113,6 +113,25 @@ class InstallationDisposition(StrEnum):
     RECOVERED = "recovered"
 
 
+class GitProjectFileDisposition(StrEnum):
+    """Read-only Git visibility of the provider's managed project files."""
+
+    NOT_REPOSITORY = "not_repository"
+    UNAVAILABLE = "unavailable"
+    ALL_IGNORED = "all_ignored"
+    UNIGNORED = "unignored"
+
+
+@dataclass(frozen=True, slots=True)
+class GitProjectFileReview:
+    """Bounded Git review result without exposing project paths in CLI output."""
+
+    disposition: GitProjectFileDisposition
+    project_local_files: tuple[Path, ...]
+    unignored_files: tuple[Path, ...]
+    tracked_files: tuple[Path, ...]
+
+
 class _JournalOperation(StrEnum):
     INSTALL = "install"
     UNINSTALL = "uninstall"
@@ -2640,6 +2659,11 @@ def uninstall_provider(
 
 
 def _git_environment() -> dict[str, str]:
+    sterile_path = os.pathsep.join(
+        item
+        for item in os.defpath.split(os.pathsep)
+        if item and "\x00" not in item and Path(item).is_absolute()
+    )
     environment = {
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -2650,31 +2674,276 @@ def _git_environment() -> dict[str, str]:
         "LANG": "C",
         "LC_ALL": "C",
         "NO_COLOR": "1",
-        "PATH": os.defpath,
+        "PATH": sterile_path,
     }
-    for name in ("COMSPEC", "PATHEXT", "SYSTEMROOT", "WINDIR"):
+    for name in ("SYSTEMROOT", "WINDIR"):
         value = os.environ.get(name)
         if value is not None:
             environment[name] = value
     return environment
 
 
-def git_tracked_project_files(spec: ProviderInstallationSpec) -> tuple[Path, ...]:
-    """Return managed files already tracked by Git; never mutate ignore configuration."""
+def _git_executable_is_usable(path: Path, *, native_windows: bool) -> bool:
+    """Validate an already-resolved Git executable without trusting child PATH lookup."""
+
+    try:
+        metadata = path.stat()
+    except OSError:
+        return False
+    if not path.is_absolute() or (
+        native_windows and path.suffix.casefold() not in {".com", ".exe"}
+    ):
+        return False
+    return stat.S_ISREG(metadata.st_mode) and (native_windows or os.access(path, os.X_OK))
+
+
+def _path_may_be_within(path: Path, boundary: Path) -> bool:
+    """Conservatively detect containment by existing-object identity."""
+
+    try:
+        boundary_metadata = boundary.stat()
+        current = path
+        while True:
+            metadata = current.stat()
+            if (
+                metadata.st_dev == boundary_metadata.st_dev
+                and metadata.st_ino == boundary_metadata.st_ino
+            ):
+                return True
+            parent = current.parent
+            if parent == current:
+                return False
+            current = parent
+    except (AttributeError, OSError, ValueError):
+        return True
+
+
+def _posix_executable_boundary_is_trusted(path: Path) -> bool:
+    """Require a root/current-user-owned path with no group or world-writable component."""
+
+    if os.name != "posix" or not _git_executable_is_usable(path, native_windows=False):
+        return False
+    try:
+        effective_user_id = os.geteuid()
+        trusted_owners = {0, effective_user_id}
+        current = path
+        while True:
+            metadata = current.stat()
+            if (
+                metadata.st_uid not in trusted_owners
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or (current == path and metadata.st_uid != 0 and metadata.st_nlink != 1)
+                or (current == path and not stat.S_ISREG(metadata.st_mode))
+                or (current != path and not stat.S_ISDIR(metadata.st_mode))
+            ):
+                return False
+            parent = current.parent
+            if parent == current:
+                return True
+            current = parent
+    except (AttributeError, OSError):
+        return False
+
+
+def _windows_executable_boundary_is_trusted(path: Path) -> bool:
+    """Authorize a current-user-owned executable and its complete native Windows ancestry."""
+
+    try:
+        operations = NativeWindowsSecurityOperations()
+        authorization = authorize_windows_managed_path(
+            PureWindowsPath(os.fspath(path)),
+            kind=WindowsPathKind.FILE,
+            operations=operations,
+        )
+        authorization.revalidate()
+    except Exception:
+        return False
+    return True
+
+
+def _windows_git_names(windows_pathext: str | None) -> tuple[str, ...]:
+    extensions = ".COM;.EXE" if windows_pathext is None else windows_pathext
+    names: list[str] = []
+    for item in extensions.split(";"):
+        normalized = item.strip().casefold()
+        if normalized not in {".com", ".exe"}:
+            continue
+        name = f"git{normalized}"
+        if name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def _find_git_executable(
+    search_path: str | None,
+    *,
+    project_root: Path,
+    current_directory: Path,
+    native_windows: bool,
+    windows_pathext: str | None,
+    candidate_is_trusted: Callable[[Path], bool],
+) -> str | None:
+    """Manually enumerate bounded PATH entries without implicit current-directory lookup."""
+
+    try:
+        if (
+            search_path is None
+            or not isinstance(search_path, str)
+            or "\x00" in search_path
+            or not callable(candidate_is_trusted)
+        ):
+            return None
+        checked_project = project_root.resolve(strict=True)
+        checked_current = current_directory.resolve(strict=True)
+        if not checked_project.is_dir() or not checked_current.is_dir():
+            return None
+    except (OSError, RuntimeError, TypeError):
+        return None
+
+    names = _windows_git_names(windows_pathext) if native_windows else ("git",)
+    separator = ";" if native_windows else os.pathsep
+    seen_directories: set[Path] = set()
+    seen_candidates: set[Path] = set()
+    for item in search_path.split(separator):
+        if not item or "\x00" in item:
+            continue
+        directory = Path(item)
+        if not directory.is_absolute():
+            continue
+        try:
+            resolved_directory = directory.resolve(strict=True)
+            if (
+                resolved_directory in seen_directories
+                or not resolved_directory.is_dir()
+                or _path_may_be_within(resolved_directory, checked_project)
+                or _path_may_be_within(resolved_directory, checked_current)
+            ):
+                continue
+            seen_directories.add(resolved_directory)
+        except (OSError, RuntimeError):
+            continue
+
+        for name in names:
+            try:
+                candidate = (resolved_directory / name).resolve(strict=True)
+            except (OSError, RuntimeError):
+                continue
+            if (
+                candidate in seen_candidates
+                or _path_may_be_within(candidate, checked_project)
+                or _path_may_be_within(candidate, checked_current)
+            ):
+                continue
+            seen_candidates.add(candidate)
+            if not _git_executable_is_usable(candidate, native_windows=native_windows):
+                continue
+            try:
+                if not candidate_is_trusted(candidate):
+                    continue
+            except Exception:
+                continue
+            return str(candidate)
+    return None
+
+
+def _resolved_git_executable(project_root: Path) -> str | None:
+    """Resolve Git only through an absolute, non-project, validated trust boundary."""
+
+    native_windows = os.name == "nt"
+    try:
+        current_directory = Path.cwd()
+    except OSError:
+        return None
+    return _find_git_executable(
+        os.environ.get("PATH"),
+        project_root=project_root,
+        current_directory=current_directory,
+        native_windows=native_windows,
+        windows_pathext=os.environ.get("PATHEXT") if native_windows else None,
+        candidate_is_trusted=(
+            _windows_executable_boundary_is_trusted
+            if native_windows
+            else _posix_executable_boundary_is_trusted
+        ),
+    )
+
+
+def git_project_file_review(spec: ProviderInstallationSpec) -> GitProjectFileReview:
+    """Classify managed-file Git visibility without mutating repository state."""
 
     checked = _validated_spec(spec)
     candidates = checked.project_local_paths
     relative = tuple(path.relative_to(checked.project_root).as_posix() for path in candidates)
+    git_executable = _resolved_git_executable(checked.project_root)
+    if git_executable is None:
+        return GitProjectFileReview(
+            GitProjectFileDisposition.UNAVAILABLE,
+            candidates,
+            (),
+            (),
+        )
+    command_prefix = (
+        git_executable,
+        "-c",
+        "color.ui=false",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "maintenance.auto=false",
+    )
     try:
-        completed = subprocess.run(
+        repository = subprocess.run(
             (
-                "git",
-                "-c",
-                "color.ui=false",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "maintenance.auto=false",
+                *command_prefix,
+                "rev-parse",
+                "--is-inside-work-tree",
+            ),
+            cwd=checked.project_root,
+            env=_git_environment(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+    except FileNotFoundError:
+        return GitProjectFileReview(
+            GitProjectFileDisposition.UNAVAILABLE,
+            candidates,
+            (),
+            (),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return GitProjectFileReview(
+            GitProjectFileDisposition.UNAVAILABLE,
+            candidates,
+            (),
+            (),
+        )
+    repository_stderr = repository.stderr
+    if (
+        repository.returncode == 128
+        and isinstance(repository_stderr, bytes)
+        and b"not a git repository" in repository_stderr
+        and len(repository_stderr) <= 64 * 1_024
+    ):
+        return GitProjectFileReview(
+            GitProjectFileDisposition.NOT_REPOSITORY,
+            candidates,
+            (),
+            (),
+        )
+    if repository.returncode != 0 or repository.stdout != b"true\n":
+        return GitProjectFileReview(
+            GitProjectFileDisposition.UNAVAILABLE,
+            candidates,
+            (),
+            (),
+        )
+
+    try:
+        tracked = subprocess.run(
+            (
+                *command_prefix,
                 "ls-files",
                 "-z",
                 "--",
@@ -2688,21 +2957,95 @@ def git_tracked_project_files(spec: ProviderInstallationSpec) -> tuple[Path, ...
             timeout=3,
             check=False,
         )
+        ignored = subprocess.run(
+            (
+                *command_prefix,
+                "check-ignore",
+                "--no-index",
+                "-z",
+                "--stdin",
+            ),
+            cwd=checked.project_root,
+            env=_git_environment(),
+            input=b"".join(name.encode("utf-8") + b"\0" for name in relative),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
     except (OSError, subprocess.SubprocessError):
-        return ()
-    if completed.returncode != 0 or len(completed.stdout) > 64 * 1_024:
-        return ()
-    tracked_names = frozenset(
-        item.decode("utf-8") for item in completed.stdout.split(b"\0") if item
-    )
-    return tuple(
+        return GitProjectFileReview(
+            GitProjectFileDisposition.UNAVAILABLE,
+            candidates,
+            (),
+            (),
+        )
+    if (
+        tracked.returncode != 0
+        or ignored.returncode not in (0, 1)
+        or len(tracked.stdout) > 64 * 1_024
+        or len(ignored.stdout) > 64 * 1_024
+    ):
+        return GitProjectFileReview(
+            GitProjectFileDisposition.UNAVAILABLE,
+            candidates,
+            (),
+            (),
+        )
+    try:
+        tracked_names = frozenset(
+            item.decode("utf-8", errors="strict") for item in tracked.stdout.split(b"\0") if item
+        )
+        ignored_names = frozenset(
+            item.decode("utf-8", errors="strict") for item in ignored.stdout.split(b"\0") if item
+        )
+    except UnicodeDecodeError:
+        return GitProjectFileReview(
+            GitProjectFileDisposition.UNAVAILABLE,
+            candidates,
+            (),
+            (),
+        )
+    expected_names = frozenset(relative)
+    if not tracked_names <= expected_names or not ignored_names <= expected_names:
+        return GitProjectFileReview(
+            GitProjectFileDisposition.UNAVAILABLE,
+            candidates,
+            (),
+            (),
+        )
+    tracked_files = tuple(
         path for path, name in zip(candidates, relative, strict=True) if name in tracked_names
     )
+    unignored_files = tuple(
+        path
+        for path, name in zip(candidates, relative, strict=True)
+        if name in tracked_names or name not in ignored_names
+    )
+    disposition = (
+        GitProjectFileDisposition.UNIGNORED
+        if unignored_files
+        else GitProjectFileDisposition.ALL_IGNORED
+    )
+    return GitProjectFileReview(
+        disposition,
+        candidates,
+        unignored_files,
+        tracked_files,
+    )
+
+
+def git_tracked_project_files(spec: ProviderInstallationSpec) -> tuple[Path, ...]:
+    """Return managed files already tracked by Git; never mutate ignore configuration."""
+
+    return git_project_file_review(spec).tracked_files
 
 
 __all__ = [
     "MAX_INSTALLATION_JOURNAL_BYTES",
     "MAX_INSTALLATION_RECEIPT_BYTES",
+    "GitProjectFileDisposition",
+    "GitProjectFileReview",
     "InstallationDisposition",
     "InstallationError",
     "InstallationIdentity",
@@ -2712,6 +3055,7 @@ __all__ = [
     "InstallationStatus",
     "derive_installation_identity",
     "ensure_private_installation_directory",
+    "git_project_file_review",
     "git_tracked_project_files",
     "inspect_installation_receipt",
     "inspect_provider_installation",

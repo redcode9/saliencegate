@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 DOCUMENTED_COMMAND_CASES = {
-    "offline-demo": "saliencegate demo",
     "shadow-native": (
         "saliencegate shadow analyze .saliencegate-shadow/events.ndjson "
         "--run-id b35f05f3-555b-4f09-8996-a7b3693bb54a "
@@ -42,6 +41,8 @@ DOCUMENTED_COMMAND_CASES = {
         "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee "
         "--output .saliencegate/atif-shadow/terminus.report.json --json"
     ),
+    "capture-status": "saliencegate status",
+    "capture-sessions": "saliencegate sessions --limit 20",
 }
 
 _ARTIFACT_BLOCK = re.compile(
@@ -61,7 +62,40 @@ _PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS = frozenset(
         "OPENAI_PROJECT_ID",
     }
 )
+_CAPTURE_PROVIDER_ALIASES = ("codex", "claude-code", "opencode", "pi")
+_POISONED_PROVIDER_CREDENTIAL = "provider-credential-read-must-fail"
+_CONTROLLED_CAPTURE_SENTINELS = tuple(
+    f"artifact-{provider}-{kind}-sentinel"
+    for provider in _CAPTURE_PROVIDER_ALIASES
+    for kind in ("native-session", "raw-content")
+)
 _WINDOWS_INVALID_FILENAME_CHARACTERS = frozenset('<>:"|?*')
+_EXPECTED_CONNECTOR_NODE_VERSION = "v22.19.0"
+_SOCKET_GUARD_PTH = b"import saliencegate_artifact_socket_guard\n"
+_SOCKET_CANARY_SOURCE = r"""
+import _socket
+import socket
+import sys
+
+guard = sys.modules.get("saliencegate_artifact_socket_guard")
+if guard is None or getattr(guard, "SOCKET_DENIAL_ACTIVE", False) is not True:
+    raise RuntimeError("installed artifact socket guard was not activated")
+if getattr(guard, "PROVIDER_CREDENTIAL_DENIAL_ACTIVE", False) is not True:
+    raise RuntimeError("installed artifact credential guard was not activated")
+for operation in (
+    lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM),
+    lambda: _socket.socket(socket.AF_INET, socket.SOCK_STREAM),
+    lambda: socket.getaddrinfo("localhost", 9),
+    lambda: socket.create_connection(("127.0.0.1", 9)),
+):
+    try:
+        operation()
+    except guard.ArtifactSocketAccessError:
+        pass
+    else:
+        raise RuntimeError("installed artifact child opened a socket or resolver")
+print("installed-artifact-child-network-and-credential-denial-ok")
+""".strip()
 
 
 @dataclass(frozen=True)
@@ -89,15 +123,10 @@ _ATIF_CASES = (
         run_id="7e2a0000-0000-4000-8000-000000000001",
     ),
 )
-EXECUTED_COMMAND_CASES = frozenset(
-    (
-        "offline-demo",
-        "shadow-native",
-        "atif-one-call",
-        *(f"atif-{case.name}" for case in _ATIF_CASES),
-    )
+SUPPLEMENTAL_ARTIFACT_PROOFS = frozenset(
+    {"offline-demo", "atif-one-call", "capture-lifecycle", "capture-quickstart"}
 )
-SUPPLEMENTAL_ARTIFACT_PROOFS = frozenset({"atif-one-call"})
+EXECUTED_COMMAND_CASES = frozenset((*DOCUMENTED_COMMAND_CASES, *SUPPLEMENTAL_ARTIFACT_PROOFS))
 _WINDOWS_CLI_SHIM = b"from saliencegate.cli import entrypoint\nraise SystemExit(entrypoint())\n"
 
 
@@ -154,7 +183,11 @@ def _run(
 
 def _diagnostic_excerpt(payload: bytes | None) -> str:
     text = (payload or b"").decode("utf-8", errors="replace")
-    text = text.replace("provider-credential-read-must-fail", "<redacted>")
+    for sentinel in (
+        _POISONED_PROVIDER_CREDENTIAL,
+        *_CONTROLLED_CAPTURE_SENTINELS,
+    ):
+        text = text.replace(sentinel, "<redacted>")
     limit = 4096
     if len(text) > limit:
         text = text[:limit] + "\n[output truncated]"
@@ -174,6 +207,20 @@ def _normalize_transport_stdout(payload: bytes, *, platform: str | None = None) 
     if not payload.endswith(b"\r\n") or payload.count(b"\r\n") != 1 or b"\r" in payload[:-2]:
         raise RuntimeError("artifact proof stdout has a non-canonical Windows transport ending")
     return payload[:-2] + b"\n"
+
+
+def _normalize_terminal_stdout(payload: bytes, *, platform: str | None = None) -> bytes:
+    if type(payload) is not bytes:
+        raise RuntimeError("artifact proof stdout is invalid")
+    selected_platform = os.name if platform is None else platform
+    if selected_platform not in {"nt", "posix"}:
+        raise RuntimeError("artifact proof platform is unsupported")
+    if selected_platform == "posix" or b"\r" not in payload:
+        return payload
+    normalized = payload.replace(b"\r\n", b"\n")
+    if b"\r" in normalized:
+        raise RuntimeError("artifact proof terminal stdout has a non-canonical Windows ending")
+    return normalized
 
 
 def _require_one_distribution(dist_dir: Path, suffix: str) -> Path:
@@ -388,7 +435,7 @@ def _environment_without_provider_credentials(source: Mapping[str, str]) -> dict
     return environment
 
 
-def _private_environment(root: Path) -> dict[str, str]:
+def _private_environment(root: Path, *, python: Path) -> dict[str, str]:
     home = root / "home"
     config = root / "config"
     cache = root / "cache"
@@ -408,6 +455,22 @@ def _private_environment(root: Path) -> dict[str, str]:
         temporary,
     ):
         directory.mkdir(mode=0o700)
+    fake_hosts = root / "fake-hosts"
+    fake_hosts.mkdir(mode=0o700)
+    if os.name == "nt":
+        host_payloads = {
+            "codex.cmd": b"@echo off\r\necho codex-cli 0.144.6\r\n",
+            "claude.cmd": b"@echo off\r\necho 2.1.204 (Claude Code)\r\n",
+        }
+    else:
+        host_payloads = {
+            "codex": b"#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.144.6'\n",
+            "claude": b"#!/bin/sh\nprintf '%s\\n' '2.1.204 (Claude Code)'\n",
+        }
+    for name, payload in host_payloads.items():
+        destination = fake_hosts / name
+        _write_private(destination, payload)
+        destination.chmod(0o700)
     environment = _environment_without_provider_credentials(os.environ)
     environment.update(
         {
@@ -423,13 +486,238 @@ def _private_environment(root: Path) -> dict[str, str]:
             "TEMP": os.fspath(temporary),
             "TMP": os.fspath(temporary),
             "TMPDIR": os.fspath(temporary),
-            **{
-                key: "provider-credential-read-must-fail"
-                for key in _PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS
-            },
+            "PATH": os.pathsep.join((os.fspath(fake_hosts), os.fspath(python.parent))),
+            **{key: _POISONED_PROVIDER_CREDENTIAL for key in _PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS},
         }
     )
+    if os.name == "nt":
+        environment["PATHEXT"] = ".COM;.EXE;.BAT;.CMD"
     return environment
+
+
+def _run_capture_cli(
+    *,
+    label: str,
+    python: Path,
+    guard: Path,
+    saliencegate: Path,
+    arguments: Sequence[str | os.PathLike[str]],
+    cwd: Path,
+    environment: dict[str, str],
+) -> str:
+    completed = _run(
+        (python, "-I", guard, saliencegate, *arguments),
+        cwd=cwd,
+        env=environment,
+        capture_output=True,
+    )
+    output = _normalize_terminal_stdout(completed.stdout).decode("utf-8")
+    if any(
+        sentinel in output
+        for sentinel in (_POISONED_PROVIDER_CREDENTIAL, *_CONTROLLED_CAPTURE_SENTINELS)
+    ):
+        raise RuntimeError(f"{label} capture quickstart exposed sensitive native data")
+    if completed.stderr:
+        raise RuntimeError(f"{label} capture quickstart command wrote to stderr")
+    return output
+
+
+def _validate_capture_connect_output(value: str, *, prefix: str, label: str) -> None:
+    git_results = (
+        "Git will surface 1 (0 already tracked)",
+        "All 1 project-local managed file(s) are ignored by Git",
+        "no Git work tree was detected",
+        "Git visibility could not be determined",
+    )
+    if (
+        not value.startswith(prefix)
+        or not any(
+            managed in value
+            for managed in (
+                "Review 1 project-local managed file(s)",
+                "All 1 project-local managed file(s)",
+            )
+        )
+        or sum(result in value for result in git_results) != 1
+        or not value.endswith(".gitignore was not changed.\n")
+    ):
+        raise RuntimeError(f"{label} capture quickstart connect returned unexpected output")
+
+
+def _prove_capture_quickstart(
+    *,
+    label: str,
+    python: Path,
+    guard: Path,
+    private_validator: Path,
+    capture_validator: Path,
+    saliencegate: Path,
+    case_root: Path,
+    environment: dict[str, str],
+) -> None:
+    quickstart_root = case_root / "capture-quickstart"
+    quickstart_root.mkdir(mode=0o700)
+    project = quickstart_root / "project"
+    project.mkdir(mode=0o700)
+
+    dry_run = _run_capture_cli(
+        label=label,
+        python=python,
+        guard=guard,
+        saliencegate=saliencegate,
+        arguments=("connect", "codex", "--project", project, "--dry-run"),
+        cwd=project,
+        environment=environment,
+    )
+    _validate_capture_connect_output(
+        dry_run,
+        prefix="codex capture: would install; disabled during dry-run.",
+        label=label,
+    )
+    if tuple(project.iterdir()):
+        raise RuntimeError(f"{label} capture quickstart dry-run mutated the project")
+
+    connected = _run_capture_cli(
+        label=label,
+        python=python,
+        guard=guard,
+        saliencegate=saliencegate,
+        arguments=("connect", "codex", "--project", project),
+        cwd=project,
+        environment=environment,
+    )
+    _validate_capture_connect_output(
+        connected,
+        prefix="codex capture: installed; enabled.",
+        label=label,
+    )
+
+    doctor = _run_capture_cli(
+        label=label,
+        python=python,
+        guard=guard,
+        saliencegate=saliencegate,
+        arguments=("doctor", "--capture"),
+        cwd=project,
+        environment=environment,
+    )
+    if (
+        not doctor.startswith("SalienceGate doctor: healthy\n")
+        or "[PASS] Passive capture (required): "
+        "Capture store and local boundaries passed read-only checks.\n"
+        not in doctor
+    ):
+        raise RuntimeError(f"{label} capture quickstart doctor returned unexpected output")
+
+    fixture = _run(
+        (
+            python,
+            "-I",
+            guard,
+            capture_validator,
+            "emit-codex-fixture",
+            project,
+            case_root,
+        ),
+        cwd=project,
+        env=environment,
+        capture_output=True,
+    )
+    if (
+        _normalize_transport_stdout(fixture.stdout) != b"capture-codex-fixture-ok\n"
+        or fixture.stderr
+    ):
+        raise RuntimeError(f"{label} capture quickstart fixture returned unexpected output")
+
+    status = _run_capture_cli(
+        label=label,
+        python=python,
+        guard=guard,
+        saliencegate=saliencegate,
+        arguments=("status", "codex", "--project", project),
+        cwd=project,
+        environment=environment,
+    )
+    if (
+        not status.startswith("Passive capture status\n")
+        or "codex: active_observed (sessions=1; quarantined=0;" not in status
+    ):
+        raise RuntimeError(f"{label} capture quickstart status returned unexpected output")
+
+    sessions = _run_capture_cli(
+        label=label,
+        python=python,
+        guard=guard,
+        saliencegate=saliencegate,
+        arguments=("sessions", "--limit", "20"),
+        cwd=project,
+        environment=environment,
+    )
+    if not sessions.startswith("Captured sessions\n") or "  codex  open  events=3" not in sessions:
+        raise RuntimeError(f"{label} capture quickstart sessions returned unexpected output")
+
+    report_directory = project / ".saliencegate" / "reports"
+    for directory in (report_directory.parent, report_directory):
+        preparation = _run(
+            (python, "-I", guard, private_validator, "prepare-private-directory", directory),
+            cwd=project,
+            env=environment,
+            capture_output=True,
+        )
+        if (
+            _normalize_transport_stdout(preparation.stdout) != b"shadow-private-directory-ok\n"
+            or preparation.stderr
+        ):
+            raise RuntimeError(f"{label} capture quickstart private report directory setup failed")
+    report_path = report_directory / "capture-report.json"
+    report = _run_capture_cli(
+        label=label,
+        python=python,
+        guard=guard,
+        saliencegate=saliencegate,
+        arguments=("report", "--latest", "--output", report_path),
+        cwd=project,
+        environment=environment,
+    )
+    if (
+        not report.startswith("Insufficient evidence\nSalienceGate capture report\n")
+        or "profile: codex-hooks/v1; compatibility: verified; host version: 0.144.6\n" not in report
+        or "decision authority: false; model calls: 0; confirmatory: false\n" not in report
+    ):
+        raise RuntimeError(f"{label} capture quickstart report returned unexpected output")
+    report_validation = _run(
+        (
+            python,
+            "-I",
+            guard,
+            capture_validator,
+            "validate-codex-report",
+            report_path,
+            case_root,
+        ),
+        cwd=project,
+        env=environment,
+        capture_output=True,
+    )
+    if (
+        _normalize_transport_stdout(report_validation.stdout) != b"capture-codex-report-ok\n"
+        or report_validation.stderr
+    ):
+        raise RuntimeError(f"{label} capture quickstart report validation failed")
+
+    disconnected = _run_capture_cli(
+        label=label,
+        python=python,
+        guard=guard,
+        saliencegate=saliencegate,
+        arguments=("disconnect", "codex", "--project", project),
+        cwd=project,
+        environment=environment,
+    )
+    if disconnected != (
+        "codex capture: uninstalled; disabled. Existing capture data was retained.\n"
+    ):
+        raise RuntimeError(f"{label} capture quickstart disconnect returned unexpected output")
 
 
 def _prove_documented_cases(
@@ -442,10 +730,11 @@ def _prove_documented_cases(
     case_root = work_root / label
     case_root.mkdir(mode=0o700)
     shadow_root = case_root / "shadow"
-    environment = _private_environment(case_root)
+    environment = _private_environment(case_root, python=python)
     guard = package_root / "scripts" / "run_without_sockets.py"
     import_smoke = package_root / "scripts" / "smoke_package_imports.py"
     validator = package_root / "scripts" / "smoke_shadow_installed.py"
+    capture_validator = package_root / "scripts" / "smoke_capture_installed.py"
     examples = package_root / "examples" / "atif-shadow"
     saliencegate = _installed_cli_script(python=python, case_root=case_root)
 
@@ -470,6 +759,31 @@ def _prove_documented_cases(
     imported_stdout = _normalize_transport_stdout(imported.stdout)
     if imported.stderr or re.fullmatch(rb"[0-9]+\.[0-9]+\.[0-9]+\n", imported_stdout) is None:
         raise RuntimeError(f"{label} core import smoke returned unexpected output")
+
+    empty_capture_project = case_root / "capture-empty-state"
+    empty_capture_project.mkdir(mode=0o700)
+    capture_status = _run(
+        (python, "-I", guard, saliencegate, "status"),
+        cwd=empty_capture_project,
+        env=environment,
+        capture_output=True,
+    )
+    status_output = _normalize_terminal_stdout(capture_status.stdout).decode("utf-8")
+    if capture_status.stderr or any(
+        f"{provider}: not_installed" not in status_output for provider in _CAPTURE_PROVIDER_ALIASES
+    ):
+        raise RuntimeError(f"{label} capture status returned unexpected output")
+    capture_sessions = _run(
+        (python, "-I", guard, saliencegate, "sessions", "--limit", "20"),
+        cwd=empty_capture_project,
+        env=environment,
+        capture_output=True,
+    )
+    if (
+        _normalize_terminal_stdout(capture_sessions.stdout) != b"No captured sessions.\n"
+        or capture_sessions.stderr
+    ):
+        raise RuntimeError(f"{label} capture sessions returned unexpected output")
 
     demo = _run(
         (python, "-I", guard, saliencegate, "demo"),
@@ -629,12 +943,175 @@ def _prove_documented_cases(
             env=environment,
         )
 
+    _prove_capture_quickstart(
+        label=label,
+        python=python,
+        guard=guard,
+        private_validator=validator,
+        capture_validator=capture_validator,
+        saliencegate=saliencegate,
+        case_root=case_root,
+        environment=environment,
+    )
+
+    capture_lifecycle = _run(
+        (
+            python,
+            "-I",
+            guard,
+            capture_validator,
+            case_root / "capture-lifecycle",
+        ),
+        cwd=case_root,
+        env=environment,
+        capture_output=True,
+    )
+    if (
+        _normalize_transport_stdout(capture_lifecycle.stdout) != b"capture-installed-artifact-ok\n"
+        or capture_lifecycle.stderr
+    ):
+        raise RuntimeError(f"{label} capture lifecycle returned unexpected output")
+
+
+def _resolve_exact_connector_node(command: str) -> Path:
+    if type(command) is not str or not command or "\0" in command:
+        raise RuntimeError("installed connector proof Node.js command is invalid")
+    selected = shutil.which(command)
+    if selected is None:
+        raise RuntimeError("installed connector proof could not resolve Node.js")
+    try:
+        resolved = Path(selected).resolve(strict=True)
+        metadata = resolved.lstat()
+    except OSError:
+        raise RuntimeError("installed connector proof could not resolve Node.js") from None
+    if not stat.S_ISREG(metadata.st_mode) or (
+        os.name == "posix" and not os.access(resolved, os.X_OK)
+    ):
+        raise RuntimeError("installed connector proof could not resolve Node.js")
+    completed = _run((resolved, "--version"), capture_output=True)
+    if completed.stdout != f"{_EXPECTED_CONNECTOR_NODE_VERSION}\n".encode() or completed.stderr:
+        raise RuntimeError("installed connector proof requires exact Node.js 22.19.0")
+    return resolved
+
+
+def _install_artifact_socket_guard(*, python: Path, package_root: Path) -> None:
+    source = package_root / "scripts" / "artifact_socket_guard.py"
+    try:
+        source_metadata = source.lstat()
+    except OSError:
+        raise RuntimeError("source distribution is missing the child socket guard") from None
+    if source.is_symlink() or not stat.S_ISREG(source_metadata.st_mode):
+        raise RuntimeError("source distribution child socket guard is invalid")
+    location = _run(
+        (
+            python,
+            "-I",
+            "-c",
+            ("import sys,sysconfig; print(sys.prefix); print(sysconfig.get_path('purelib'))"),
+        ),
+        capture_output=True,
+    )
+    if location.stderr:
+        raise RuntimeError("installed artifact purelib discovery wrote to stderr")
+    try:
+        prefix_raw, purelib_raw = location.stdout.decode("utf-8", errors="strict").splitlines()
+        prefix = Path(prefix_raw).resolve(strict=True)
+        purelib = Path(purelib_raw).resolve(strict=True)
+        python_prefix = python.parent.parent.resolve(strict=True)
+        purelib.relative_to(prefix)
+    except (OSError, UnicodeError, ValueError):
+        raise RuntimeError("installed artifact purelib discovery is invalid") from None
+    if prefix != python_prefix or purelib.is_symlink() or not purelib.is_dir():
+        raise RuntimeError("installed artifact purelib discovery is invalid")
+    _write_private(
+        purelib / "saliencegate_artifact_socket_guard.py",
+        source.read_bytes(),
+    )
+    _write_private(
+        purelib / "saliencegate_artifact_socket_guard.pth",
+        _SOCKET_GUARD_PTH,
+    )
+
+
+def _prove_artifact_socket_guard(
+    *,
+    python: Path,
+    cwd: Path,
+    environment: dict[str, str],
+) -> None:
+    canary_environment = _environment_without_provider_credentials(environment)
+    canary = _run(
+        (python, "-c", _SOCKET_CANARY_SOURCE),
+        cwd=cwd,
+        env=canary_environment,
+        capture_output=True,
+    )
+    if (
+        _normalize_transport_stdout(canary.stdout)
+        != b"installed-artifact-child-network-and-credential-denial-ok\n"
+        or canary.stderr
+    ):
+        raise RuntimeError("installed artifact child network and credential denial canary failed")
+
+
+def _prove_installed_connector_e2e(
+    *,
+    label: str,
+    python: Path,
+    package_root: Path,
+    work_root: Path,
+    node: Path,
+) -> None:
+    case_root = work_root / label / "launcher path & data"
+    case_root.mkdir(mode=0o700, parents=True)
+    environment = _private_environment(case_root, python=python)
+    environment.update(
+        {
+            "SALIENCEGATE_ARTIFACT_SOCKET_DENIAL": "1",
+            "SALIENCEGATE_ARTIFACT_SOCKET_STARTUP_LOG": os.fspath(
+                case_root / "socket-denial-startups.log"
+            ),
+        }
+    )
+    _prove_artifact_socket_guard(
+        python=python,
+        cwd=case_root,
+        environment=environment,
+    )
+    guard = package_root / "scripts" / "run_without_sockets.py"
+    network_guard = package_root / "connectors" / "scripts" / "deny-network.mjs"
+    capture_validator = package_root / "scripts" / "smoke_capture_installed.py"
+    lifecycle_environment = dict(environment)
+    del lifecycle_environment["SALIENCEGATE_ARTIFACT_SOCKET_DENIAL"]
+    lifecycle = _run(
+        (
+            python,
+            "-I",
+            guard,
+            capture_validator,
+            "installed-e2e",
+            case_root / "capture-installed-connectors",
+            node,
+            network_guard,
+        ),
+        cwd=case_root,
+        env=lifecycle_environment,
+        capture_output=True,
+    )
+    if (
+        _normalize_transport_stdout(lifecycle.stdout) != b"capture-installed-connectors-e2e-ok\n"
+        or lifecycle.stderr
+    ):
+        raise RuntimeError(f"{label} installed connector end-to-end proof failed")
+
 
 def verify_built_artifacts(
     *,
     dist_dir: Path,
     work_root: Path,
     python_version: str,
+    connector_node: str | None = None,
+    capture_connectors_only: bool = False,
 ) -> None:
     if set(DOCUMENTED_COMMAND_CASES) | SUPPLEMENTAL_ARTIFACT_PROOFS != EXECUTED_COMMAND_CASES:
         raise RuntimeError("documented and executed artifact command cases differ")
@@ -649,8 +1126,11 @@ def verify_built_artifacts(
         "pyproject.toml",
         "uv.lock",
         "scripts/run_without_sockets.py",
+        "scripts/artifact_socket_guard.py",
         "scripts/smoke_package_imports.py",
+        "scripts/smoke_capture_installed.py",
         "scripts/smoke_shadow_installed.py",
+        "connectors/scripts/deny-network.mjs",
         "examples/atif-shadow/one_call.py",
         "examples/atif-shadow/codex-minimal.trajectory.json",
         "examples/atif-shadow/terminus-minimal.trajectory.json",
@@ -708,6 +1188,29 @@ def verify_built_artifacts(
         build_constraints=build_constraints,
         is_sdist=True,
     )
+    if capture_connectors_only:
+        if connector_node is None:
+            raise RuntimeError("installed connector proof requires Node.js")
+        node = _resolve_exact_connector_node(connector_node)
+        _install_artifact_socket_guard(python=wheel_python, package_root=package_root)
+        _install_artifact_socket_guard(python=sdist_python, package_root=package_root)
+        _prove_installed_connector_e2e(
+            label="wheel-connectors",
+            python=wheel_python,
+            package_root=package_root,
+            work_root=work_root,
+            node=node,
+        )
+        _prove_installed_connector_e2e(
+            label="sdist-connectors",
+            python=sdist_python,
+            package_root=package_root,
+            work_root=work_root,
+            node=node,
+        )
+        return
+    if connector_node is not None:
+        raise RuntimeError("--node requires --capture-connectors-only")
     _prove_documented_cases(
         label="wheel",
         python=wheel_python,
@@ -723,7 +1226,11 @@ def verify_built_artifacts(
 
 
 @contextmanager
-def _workspace(requested: Path | None) -> Iterator[Path]:
+def _workspace(
+    requested: Path | None,
+    *,
+    default_parent: Path | None = None,
+) -> Iterator[Path]:
     if requested is not None:
         requested.mkdir(mode=0o700)
         canonical = requested.resolve(strict=True)
@@ -732,7 +1239,17 @@ def _workspace(requested: Path | None) -> Iterator[Path]:
         finally:
             shutil.rmtree(canonical)
         return
-    created = Path(tempfile.mkdtemp(prefix="saliencegate-artifact-smoke-"))
+    canonical_parent = None if default_parent is None else default_parent.resolve(strict=True)
+    if canonical_parent is not None and not canonical_parent.is_dir():
+        raise RuntimeError("artifact smoke workspace parent is unavailable")
+    created = Path(
+        tempfile.mkdtemp(prefix="saliencegate-artifact-smoke-")
+        if canonical_parent is None
+        else tempfile.mkdtemp(
+            prefix="saliencegate-artifact-smoke-",
+            dir=canonical_parent,
+        )
+    )
     temporary = created.resolve(strict=True)
     try:
         yield temporary
@@ -745,19 +1262,26 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dist-dir", type=Path, default=Path("dist"))
     parser.add_argument("--work-dir", type=Path)
     parser.add_argument("--python", default="3.12")
+    parser.add_argument("--node")
+    parser.add_argument("--capture-connectors-only", action="store_true")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     dist_dir = arguments.dist_dir.resolve(strict=True)
-    with _workspace(arguments.work_dir) as work_root:
+    with _workspace(arguments.work_dir, default_parent=dist_dir.parent) as work_root:
         verify_built_artifacts(
             dist_dir=dist_dir,
             work_root=work_root,
             python_version=arguments.python,
+            connector_node=arguments.node,
+            capture_connectors_only=arguments.capture_connectors_only,
         )
-    print("artifact smoke passed for wheel and sdist")
+    if arguments.capture_connectors_only:
+        print("installed connector smoke passed for wheel and sdist")
+    else:
+        print("artifact smoke passed for wheel and sdist")
     return 0
 
 

@@ -30,8 +30,16 @@ PROJECT_RUNTIME_METADATA_SELECTION = (
 )
 PROJECT_RUNTIME_METADATA_CANONICALIZATION = "UTF-8 JSON with sorted keys and compact separators"
 README_ASSETS = (
-    (Path("docs/assets/readme/pipeline.svg"), ("shadow", "missing suffix", "provenance report")),
-    (Path("docs/assets/readme/atif-example-results.svg"), ("codex", "terminus", "synthetic")),
+    (Path("docs/assets/readme/pipeline.svg"), ("capture", "hmac", "bounded report")),
+    (
+        Path("docs/assets/readme/capture-headlines.svg"),
+        (
+            "synthetic",
+            "memory review suggested",
+            "no current evidence",
+            "insufficient evidence",
+        ),
+    ),
     (Path("docs/assets/readme/reference-run.svg"), ("memory", "sqlite", "local reference run")),
 )
 
@@ -75,6 +83,19 @@ _MARKDOWN_IMAGE = re.compile(
 )
 _HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}\Z")
 _NUMBER = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z")
+_OBSERVATIONAL_FORBIDDEN_PATTERNS = (
+    (re.compile(r"(?i)\b(?:improves|preserves)\s+task success\b"), "task-success claim"),
+    (re.compile(r"(?i)\bsaves?\s+tokens?\b"), "token-savings claim"),
+    (re.compile(r"(?i)\btoken savings?\b"), "token-savings claim"),
+    (re.compile(r"(?i)\bcausal effect\b"), "causal claim"),
+    (re.compile(r"(?i)\bcalibrated trigger\b"), "calibration claim"),
+    (re.compile(r"(?i)\bpopulation prevalence\b"), "prevalence claim"),
+    (re.compile(r"(?i)\bthe agent (?:needs|requires) memory\b"), "memory-need certainty"),
+    (
+        re.compile(r"(?i)\breminders? (?:will|would) (?:help|improve)\b"),
+        "reminder-effect claim",
+    ),
+)
 
 
 def _sha256(path: Path) -> str:
@@ -395,6 +416,10 @@ def validate_svg_text(
         for item in required_text
     ):
         findings.append(f"{path}: title and desc lack asset-specific text")
+    rendered_text = _normalized_text(root)
+    for pattern, description in _OBSERVATIONAL_FORBIDDEN_PATTERNS:
+        if pattern.search(rendered_text):
+            findings.append(f"{path}: {description}")
     return tuple(dict.fromkeys(findings))
 
 
@@ -441,9 +466,37 @@ def validate_readme_assets(root: Path = ROOT) -> tuple[str, ...]:
     return tuple(findings)
 
 
+def validate_capture_headline_render(root: Path = ROOT) -> tuple[str, ...]:
+    script = root / "scripts/render_capture_headlines.py"
+    fixture = root / "examples/capture/headline-results.json"
+    output = root / "docs/assets/readme/capture-headlines.svg"
+    try:
+        completed = subprocess.run(
+            (
+                sys.executable,
+                str(script),
+                "--check",
+                "--fixture",
+                str(fixture),
+                "--output",
+                str(output),
+            ),
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return ("docs/assets/readme/capture-headlines.svg: renderer check failed",)
+    if completed.returncode != 0:
+        return ("docs/assets/readme/capture-headlines.svg: fixture rendering is stale",)
+    return ()
+
+
 def main() -> int:
     findings = list(validate_evidence_manifest())
     findings.extend(validate_readme_assets())
+    findings.extend(validate_capture_headline_render())
     readme = ROOT / "README.md"
     if readme.is_file():
         findings.extend(

@@ -38,6 +38,7 @@ PROVIDER_CREDENTIAL_KEYS = (
     "OPENAI_PROJECT_ID",
 )
 POISONED_CREDENTIAL = "provider-credential-read-must-fail"
+NATIVE_SECRET_SENTINEL = "connector-native-secret-sentinel"
 PROVIDER_CREDENTIAL_KEY_SET = frozenset(PROVIDER_CREDENTIAL_KEYS)
 RUNTIME_ASSET_NAMES = {
     "opencode": "saliencegate.js",
@@ -70,11 +71,14 @@ for await (const chunk of process.stdin) bytes += chunk.length;
 if (bytes === 0) throw new Error("connector launcher received no capture chunk");
 const output = process.env.SALIENCEGATE_ARTIFACT_LAUNCH_LOG;
 if (typeof output !== "string" || output.length === 0) throw new Error("missing proof log");
+const provider = process.argv.at(-1);
+if (provider !== "opencode" && provider !== "pi") throw new Error("invalid proof provider");
 await appendFile(
   output,
   `${JSON.stringify({
     network_denial: true,
     provider_credential_keys_present: present,
+    provider,
     schema_version: "connector-artifact-launch/v1",
     stdin_bytes: bytes,
   })}\n`,
@@ -83,14 +87,17 @@ await appendFile(
 """
 
 POSIX_LAUNCHER_SOURCE = (
-    b'#!/bin/sh\nexec "$SALIENCEGATE_ARTIFACT_NODE" "$SALIENCEGATE_ARTIFACT_LAUNCH_SOURCE"\n'
+    b'#!/bin/sh\nexec "$SALIENCEGATE_ARTIFACT_NODE" '
+    b'"$SALIENCEGATE_ARTIFACT_LAUNCH_SOURCE" "{provider}"\n'
 )
 WINDOWS_LAUNCHER_SOURCE = (
-    b'@echo off\r\n"%SALIENCEGATE_ARTIFACT_NODE%" "%SALIENCEGATE_ARTIFACT_LAUNCH_SOURCE%"\r\n'
+    b'@echo off\r\n"%SALIENCEGATE_ARTIFACT_NODE%" '
+    b'"%SALIENCEGATE_ARTIFACT_LAUNCH_SOURCE%" "{provider}"\r\n'
 )
 
 NODE_SMOKE_SOURCE = r"""
 const fail = (message) => { throw new Error(message); };
+const nativeSentinel = "connector-native-secret-sentinel";
 const opencode = await import(process.env.SALIENCEGATE_OPENCODE_ASSET);
 const pi = await import(process.env.SALIENCEGATE_PI_ASSET);
 if (opencode.default?.id !== "saliencegate") fail("invalid OpenCode connector id");
@@ -149,7 +156,7 @@ await openCodeHooks.event({
   event: {
     type: "message.part.updated",
     properties: {
-      part: { ...openCodePart, state: { status: "pending", input: { path: "synthetic" } } },
+      part: { ...openCodePart, state: { status: "pending", input: { path: nativeSentinel } } },
     },
   },
 });
@@ -182,7 +189,7 @@ const piContext = {
   },
 };
 await piHandlers.get("session_start")(
-  { type: "session_start", reason: "startup" },
+  { type: "session_start", reason: "startup", nativeSentinel },
   piContext,
 );
 await piHandlers.get("session_shutdown")(
@@ -382,16 +389,23 @@ def _workspace(requested: Path | None) -> Iterator[Path]:
 
 
 def _redacted(value: str) -> str:
-    return value.replace(POISONED_CREDENTIAL, "<redacted>")
+    result = value
+    for sensitive in (POISONED_CREDENTIAL, NATIVE_SECRET_SENTINEL):
+        result = result.replace(sensitive, "<redacted>")
+    return result
 
 
 def _assert_poison_absent(workspace: Path) -> None:
-    poisoned = POISONED_CREDENTIAL.encode("utf-8")
+    forbidden = tuple(
+        value.encode("utf-8") for value in (POISONED_CREDENTIAL, NATIVE_SECRET_SENTINEL)
+    )
     for path in workspace.rglob("*"):
         if path.is_symlink():
             raise VerificationError("connector artifact smoke created a symbolic link")
-        if path.is_file() and poisoned in path.read_bytes():
-            raise VerificationError("connector artifact smoke persisted a poisoned credential")
+        if path.is_file():
+            payload = path.read_bytes()
+            if any(value in payload for value in forbidden):
+                raise VerificationError("connector artifact smoke persisted sensitive native data")
 
 
 def _project_environment_without_provider_values(
@@ -436,20 +450,32 @@ def _bootstrap_bytes(*, connector: str, bundle: bytes, launcher: Path) -> bytes:
     )
 
 
-def _materialize_launcher(workspace: Path, *, platform: str | None = None) -> Path:
+def _materialize_launcher(
+    workspace: Path,
+    *,
+    connector: str,
+    platform: str | None = None,
+) -> Path:
     selected_platform = os.name if platform is None else platform
-    if selected_platform not in {"nt", "posix"}:
+    if selected_platform not in {"nt", "posix"} or connector not in RUNTIME_PROFILES:
         raise VerificationError("connector artifact launcher platform is unsupported")
     source = workspace / "proof" / "capture-launcher.mjs"
-    _write_private(source, LAUNCHER_SMOKE_SOURCE.encode("utf-8"))
-    launcher = (
-        workspace
-        / "proof"
-        / ("capture-launcher.cmd" if selected_platform == "nt" else "capture-launcher")
+    if source.exists():
+        if source.is_symlink() or source.read_bytes() != LAUNCHER_SMOKE_SOURCE.encode("utf-8"):
+            raise VerificationError("connector artifact launcher source is invalid")
+    else:
+        _write_private(source, LAUNCHER_SMOKE_SOURCE.encode("utf-8"))
+    launcher_directory = workspace / "proof"
+    if selected_platform == "nt":
+        launcher_directory /= "launcher path & data"
+    launcher = launcher_directory / (
+        f"capture-launcher-{connector}.cmd"
+        if selected_platform == "nt"
+        else f"capture-launcher-{connector}"
     )
     launcher_source = (
         WINDOWS_LAUNCHER_SOURCE if selected_platform == "nt" else POSIX_LAUNCHER_SOURCE
-    )
+    ).replace(b"{provider}", connector.encode("ascii"))
     _write_private(launcher, launcher_source, mode=0o700)
     return launcher
 
@@ -460,6 +486,7 @@ def _validate_launch_log(path: Path) -> None:
     lines = path.read_text(encoding="utf-8").splitlines()
     if len(lines) < 3:
         raise VerificationError("built connector runtime did not exercise both launch paths")
+    observed_providers: set[str] = set()
     for line in lines:
         try:
             record = json.loads(line)
@@ -473,9 +500,15 @@ def _validate_launch_log(path: Path) -> None:
             raise VerificationError("connector launcher did not inherit network denial")
         if record.get("provider_credential_keys_present") != []:
             raise VerificationError("connector launcher received a provider credential key")
+        provider = record.get("provider")
+        if provider not in RUNTIME_PROFILES:
+            raise VerificationError("connector launcher proof provider is invalid")
+        observed_providers.add(provider)
         stdin_bytes = record.get("stdin_bytes")
         if not isinstance(stdin_bytes, int) or isinstance(stdin_bytes, bool) or stdin_bytes <= 0:
             raise VerificationError("connector launcher did not receive a capture payload")
+    if observed_providers != set(RUNTIME_PROFILES):
+        raise VerificationError("built connector runtime did not exercise both launch paths")
 
 
 def _run_node_smoke(
@@ -551,26 +584,29 @@ def _run_node_smoke(
     if npm_version.returncode != 0 or npm_version.stdout.strip() != EXPECTED_NPM_VERSION:
         raise VerificationError("connector artifact smoke requires exact npm 10.9.3")
 
-    completed = subprocess.run(
-        (
-            resolved_node,
-            "--no-warnings",
-            "--import",
-            guard.as_uri(),
-            "--input-type=module",
-            "--eval",
-            NODE_SMOKE_SOURCE,
-        ),
-        cwd=workspace,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    try:
+        completed = subprocess.run(
+            (
+                resolved_node,
+                "--no-warnings",
+                "--import",
+                guard.as_uri(),
+                "--input-type=module",
+                "--eval",
+                NODE_SMOKE_SOURCE,
+            ),
+            cwd=workspace,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise VerificationError("connector artifact smoke timed out") from None
     output = completed.stdout + completed.stderr
-    if POISONED_CREDENTIAL in output:
-        raise VerificationError("connector artifact smoke exposed a poisoned credential")
+    if POISONED_CREDENTIAL in output or NATIVE_SECRET_SENTINEL in output:
+        raise VerificationError("connector artifact smoke exposed sensitive native data")
     if completed.returncode != 0:
         detail = _redacted(completed.stderr.strip() or completed.stdout.strip())
         raise VerificationError(f"connector artifact smoke failed: {detail}")
@@ -591,10 +627,10 @@ def verify(*, dist_dir: Path, work_dir: Path | None, node: str, npm: str) -> Non
     with _workspace(work_dir) as workspace:
         guard = workspace / "proof" / "deny-network.mjs"
         _write_private(guard, sdist_payloads[NETWORK_GUARD])
-        launcher = _materialize_launcher(workspace)
         launch_log = workspace / "proof" / "launches.ndjson"
         assets: dict[str, Path] = {}
         for connector, (wheel_name, _sdist_name) in BUNDLES.items():
+            launcher = _materialize_launcher(workspace, connector=connector)
             runtime = workspace / "proof" / connector
             runtime.mkdir(mode=0o700)
             _write_private(runtime / "package.json", b'{"type":"module"}')

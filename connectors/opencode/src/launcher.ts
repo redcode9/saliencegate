@@ -12,6 +12,7 @@ export type LauncherInvocation = Readonly<{
   options: {
     shell: false;
     windowsHide: true;
+    windowsVerbatimArguments?: true;
     env: Record<string, string>;
     stdio: ["pipe", "ignore", "ignore"];
   };
@@ -66,10 +67,11 @@ export function launcherInvocation(input: {
     );
     return {
       file,
-      arguments: ["/d", "/v:off", "/s", "/c", '"%SALIENCEGATE_LAUNCHER%"'],
+      arguments: ["/d", "/v:off", "/s", "/c", '""%SALIENCEGATE_LAUNCHER%""'],
       options: {
         ...options,
         env: { ...windowsEnvironment, SALIENCEGATE_LAUNCHER: input.launcherPath },
+        windowsVerbatimArguments: true,
       },
     };
   } catch (error) {

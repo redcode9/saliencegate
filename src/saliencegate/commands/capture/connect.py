@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from saliencegate.capture import (
     CaptureConnectionState,
@@ -38,6 +38,7 @@ from saliencegate.commands.capture.common import (
 from saliencegate.domain import canonical_json
 from saliencegate.integrations.config_files import ConfigFileError, read_config_bytes
 from saliencegate.integrations.installation import (
+    GitProjectFileDisposition,
     InstallationDisposition,
     InstallationError,
     InstallationState,
@@ -45,7 +46,7 @@ from saliencegate.integrations.installation import (
     _load_receipt_optional,
     derive_installation_identity,
     ensure_private_installation_directory,
-    git_tracked_project_files,
+    git_project_file_review,
     inspect_provider_installation,
     install_provider,
 )
@@ -97,7 +98,20 @@ class CaptureConnectReport(BaseModel):
     dry_run: bool
     capture_enabled: bool
     project_local_files: Annotated[int, Field(ge=0, le=3)]
+    git_disposition: GitProjectFileDisposition
+    git_unignored_files: Annotated[int, Field(ge=0, le=3)]
     git_tracked_files: Annotated[int, Field(ge=0, le=3)]
+
+    @model_validator(mode="after")
+    def git_counts_are_consistent(self) -> CaptureConnectReport:
+        if not (self.git_tracked_files <= self.git_unignored_files <= self.project_local_files):
+            raise ValueError("capture connect Git counts are inconsistent")
+        if self.git_disposition is GitProjectFileDisposition.UNIGNORED:
+            if self.git_unignored_files == 0:
+                raise ValueError("capture connect Git disposition is inconsistent")
+        elif self.git_unignored_files != 0 or self.git_tracked_files != 0:
+            raise ValueError("capture connect Git disposition is inconsistent")
+        return self
 
     def __repr__(self) -> str:
         return "CaptureConnectReport(<redacted>)"
@@ -485,7 +499,7 @@ def run_connect(
             key,
             capture_executable=capture_executable,
         )
-        tracked_project_files = git_tracked_project_files(spec)
+        git_review = git_project_file_review(spec)
         if dry_run:
             status = install_provider(spec, key, dry_run=True)
         else:
@@ -536,7 +550,9 @@ def run_connect(
             dry_run=dry_run,
             capture_enabled=not dry_run and status.state is InstallationState.ENABLED,
             project_local_files=len(spec.project_local_paths),
-            git_tracked_files=len(tracked_project_files),
+            git_disposition=git_review.disposition,
+            git_unignored_files=len(git_review.unignored_files),
+            git_tracked_files=len(git_review.tracked_files),
         )
     except CaptureCommandIntegrityError:
         raise
@@ -570,10 +586,29 @@ def render_connect_human(report: CaptureConnectReport) -> str:
     checked = CaptureConnectReport.model_validate(report)
     action = "would install" if checked.dry_run else checked.disposition.value
     state = "disabled during dry-run" if checked.dry_run else "enabled"
-    tracked = (
-        " Project-local managed files are already Git-tracked." if checked.git_tracked_files else ""
-    )
-    return f"{checked.provider.value} capture: {action}; {state}.{tracked}\n"
+    managed = checked.project_local_files
+    if checked.git_disposition is GitProjectFileDisposition.UNIGNORED:
+        git_review = (
+            f" Review {managed} project-local managed file(s): Git will surface "
+            f"{checked.git_unignored_files} ({checked.git_tracked_files} already tracked); "
+            ".gitignore was not changed."
+        )
+    elif checked.git_disposition is GitProjectFileDisposition.ALL_IGNORED:
+        git_review = (
+            f" All {managed} project-local managed file(s) are ignored by Git; "
+            ".gitignore was not changed."
+        )
+    elif checked.git_disposition is GitProjectFileDisposition.NOT_REPOSITORY:
+        git_review = (
+            f" Review {managed} project-local managed file(s); no Git work tree was detected "
+            "and .gitignore was not changed."
+        )
+    else:
+        git_review = (
+            f" Review {managed} project-local managed file(s); Git visibility could not be "
+            "determined and .gitignore was not changed."
+        )
+    return f"{checked.provider.value} capture: {action}; {state}.{git_review}\n"
 
 
 __all__ = [

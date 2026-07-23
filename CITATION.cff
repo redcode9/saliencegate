@@ -5,12 +5,15 @@ type: software
 authors:
   - family-names: "Carrieri"
     given-names: "Piero"
-version: 0.1.0
+version: 0.2.0
 license: Apache-2.0
 abstract: >-
-  A budget-aware memory intervention runtime for long-horizon agents.
+  A local passive-capture and deterministic Shadow-analysis toolkit for
+  studying memory-relevant signals in long-horizon agent sessions.
 keywords:
   - agent memory
   - long-horizon agents
+  - passive capture
+  - shadow analysis
   - memory intervention
   - behavioral state decay

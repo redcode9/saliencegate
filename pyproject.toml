@@ -4,16 +4,17 @@ build-backend = "hatchling.build"
 
 [project]
 name = "saliencegate"
-version = "0.1.0"
-description = "Budget-aware memory intervention for long-horizon agents"
+version = "0.2.0"
+description = "Passive local agent capture and deterministic Shadow analysis"
 readme = "docs/package-description.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
 keywords = [
   "agents",
+  "passive-capture",
   "long-horizon",
   "memory",
-  "runtime",
+  "shadow-analysis",
 ]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",

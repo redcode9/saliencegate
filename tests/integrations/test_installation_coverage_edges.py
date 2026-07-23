@@ -6,6 +6,7 @@ import hashlib
 import os
 import stat
 import subprocess
+import tempfile
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
@@ -621,13 +622,15 @@ def test_git_probe_handles_process_failures_nonzero_and_oversize_outputs(
 ) -> None:
     spec = _make_spec(tmp_path)
     monkeypatch.setenv("COMSPEC", "synthetic-command")
-    assert installation._git_environment()["COMSPEC"] == "synthetic-command"
+    assert "COMSPEC" not in installation._git_environment()
 
     monkeypatch.setattr(
         installation.subprocess,
         "run",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("git missing")),
     )
+    review = installation.git_project_file_review(spec)
+    assert review.disposition is installation.GitProjectFileDisposition.UNAVAILABLE
     assert installation.git_tracked_project_files(spec) == ()
 
     for completed in (
@@ -640,6 +643,276 @@ def test_git_probe_handles_process_failures_nonzero_and_oversize_outputs(
             lambda *args, _completed=completed, **kwargs: _completed,
         )
         assert installation.git_tracked_project_files(spec) == ()
+
+
+def test_git_probe_rejects_relative_cwd_and_project_path_executables(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _make_spec(tmp_path)
+    project_bin = spec.project_root / "bin"
+    project_bin.mkdir()
+    executable = project_bin / "git"
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    monkeypatch.chdir(spec.project_root)
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join((".", "bin", str(project_bin))),
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def run(command: tuple[str, ...], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(command)
+        raise AssertionError("an untrusted Git executable must never run")
+
+    monkeypatch.setattr(installation.subprocess, "run", run)
+    review = installation.git_project_file_review(spec)
+
+    assert review.disposition is installation.GitProjectFileDisposition.UNAVAILABLE
+    assert calls == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX case-alias regression")
+def test_git_probe_rejects_case_alias_of_project_path_on_case_insensitive_filesystem(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "CaseProject"
+    project_bin = project / "bin"
+    current = tmp_path / "current"
+    project_bin.mkdir(parents=True)
+    current.mkdir()
+    executable = project_bin / "git"
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    aliased_project = tmp_path / "caseproject"
+    try:
+        same_project = os.path.samefile(project, aliased_project)
+    except OSError:
+        same_project = False
+    if not same_project:
+        pytest.skip("filesystem is case-sensitive")
+
+    assert (
+        installation._find_git_executable(
+            str(aliased_project / "bin"),
+            project_root=project,
+            current_directory=current,
+            native_windows=False,
+            windows_pathext=None,
+            candidate_is_trusted=lambda _candidate: True,
+        )
+        is None
+    )
+
+
+def test_git_path_identity_failure_rejects_candidate_before_trust(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _case_root(tmp_path, "project")
+    current = _case_root(tmp_path, "current")
+    candidate_directory = _case_root(tmp_path, "candidate")
+    executable = candidate_directory / "git"
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    checked_project = project.resolve()
+    original_stat = Path.stat
+
+    def failed_project_stat(path: Path, *args: object, **kwargs: object) -> object:
+        if path == checked_project:
+            raise OSError("identity unavailable")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", failed_project_stat)
+    observed: list[Path] = []
+
+    assert installation._path_may_be_within(executable.resolve(), checked_project)
+    assert (
+        installation._find_git_executable(
+            str(candidate_directory),
+            project_root=project,
+            current_directory=current,
+            native_windows=False,
+            windows_pathext=None,
+            candidate_is_trusted=lambda candidate: observed.append(candidate) is None,
+        )
+        is None
+    )
+    assert observed == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership and mode boundary")
+def test_git_probe_rejects_an_absolute_executable_below_world_writable_tmp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _make_spec(tmp_path)
+    with tempfile.TemporaryDirectory(prefix="saliencegate-hostile-git-", dir="/tmp") as raw:
+        hostile_directory = Path(raw)
+        executable = hostile_directory / "git"
+        executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
+        monkeypatch.setenv("PATH", str(hostile_directory))
+
+        assert installation._resolved_git_executable(spec.project_root) is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX link-count boundary")
+def test_git_probe_rejects_a_trusted_path_hard_linked_into_the_project() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="saliencegate-hardlink-git-",
+        dir=Path.cwd(),
+    ) as raw:
+        boundary = Path(raw)
+        project = boundary / "project"
+        current = boundary / "current"
+        trusted_bin = boundary / "trusted-bin"
+        project.mkdir()
+        current.mkdir()
+        trusted_bin.mkdir()
+        executable = trusted_bin / "git"
+        executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
+
+        assert installation._posix_executable_boundary_is_trusted(executable.resolve())
+
+        os.link(executable, project / "project-git")
+
+        assert executable.stat().st_nlink == 2
+        assert not installation._posix_executable_boundary_is_trusted(executable.resolve())
+        assert (
+            installation._find_git_executable(
+                str(trusted_bin),
+                project_root=project,
+                current_directory=current,
+                native_windows=False,
+                windows_pathext=None,
+                candidate_is_trusted=installation._posix_executable_boundary_is_trusted,
+            )
+            is None
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership and link-count boundary")
+def test_posix_git_boundary_allows_privileged_owned_multiply_linked_system_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="saliencegate-system-git-",
+        dir=Path.cwd(),
+    ) as raw:
+        executable = (Path(raw) / "git").resolve()
+        executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
+        original_stat = Path.stat
+
+        def system_owned_stat(path: Path, *args: object, **kwargs: object) -> object:
+            metadata = original_stat(path, *args, **kwargs)
+            if path == executable:
+                return SimpleNamespace(
+                    st_mode=metadata.st_mode,
+                    st_nlink=2,
+                    st_uid=0,
+                )
+            return metadata
+
+        monkeypatch.setattr(Path, "stat", system_owned_stat)
+
+        assert installation._posix_executable_boundary_is_trusted(executable)
+
+
+def test_git_search_manually_enumerates_safe_windows_executables_without_cwd(
+    tmp_path: Path,
+) -> None:
+    project = _case_root(tmp_path, "project")
+    current = _case_root(tmp_path, "current")
+    safe = _case_root(tmp_path, "safe")
+    for directory in (project, current, safe):
+        (directory / "git.exe").write_bytes(b"synthetic executable")
+        (directory / "git.cmd").write_bytes(b"synthetic command wrapper")
+
+    trusted = (safe / "git.exe").resolve()
+    observed: list[Path] = []
+
+    def trust(candidate: Path) -> bool:
+        observed.append(candidate)
+        return candidate == trusted
+
+    selected = installation._find_git_executable(
+        ";".join(("", ".", "relative", str(project), str(current), str(safe))),
+        project_root=project,
+        current_directory=current,
+        native_windows=True,
+        windows_pathext=".CMD;.EXE;.COM",
+        candidate_is_trusted=trust,
+    )
+
+    assert selected == str(trusted)
+    assert observed == [trusted]
+    assert (
+        installation._find_git_executable(
+            str(safe),
+            project_root=project,
+            current_directory=current,
+            native_windows=True,
+            windows_pathext=".CMD",
+            candidate_is_trusted=lambda _candidate: True,
+        )
+        is None
+    )
+    assert (
+        installation._find_git_executable(
+            str(safe),
+            project_root=project,
+            current_directory=current,
+            native_windows=True,
+            windows_pathext=".EXE",
+            candidate_is_trusted=lambda _candidate: False,
+        )
+        is None
+    )
+
+
+def test_windows_git_boundary_requires_current_user_managed_path_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "git.exe"
+    executable.write_bytes(b"synthetic executable")
+    native_operations = object()
+    revalidations: list[bool] = []
+    authorization = SimpleNamespace(revalidate=lambda: revalidations.append(True))
+    monkeypatch.setattr(
+        installation,
+        "NativeWindowsSecurityOperations",
+        lambda: native_operations,
+    )
+
+    def authorize(
+        path: PureWindowsPath,
+        *,
+        kind: WindowsPathKind,
+        operations: object,
+    ) -> object:
+        assert path.name == "git.exe"
+        assert kind is WindowsPathKind.FILE
+        assert operations is native_operations
+        return authorization
+
+    monkeypatch.setattr(installation, "authorize_windows_managed_path", authorize)
+
+    assert installation._windows_executable_boundary_is_trusted(executable.resolve())
+    assert revalidations == [True]
+
+    monkeypatch.setattr(
+        installation,
+        "authorize_windows_managed_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("system-owned or unsafe boundary is intentionally unavailable")
+        ),
+    )
+    assert not installation._windows_executable_boundary_is_trusted(executable.resolve())
 
 
 def test_spec_validation_and_mac_helpers_normalize_backend_and_project_type_failures(
