@@ -915,7 +915,7 @@ def test_populated_version_one_bridge_session_migrates_as_authenticated_legacy(
     ) as store:
         snapshot = store.snapshot_session(CONNECTION_ID, descriptor.session_id)
 
-    assert migrated.applied_versions == (2,)
+    assert migrated.applied_versions == (2, 3)
     assert snapshot.event_count == 1
     assert snapshot.transport_receipt_count == 0
     assert snapshot.coverage_degraded is True

@@ -66,7 +66,10 @@ class FakePiAPI {
   }
 }
 
-function context(sessionID = SESSION_ID): PiExtensionContext {
+function context(
+  sessionID = SESSION_ID,
+  workspacePath?: string,
+): PiExtensionContext {
   const manager = new Proxy(
     { getSessionId: () => sessionID },
     {
@@ -78,11 +81,15 @@ function context(sessionID = SESSION_ID): PiExtensionContext {
       },
     },
   );
+  const target = {
+    sessionManager: manager,
+    ...(workspacePath === undefined ? {} : { cwd: workspacePath }),
+  };
   return new Proxy(
-    { sessionManager: manager },
+    target,
     {
       get(target, property, receiver) {
-        if (property !== "sessionManager") {
+        if (property !== "sessionManager" && property !== "cwd") {
           throw new Error(`forbidden context field ${String(property)}`);
         }
         return Reflect.get(target, property, receiver);
@@ -262,6 +269,44 @@ test("reload, resume, new, and fork starts create distinct windows even for one 
     [WINDOW_A, WINDOW_B, "c".repeat(64), "d".repeat(64)],
   );
   assert.ok(documents.every((document) => document.session_id === SESSION_ID));
+});
+
+test("the extension binds its absolute workspace path to every window batch", async () => {
+  const writes: WindowedCaptureChunkWrite[] = [];
+  const api = new FakePiAPI();
+  const workspacePath =
+    process.platform === "win32"
+      ? "C:\\workspace\\saliencegate"
+      : "/workspace/saliencegate";
+  await createPiExtension({
+    bootstrapURL: new URL("file:///synthetic/.pi/extensions/saliencegate.bootstrap.json"),
+    loadBootstrap: async () => bootstrap,
+    writeChunk: async (write) => {
+      writes.push(write);
+      return true;
+    },
+    batchID: () => "7".repeat(64),
+    windowDiscriminator: () => WINDOW_A,
+  })(api as PiExtensionAPI);
+  const workspaceContext = context(SESSION_ID, workspacePath);
+
+  await invoke(
+    api,
+    "session_start",
+    { type: "session_start", reason: "startup" },
+    workspaceContext,
+  );
+  await invoke(
+    api,
+    "session_shutdown",
+    { type: "session_shutdown", reason: "quit" },
+    workspaceContext,
+  );
+
+  assert.ok(writes.length >= 2);
+  assert.ok(
+    writes.every((write) => decode(write).workspace_path === workspacePath),
+  );
 });
 
 test("callbacks reject a mismatched native session without opening a foreign window", async () => {

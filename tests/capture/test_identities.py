@@ -29,6 +29,9 @@ DOMAINS = {
     "turn_id": b"saliencegate:capture:turn-id:v1",
     "transport_batch_ref": b"saliencegate:capture:transport-batch-ref:v1",
     "transport_chunk_digest": b"saliencegate:capture:transport-chunk-digest:v1",
+    "global_config_root": b"saliencegate:capture:global-config-root:v1",
+    "global_parent_id": b"saliencegate:capture:global-parent-id:v1",
+    "global_child_id": b"saliencegate:capture:global-child-id:v1",
     "integrity_tag": b"saliencegate:capture:integrity-tag:v1",
 }
 

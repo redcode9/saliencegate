@@ -1,6 +1,10 @@
 import { Buffer } from "node:buffer";
 
-import { canonicalizeJson, encodeCanonicalJson } from "./canonical.ts";
+import {
+  canonicalizeJson,
+  encodeCanonicalJson,
+  isWellFormedUnicode,
+} from "./canonical.ts";
 import {
   BridgeContractError,
   MAX_CAPTURE_BATCH_BYTES,
@@ -18,6 +22,20 @@ import {
 const SHA256 = /^[0-9a-f]{64}$/;
 const CONNECTION_ID = /^sg-[0-9a-f]{48}$/;
 const WINDOWS_ABSOLUTE = /^[A-Za-z]:[\\/]/;
+const WINDOWS_UNC_ABSOLUTE = /^\\\\[^\\]+\\[^\\]+/;
+const MAX_WORKSPACE_PATH_BYTES = 4_096;
+
+function validWorkspacePath(value: string): boolean {
+  return (
+    value.length > 0 &&
+    isWellFormedUnicode(value) &&
+    Buffer.byteLength(value, "utf8") <= MAX_WORKSPACE_PATH_BYTES &&
+    !value.includes("\0") &&
+    (value.startsWith("/") ||
+      WINDOWS_ABSOLUTE.test(value) ||
+      WINDOWS_UNC_ABSOLUTE.test(value))
+  );
+}
 
 function validateBootstrap(value: BootstrapBinding): BootstrapBinding {
   const keys = Object.keys(value).sort();
@@ -69,6 +87,7 @@ function documentFor(input: {
   bootstrap: BootstrapBinding;
   batchID: string;
   sessionID: string;
+  workspacePath?: string;
   chunkIndex: number;
   chunkCount: number;
   events: readonly CanonicalJson[];
@@ -78,6 +97,9 @@ function documentFor(input: {
     bootstrap: input.bootstrap,
     batch_id: input.batchID,
     session_id: input.sessionID,
+    ...(input.workspacePath === undefined
+      ? {}
+      : { workspace_path: input.workspacePath }),
     chunk_index: input.chunkIndex,
     chunk_count: input.chunkCount,
     events: input.events,
@@ -88,6 +110,7 @@ function encodedSize(input: {
   bootstrap: BootstrapBinding;
   batchID: string;
   sessionID: string;
+  workspacePath?: string;
   chunkIndex: number;
   events: readonly CanonicalJson[];
 }): number {
@@ -108,6 +131,7 @@ export function buildCaptureChunks(input: {
   bootstrap: BootstrapBinding;
   batchID: string;
   sessionID: string;
+  workspacePath?: string;
   events: readonly unknown[];
 }): CaptureChunk[] {
   try {
@@ -118,6 +142,9 @@ export function buildCaptureChunks(input: {
       typeof input.sessionID !== "string" ||
       input.sessionID.length === 0 ||
       Buffer.byteLength(input.sessionID, "utf8") > MAX_CAPTURE_SESSION_ID_BYTES ||
+      (input.workspacePath !== undefined &&
+        (typeof input.workspacePath !== "string" ||
+          !validWorkspacePath(input.workspacePath))) ||
       !Array.isArray(input.events) ||
       input.events.length > 10_000
     ) {
@@ -130,6 +157,9 @@ export function buildCaptureChunks(input: {
         bootstrap,
         batchID: input.batchID,
         sessionID: input.sessionID,
+        ...(input.workspacePath === undefined
+          ? {}
+          : { workspacePath: input.workspacePath }),
         chunkIndex: 0,
         events: [normalized],
       }) <= MAX_CAPTURE_BATCH_BYTES
@@ -147,6 +177,9 @@ export function buildCaptureChunks(input: {
             bootstrap,
             batchID: input.batchID,
             sessionID: input.sessionID,
+            ...(input.workspacePath === undefined
+              ? {}
+              : { workspacePath: input.workspacePath }),
             chunkIndex: groups.length,
             events: candidate,
           }) > MAX_CAPTURE_BATCH_BYTES)
@@ -165,6 +198,9 @@ export function buildCaptureChunks(input: {
         bootstrap,
         batchID: input.batchID,
         sessionID: input.sessionID,
+        ...(input.workspacePath === undefined
+          ? {}
+          : { workspacePath: input.workspacePath }),
         chunkIndex: index,
         chunkCount: groups.length,
         events: group,
@@ -198,6 +234,7 @@ export function inspectChunkCoverage(
         chunk.schema_version !== "capture-batch/v1" ||
         chunk.batch_id !== first.batch_id ||
         chunk.session_id !== first.session_id ||
+        chunk.workspace_path !== first.workspace_path ||
         chunk.chunk_count !== first.chunk_count ||
         !Number.isInteger(chunk.chunk_index) ||
         chunk.chunk_index < 0 ||

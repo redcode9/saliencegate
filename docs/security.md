@@ -150,8 +150,8 @@ executable owned by a privileged account rather than the current user is reporte
 
 On POSIX, private directories and regular data files are required to be owner controlled; the key
 is exactly 32 bytes in an owner-only regular file. On Windows, the implementation uses native
-handle and DACL checks for the managed boundary. Native Ubuntu, Windows, and macOS jobs are prepared
-but remote verification remains a separate gate for this unpublished branch.
+handle and DACL checks for the managed boundary. CI exercises the native capture boundary on
+Ubuntu, Windows, and macOS.
 
 There is no automatic retention period, expiry, or time-to-live. `disconnect PROVIDER` is the
 connector uninstall operation: it drains admission, reverses only authenticated owned provider

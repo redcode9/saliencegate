@@ -44,43 +44,40 @@ PUBLIC_DOCUMENT_EXCLUSIONS = (
 )
 README_HEADINGS = (
     "# SalienceGate",
-    "## Try it locally",
-    "## Analyze a trajectory",
-    "## What happens inside",
-    "## What the examples show",
-    "## Use SalienceGate",
-    "## Reproduce the research",
-    "## Available today",
-    "## Limits",
+    "## Install",
+    "## Connect",
+    "## Inspect and disconnect",
+    "## How it works",
+    "## Privacy and limits",
     "## Development",
-    "## Citation",
     "## License",
 )
 README_IMAGE_TARGETS = (
+    "docs/assets/readme/saliencegate-logo.svg",
+    "docs/assets/readme/install-flow.svg",
     "docs/assets/readme/pipeline.svg",
-    "docs/assets/readme/capture-headlines.svg",
-    "docs/assets/readme/reference-run.svg",
 )
-README_LOCAL_CAPTURE_COMMANDS = (
-    '"$SG" connect codex --project "$PROJECT" --dry-run',
-    '"$SG" connect codex --project "$PROJECT"',
-    '"$SG" doctor --capture',
-    '"$SG" status codex --project "$PROJECT"',
-    '"$SG" sessions --limit 20',
-    '"$SG" report --latest --output "$PROJECT/.saliencegate/reports/capture-report.json"',
-    '"$SG" disconnect codex --project "$PROJECT"',
-    '"$SG" delete SESSION_ID',
-    '"$SG" delete --all --project "$PROJECT" --confirm',
+README_INSTALL_COMMANDS = (
+    "curl --proto '=https' --tlsv1.2 -LsSf "
+    "https://github.com/redcode9/saliencegate/releases/download/v0.2.0/install.sh | sh",
+    "irm https://github.com/redcode9/saliencegate/releases/download/v0.2.0/install.ps1 | iex",
 )
-README_LOCAL_AMBIENT_CAPTURE_COMMAND = re.compile(
-    r'(?:^|[\s`])["\']?[^ \t\r\n`"\']*saliencegate["\']?\s+'
-    r"(?:connect|doctor|status|sessions|report|disconnect|delete)\b",
-    re.MULTILINE,
+README_CLI_COMMANDS = (
+    'saliencegate setup --provider all --scope project --project "$PWD" --dry-run',
+    'saliencegate setup --provider all --scope project --project "$PWD" --yes',
+    "saliencegate setup --provider all --scope global "
+    '--exclude "$HOME/Private" --exclude "$HOME/Clients/NoCapture" --dry-run',
+    "saliencegate setup --provider all --scope global "
+    '--exclude "$HOME/Private" --exclude "$HOME/Clients/NoCapture" --yes',
+    "saliencegate status --global",
+    'saliencegate disconnect codex --project "$PWD"',
+    "saliencegate disconnect codex --global",
+    'saliencegate delete --all --project "$PWD" --confirm',
 )
 
 
-def count_readme_local_capture_command(text: str, command: str) -> int:
-    return len(re.findall(rf"{re.escape(command)}(?=$|[\n`])", text))
+def count_readme_command(text: str, command: str) -> int:
+    return sum(line == command for line in text.splitlines())
 
 
 FORBIDDEN_PATTERNS = (
@@ -351,52 +348,22 @@ def validate_public_docs(root: Path = ROOT) -> list[str]:
                 position = next_position
 
         word_count = len(readme_text.split())
-        if not 1_000 <= word_count <= 1_200:
-            findings.append(f"README.md: expected 1000-1200 whitespace tokens, found {word_count}")
-        introduction = readme_text.split("\n## Try it locally\n", maxsplit=1)[0]
-        for fragment in ("Build with it:", "Study it:", "It is not a memory database."):
+        if not 550 <= word_count <= 850:
+            findings.append(f"README.md: expected 550-850 whitespace tokens, found {word_count}")
+        introduction = readme_text.split("\n## Install\n", maxsplit=1)[0]
+        for fragment in ("Codex", "Claude Code", "OpenCode", "Pi"):
             if fragment not in introduction:
-                findings.append(f"README.md: missing introductory route {fragment!r}")
+                findings.append(f"README.md: missing supported provider {fragment!r}")
         if readme_text.count("![") != 3:
-            findings.append("README.md: expected exactly three result visuals")
+            findings.append("README.md: expected exactly three primary visuals")
         for target in README_IMAGE_TARGETS:
             if readme_text.count(target) != 1:
                 findings.append(f"README.md: expected one image reference to {target}")
-        for label in ("Artifact-compatible after installation:", "Run from a checkout:"):
-            if readme_text.count(label) < 2:
-                findings.append(f"README.md: expected at least two command labels {label!r}")
-        if "\n## Try it locally\n" in readme_text and "\n## Analyze a trajectory\n" in readme_text:
-            local_quickstart = readme_text.split("\n## Try it locally\n", maxsplit=1)[1].split(
-                "\n## Analyze a trajectory\n", maxsplit=1
-            )[0]
-            for variable, assignment in (
-                ("VENV", 'VENV="$HOME/.local/share/saliencegate/quickstart-venv"'),
-                ("SG", 'SG="$VENV/bin/saliencegate"'),
-            ):
-                assignment_lines = sum(
-                    line.startswith(f"{variable}=") for line in local_quickstart.splitlines()
-                )
-                if local_quickstart.count(assignment) != 1 or assignment_lines != 1:
-                    findings.append(
-                        f"README.md: expected one local capture assignment {assignment!r}"
-                    )
-            for command in README_LOCAL_CAPTURE_COMMANDS:
-                if count_readme_local_capture_command(local_quickstart, command) != 1:
-                    findings.append(f"README.md: expected one local capture command {command!r}")
-            expected_invocations = len(README_LOCAL_CAPTURE_COMMANDS)
-            if (
-                local_quickstart.count("$SG") != expected_invocations
-                or local_quickstart.count('"$SG"') != expected_invocations
-            ):
-                findings.append(
-                    'README.md: every local capture invocation must use quoted "$SG" exactly once'
-                )
-            if README_LOCAL_AMBIENT_CAPTURE_COMMAND.search(local_quickstart):
-                findings.append(
-                    "README.md: local capture commands must not use an ambient executable"
-                )
-        if "\n## Limits\n" in readme_text and "\n## Development\n" in readme_text:
-            limits = readme_text.split("\n## Limits\n", maxsplit=1)[1].split(
+        for command in (*README_INSTALL_COMMANDS, *README_CLI_COMMANDS):
+            if count_readme_command(readme_text, command) != 1:
+                findings.append(f"README.md: expected one public command {command!r}")
+        if "\n## Privacy and limits\n" in readme_text and "\n## Development\n" in readme_text:
+            limits = readme_text.split("\n## Privacy and limits\n", maxsplit=1)[1].split(
                 "\n## Development\n", maxsplit=1
             )[0]
             if sum(line.startswith("- ") for line in limits.splitlines()) > 5:

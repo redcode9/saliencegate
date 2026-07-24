@@ -115,6 +115,11 @@ AdapterResolver = Callable[[object], object]
 StoreFactory = Callable[[object], CaptureHookStore]
 SpoolFactory = Callable[[object], CaptureHookSpool]
 HealthMarker = Callable[[object, "CaptureHealthCode"], None]
+ConnectionIDResolver = Callable[[object, str], str]
+
+
+def _requested_connection_id(_connection: object, requested: str) -> str:
+    return requested
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -129,6 +134,7 @@ class CaptureHookDependencies:
     open_store: StoreFactory
     open_spool: SpoolFactory
     mark_health: HealthMarker
+    resolve_connection_id: ConnectionIDResolver = _requested_connection_id
 
     def __post_init__(self) -> None:
         if any(
@@ -142,6 +148,7 @@ class CaptureHookDependencies:
                 self.open_store,
                 self.open_spool,
                 self.mark_health,
+                self.resolve_connection_id,
             )
         ):
             raise CaptureHookError()
@@ -642,12 +649,21 @@ def run_capture_hook(
         context = selected.load_context(connection)
         if type(context) is not CaptureDigestContext:
             raise CaptureHookError()
+        effective_connection_id = selected.resolve_connection_id(
+            connection,
+            parsed.connection_id,
+        )
+        if (
+            type(effective_connection_id) is not str
+            or _CONNECTION_ID.fullmatch(effective_connection_id) is None
+        ):
+            raise CaptureHookError()
         adapter = selected.resolve_adapter(connection)
         intakes = _adapter_intakes(
             adapter,
             source,
             profile=parsed.profile,
-            connection_id=parsed.connection_id,
+            connection_id=effective_connection_id,
             context=context,
         )
         store = selected.open_store(connection)

@@ -46,6 +46,23 @@ from saliencegate.capture.schema import (
     canonical_capture_intake,
     load_capture_event,
 )
+from saliencegate.capture.scopes import (
+    MAX_GLOBAL_CHILDREN_PER_PARENT,
+    MAX_GLOBAL_EXCLUSIONS_PER_PARENT,
+    MAX_GLOBAL_HEALTH_COUNT,
+    CaptureGlobalChildBinding,
+    CaptureGlobalExclusionBinding,
+    CaptureGlobalHealthCode,
+    CaptureGlobalHealthCounter,
+    CaptureGlobalParentRegistration,
+    CaptureGlobalParentState,
+    CaptureGlobalParentSummary,
+    CaptureGlobalParentTransition,
+    CaptureGlobalProvider,
+    _derive_global_child_from_project_digest,
+    _derive_global_parent_id,
+    capture_global_provider_profile,
+)
 from saliencegate.capture.transport import (
     MAX_CAPTURE_TRANSPORT_CHUNKS_PER_SESSION,
     CaptureTransportChunk,
@@ -272,6 +289,13 @@ class _CaptureStoreIntegrity:
 
     _DOMAINS: ClassVar[dict[str, bytes]] = {
         "connection": b"saliencegate:capture-store:connection:v1",
+        "global_parent": b"saliencegate:capture-store:global-parent:v1",
+        "global_child": b"saliencegate:capture-store:global-child:v1",
+        "global_exclusion": b"saliencegate:capture-store:global-exclusion:v1",
+        "global_exclusion_set": b"saliencegate:capture-store:global-exclusion-set:v1",
+        "global_health_id": b"saliencegate:capture-store:global-health-id:v1",
+        "global_health": b"saliencegate:capture-store:global-health:v1",
+        "global_health_set": b"saliencegate:capture-store:global-health-set:v1",
         "session": b"saliencegate:capture-store:session:v1",
         "event": b"saliencegate:capture-store:event:v1",
         "head": b"saliencegate:capture-store:head:v1",
@@ -337,6 +361,73 @@ def _connection_material(row: sqlite3.Row | dict[str, object]) -> dict[str, obje
         "host_version": row["host_version"],
         "compatibility_status": row["compatibility_status"],
         "state": row["state"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _global_parent_material(row: sqlite3.Row | dict[str, object]) -> dict[str, object]:
+    return {
+        "schema_version": "capture-global-parent-integrity/v1",
+        "global_parent_id": row["global_parent_id"],
+        "provider_id": row["provider_id"],
+        "config_root_digest": row["config_root_digest"],
+        "profile_id": row["profile_id"],
+        "capability_manifest_digest": row["capability_manifest_digest"],
+        "host_version": row["host_version"],
+        "compatibility_status": row["compatibility_status"],
+        "generation": row["generation"],
+        "state": row["state"],
+        "health_marker_count": row["health_marker_count"],
+        "health_set_digest": row["health_set_digest"],
+        "exclusion_count": row["exclusion_count"],
+        "exclusion_set_digest": row["exclusion_set_digest"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _global_child_material(row: sqlite3.Row | dict[str, object]) -> dict[str, object]:
+    return {
+        "schema_version": "capture-global-child-integrity/v1",
+        "global_parent_id": row["global_parent_id"],
+        "connection_id": row["connection_id"],
+        "project_digest": row["project_digest"],
+        "created_at": row["created_at"],
+    }
+
+
+def _global_exclusion_material(
+    row: sqlite3.Row | dict[str, object],
+) -> dict[str, object]:
+    return {
+        "schema_version": "capture-global-exclusion-integrity/v1",
+        "global_parent_id": row["global_parent_id"],
+        "project_digest": row["project_digest"],
+        "created_at": row["created_at"],
+    }
+
+
+def _global_health_identity_material(
+    *,
+    global_parent_id: str,
+    code: CaptureGlobalHealthCode,
+) -> dict[str, object]:
+    return {
+        "schema_version": "capture-global-health-id/v1",
+        "global_parent_id": global_parent_id,
+        "code": code.value,
+    }
+
+
+def _global_health_material(row: sqlite3.Row | dict[str, object]) -> dict[str, object]:
+    return {
+        "schema_version": "capture-global-health-integrity/v1",
+        "marker_id": row["marker_id"],
+        "global_parent_id": row["global_parent_id"],
+        "code": row["code"],
+        "count": row["count"],
+        "saturated": row["saturated"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -520,6 +611,19 @@ _TRANSITIONS = {
         }
     ),
     CaptureConnectionState.DELETING: frozenset(),
+}
+
+_GLOBAL_PARENT_TRANSITIONS = {
+    CaptureGlobalParentState.PENDING: frozenset({CaptureGlobalParentState.ENABLED}),
+    CaptureGlobalParentState.ENABLED: frozenset({CaptureGlobalParentState.DRAINING}),
+    CaptureGlobalParentState.DRAINING: frozenset({CaptureGlobalParentState.DISABLED}),
+    CaptureGlobalParentState.DISABLED: frozenset(
+        {
+            CaptureGlobalParentState.ENABLED,
+            CaptureGlobalParentState.DELETING,
+        }
+    ),
+    CaptureGlobalParentState.DELETING: frozenset(),
 }
 
 
@@ -935,6 +1039,314 @@ class CaptureStore:
             raise CaptureStoreIntegrityError()
         return cast(sqlite3.Row, row)
 
+    def _global_parent_row(self, global_parent_id: str) -> sqlite3.Row:
+        row = self._connection.execute(
+            """
+            SELECT *
+            FROM capture_global_parents
+            WHERE global_parent_id = ?
+            """,
+            (global_parent_id,),
+        ).fetchone()
+        if row is None:
+            raise CaptureStoreStateError()
+        try:
+            provider_id = CaptureGlobalProvider(row["provider_id"])
+            profile_id = CaptureProfile(row["profile_id"])
+            state = CaptureGlobalParentState(row["state"])
+            expected_id = _derive_global_parent_id(
+                context=self._context,
+                provider_id=provider_id,
+                config_root_digest=row["config_root_digest"],
+                generation=row["generation"],
+            )
+            profile = validate_capture_capability_binding(
+                profile_id,
+                row["capability_manifest_digest"],
+            )
+            compatibility = (
+                CompatibilityStatus.VERIFIED
+                if row["host_version"] == profile.host_version
+                else CompatibilityStatus.SCHEMA_COMPATIBLE_UNVERIFIED_VERSION
+            )
+            created_at = _stored_timestamp(row["created_at"])
+            updated_at = _stored_timestamp(row["updated_at"])
+            expected_tag = self._integrity.tag(
+                "global_parent",
+                _global_parent_material(row),
+            )
+            if (
+                expected_id != global_parent_id
+                or capture_global_provider_profile(provider_id) is not profile_id
+                or row["compatibility_status"] != compatibility.value
+                or type(row["host_version"]) is not str
+                or _HOST_VERSION.fullmatch(row["host_version"]) is None
+                or type(row["generation"]) is not int
+                or not 1 <= row["generation"] <= 1_000_000
+                or type(row["health_marker_count"]) is not int
+                or not 0 <= row["health_marker_count"] <= len(CaptureGlobalHealthCode)
+                or type(row["health_set_digest"]) is not str
+                or _PROJECT_DIGEST.fullmatch(row["health_set_digest"]) is None
+                or type(row["exclusion_count"]) is not int
+                or not 0 <= row["exclusion_count"] <= MAX_GLOBAL_EXCLUSIONS_PER_PARENT
+                or type(row["exclusion_set_digest"]) is not str
+                or _PROJECT_DIGEST.fullmatch(row["exclusion_set_digest"]) is None
+                or updated_at < created_at
+                or type(row["row_tag"]) is not str
+                or not hmac.compare_digest(row["row_tag"], expected_tag)
+                or type(state) is not CaptureGlobalParentState
+            ):
+                raise CaptureStoreIntegrityError()
+        except CaptureStoreError:
+            raise
+        except Exception:
+            raise CaptureStoreIntegrityError() from None
+        return cast(sqlite3.Row, row)
+
+    def _global_child_row(
+        self,
+        global_parent_id: str,
+        project_digest: str,
+    ) -> sqlite3.Row:
+        row = self._connection.execute(
+            """
+            SELECT *
+            FROM capture_global_children
+            WHERE global_parent_id = ? AND project_digest = ?
+            """,
+            (global_parent_id, project_digest),
+        ).fetchone()
+        if row is None:
+            raise CaptureStoreStateError()
+        try:
+            parent = self._global_parent_row(global_parent_id)
+            provider_id = CaptureGlobalProvider(parent["provider_id"])
+            expected_identity = _derive_global_child_from_project_digest(
+                context=self._context,
+                global_parent_id=global_parent_id,
+                provider_id=provider_id,
+                generation=parent["generation"],
+                project_digest=project_digest,
+            )
+            connection = self._connection_row(row["connection_id"])
+            expected_tag = self._integrity.tag(
+                "global_child",
+                _global_child_material(row),
+            )
+            if (
+                row["global_parent_id"] != global_parent_id
+                or row["project_digest"] != project_digest
+                or row["connection_id"] != expected_identity.connection_id
+                or connection["project_digest"] != project_digest
+                or connection["profile_id"] != parent["profile_id"]
+                or connection["capability_manifest_digest"] != parent["capability_manifest_digest"]
+                or connection["host_version"] != parent["host_version"]
+                or connection["compatibility_status"] != parent["compatibility_status"]
+                or connection["created_at"] != row["created_at"]
+                or type(row["row_tag"]) is not str
+                or not hmac.compare_digest(row["row_tag"], expected_tag)
+            ):
+                raise CaptureStoreIntegrityError()
+            _stored_timestamp(row["created_at"])
+        except CaptureStoreError:
+            raise
+        except Exception:
+            raise CaptureStoreIntegrityError() from None
+        return cast(sqlite3.Row, row)
+
+    def _global_exclusion_row(
+        self,
+        global_parent_id: str,
+        project_digest: str,
+    ) -> sqlite3.Row:
+        row = self._connection.execute(
+            """
+            SELECT *
+            FROM capture_global_exclusions
+            WHERE global_parent_id = ? AND project_digest = ?
+            """,
+            (global_parent_id, project_digest),
+        ).fetchone()
+        if row is None:
+            raise CaptureStoreStateError()
+        try:
+            expected_tag = self._integrity.tag(
+                "global_exclusion",
+                _global_exclusion_material(row),
+            )
+            if (
+                row["global_parent_id"] != global_parent_id
+                or row["project_digest"] != project_digest
+                or type(row["project_digest"]) is not str
+                or _PROJECT_DIGEST.fullmatch(row["project_digest"]) is None
+                or type(row["row_tag"]) is not str
+                or not hmac.compare_digest(row["row_tag"], expected_tag)
+            ):
+                raise CaptureStoreIntegrityError()
+            _stored_timestamp(row["created_at"])
+        except CaptureStoreError:
+            raise
+        except Exception:
+            raise CaptureStoreIntegrityError() from None
+        return cast(sqlite3.Row, row)
+
+    def _load_verified_global_exclusion_rows(
+        self,
+        global_parent_id: str,
+    ) -> tuple[sqlite3.Row, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT *
+            FROM capture_global_exclusions
+            WHERE global_parent_id = ?
+            ORDER BY project_digest
+            LIMIT ?
+            """,
+            (global_parent_id, MAX_GLOBAL_EXCLUSIONS_PER_PARENT + 1),
+        ).fetchall()
+        if len(rows) > MAX_GLOBAL_EXCLUSIONS_PER_PARENT:
+            raise CaptureStoreIntegrityError()
+        return tuple(
+            self._global_exclusion_row(global_parent_id, row["project_digest"]) for row in rows
+        )
+
+    def _global_exclusion_set_digest(
+        self,
+        rows: tuple[sqlite3.Row, ...],
+    ) -> str:
+        return self._integrity.tag(
+            "global_exclusion_set",
+            {
+                "schema_version": "capture-global-exclusion-set-integrity/v1",
+                "rows": [
+                    {
+                        "project_digest": row["project_digest"],
+                        "row_tag": row["row_tag"],
+                    }
+                    for row in rows
+                ],
+            },
+        )
+
+    def _verify_global_exclusion_set(
+        self,
+        global_parent_id: str,
+        parent: sqlite3.Row,
+    ) -> tuple[sqlite3.Row, ...]:
+        rows = self._load_verified_global_exclusion_rows(global_parent_id)
+        expected_digest = self._global_exclusion_set_digest(rows)
+        if (
+            parent["exclusion_count"] != len(rows)
+            or type(parent["exclusion_set_digest"]) is not str
+            or not hmac.compare_digest(
+                parent["exclusion_set_digest"],
+                expected_digest,
+            )
+        ):
+            raise CaptureStoreIntegrityError()
+        return rows
+
+    def _global_project_is_excluded(
+        self,
+        global_parent_id: str,
+        project_digest: str,
+    ) -> bool:
+        candidate = self._connection.execute(
+            """
+            SELECT 1
+            FROM capture_global_exclusions
+            WHERE global_parent_id = ? AND project_digest = ?
+            """,
+            (global_parent_id, project_digest),
+        ).fetchone()
+        if candidate is None:
+            return False
+        self._global_exclusion_row(global_parent_id, project_digest)
+        return True
+
+    def _load_verified_global_health_rows(
+        self,
+        global_parent_id: str,
+    ) -> tuple[sqlite3.Row, ...]:
+        rows = self._connection.execute(
+            """
+            SELECT *
+            FROM capture_global_health
+            WHERE global_parent_id = ?
+            ORDER BY code
+            """,
+            (global_parent_id,),
+        ).fetchall()
+        if len(rows) > len(CaptureGlobalHealthCode):
+            raise CaptureStoreIntegrityError()
+        verified: list[sqlite3.Row] = []
+        for row in rows:
+            try:
+                code = CaptureGlobalHealthCode(row["code"])
+                expected_marker_id = self._integrity.tag(
+                    "global_health_id",
+                    _global_health_identity_material(
+                        global_parent_id=global_parent_id,
+                        code=code,
+                    ),
+                )
+                expected_row_tag = self._integrity.tag(
+                    "global_health",
+                    _global_health_material(row),
+                )
+                created_at = _stored_timestamp(row["created_at"])
+                updated_at = _stored_timestamp(row["updated_at"])
+                if (
+                    row["global_parent_id"] != global_parent_id
+                    or type(row["marker_id"]) is not str
+                    or not hmac.compare_digest(row["marker_id"], expected_marker_id)
+                    or type(row["count"]) is not int
+                    or not 1 <= row["count"] <= MAX_GLOBAL_HEALTH_COUNT
+                    or type(row["saturated"]) is not int
+                    or row["saturated"] not in (0, 1)
+                    or bool(row["saturated"]) is not (row["count"] == MAX_GLOBAL_HEALTH_COUNT)
+                    or updated_at < created_at
+                    or type(row["row_tag"]) is not str
+                    or not hmac.compare_digest(row["row_tag"], expected_row_tag)
+                ):
+                    raise CaptureStoreIntegrityError()
+            except CaptureStoreError:
+                raise
+            except Exception:
+                raise CaptureStoreIntegrityError() from None
+            verified.append(cast(sqlite3.Row, row))
+        return tuple(verified)
+
+    def _global_health_set_digest(self, rows: tuple[sqlite3.Row, ...]) -> str:
+        return self._integrity.tag(
+            "global_health_set",
+            {
+                "schema_version": "capture-global-health-set-integrity/v1",
+                "rows": [
+                    {
+                        "marker_id": row["marker_id"],
+                        "row_tag": row["row_tag"],
+                    }
+                    for row in rows
+                ],
+            },
+        )
+
+    def _verify_global_health_set(
+        self,
+        global_parent_id: str,
+        parent: sqlite3.Row,
+    ) -> tuple[sqlite3.Row, ...]:
+        rows = self._load_verified_global_health_rows(global_parent_id)
+        expected_digest = self._global_health_set_digest(rows)
+        if (
+            parent["health_marker_count"] != len(rows)
+            or type(parent["health_set_digest"]) is not str
+            or not hmac.compare_digest(parent["health_set_digest"], expected_digest)
+        ):
+            raise CaptureStoreIntegrityError()
+        return rows
+
     def register_connection(
         self,
         *,
@@ -1086,6 +1498,976 @@ class CaptureStore:
             previous_state=expected_state,
             state=target_state,
         )
+
+    def register_global_parent(
+        self,
+        *,
+        provider_id: CaptureGlobalProvider,
+        config_root_digest: str,
+        profile_id: CaptureProfile,
+        capability_manifest_digest: str,
+        host_version: str,
+        generation: int,
+    ) -> CaptureGlobalParentRegistration:
+        """Idempotently register one pending provider-global parent."""
+
+        self._require_maintenance()
+        try:
+            global_parent_id = _derive_global_parent_id(
+                context=self._context,
+                provider_id=provider_id,
+                config_root_digest=config_root_digest,
+                generation=generation,
+            )
+            registration = CaptureGlobalParentRegistration(
+                global_parent_id=global_parent_id,
+                provider_id=provider_id,
+                config_root_digest=config_root_digest,
+                profile_id=profile_id,
+                capability_manifest_digest=capability_manifest_digest,
+                host_version=host_version,
+                generation=generation,
+            )
+            profile = validate_capture_capability_binding(
+                registration.profile_id,
+                registration.capability_manifest_digest,
+            )
+            if _HOST_VERSION.fullmatch(registration.host_version) is None:
+                raise CaptureStoreStateError()
+            compatibility = (
+                CompatibilityStatus.VERIFIED
+                if registration.host_version == profile.host_version
+                else CompatibilityStatus.SCHEMA_COMPATIBLE_UNVERIFIED_VERSION
+            )
+            with self._lock:
+                self._require_maintenance()
+                self._revalidate_boundary()
+                self._begin_immediate()
+                try:
+                    existing = self._connection.execute(
+                        """
+                        SELECT *
+                        FROM capture_global_parents
+                        WHERE global_parent_id = ?
+                        """,
+                        (registration.global_parent_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        checked = self._global_parent_row(registration.global_parent_id)
+                        self._verify_global_health_set(registration.global_parent_id, checked)
+                        self._verify_global_exclusion_set(
+                            registration.global_parent_id,
+                            checked,
+                        )
+                        if any(
+                            checked[field] != expected
+                            for field, expected in (
+                                ("provider_id", registration.provider_id.value),
+                                ("config_root_digest", registration.config_root_digest),
+                                ("profile_id", registration.profile_id.value),
+                                (
+                                    "capability_manifest_digest",
+                                    registration.capability_manifest_digest,
+                                ),
+                                ("host_version", registration.host_version),
+                                ("generation", registration.generation),
+                            )
+                        ):
+                            raise CaptureStoreStateError()
+                        self._connection.rollback()
+                        self._revalidate_boundary()
+                        values = registration.model_dump(mode="python")
+                        values["state"] = CaptureGlobalParentState(checked["state"])
+                        return CaptureGlobalParentRegistration.model_validate(values)
+                    timestamp = _now()
+                    material: dict[str, object] = {
+                        "global_parent_id": registration.global_parent_id,
+                        "provider_id": registration.provider_id.value,
+                        "config_root_digest": registration.config_root_digest,
+                        "profile_id": registration.profile_id.value,
+                        "capability_manifest_digest": (registration.capability_manifest_digest),
+                        "host_version": registration.host_version,
+                        "compatibility_status": compatibility.value,
+                        "generation": registration.generation,
+                        "state": CaptureGlobalParentState.PENDING.value,
+                        "health_marker_count": 0,
+                        "health_set_digest": self._global_health_set_digest(()),
+                        "exclusion_count": 0,
+                        "exclusion_set_digest": self._global_exclusion_set_digest(()),
+                        "created_at": timestamp,
+                        "updated_at": timestamp,
+                    }
+                    row_tag = self._integrity.tag(
+                        "global_parent",
+                        _global_parent_material(material),
+                    )
+                    self._connection.execute(
+                        """
+                        INSERT INTO capture_global_parents(
+                            global_parent_id, provider_id, config_root_digest,
+                            profile_id, capability_manifest_digest, host_version,
+                            compatibility_status, generation, state,
+                            health_marker_count, health_set_digest,
+                            exclusion_count, exclusion_set_digest,
+                            created_at, updated_at, row_tag
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            registration.global_parent_id,
+                            registration.provider_id.value,
+                            registration.config_root_digest,
+                            registration.profile_id.value,
+                            registration.capability_manifest_digest,
+                            registration.host_version,
+                            compatibility.value,
+                            registration.generation,
+                            CaptureGlobalParentState.PENDING.value,
+                            0,
+                            material["health_set_digest"],
+                            0,
+                            material["exclusion_set_digest"],
+                            timestamp,
+                            timestamp,
+                            row_tag,
+                        ),
+                    )
+                    self._connection.commit()
+                except BaseException:
+                    self._rollback()
+                    raise
+                self._revalidate_boundary()
+                return registration
+        except CaptureStoreError:
+            raise
+        except Exception:
+            raise CaptureStoreError() from None
+
+    def transition_global_parent(
+        self,
+        global_parent_id: str,
+        *,
+        expected_state: CaptureGlobalParentState,
+        target_state: CaptureGlobalParentState,
+    ) -> CaptureGlobalParentTransition:
+        """Apply one authenticated compare-and-swap global lifecycle transition."""
+
+        self._require_maintenance()
+        if (
+            type(global_parent_id) is not str
+            or type(expected_state) is not CaptureGlobalParentState
+            or type(target_state) is not CaptureGlobalParentState
+            or target_state not in _GLOBAL_PARENT_TRANSITIONS[expected_state]
+        ):
+            raise CaptureStoreStateError()
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            self._begin_immediate()
+            try:
+                row = self._global_parent_row(global_parent_id)
+                self._verify_global_health_set(global_parent_id, row)
+                self._verify_global_exclusion_set(global_parent_id, row)
+                if row["state"] != expected_state.value:
+                    raise CaptureStoreStateError()
+                updated = dict(row)
+                updated["state"] = target_state.value
+                updated["updated_at"] = _now()
+                row_tag = self._integrity.tag(
+                    "global_parent",
+                    _global_parent_material(updated),
+                )
+                result = self._connection.execute(
+                    """
+                    UPDATE capture_global_parents
+                    SET state = ?, updated_at = ?, row_tag = ?
+                    WHERE global_parent_id = ? AND state = ?
+                    """,
+                    (
+                        target_state.value,
+                        updated["updated_at"],
+                        row_tag,
+                        global_parent_id,
+                        expected_state.value,
+                    ),
+                )
+                if result.rowcount != 1:
+                    raise CaptureStoreStateError()
+                self._connection.commit()
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+        return CaptureGlobalParentTransition(
+            global_parent_id=global_parent_id,
+            previous_state=expected_state,
+            state=target_state,
+        )
+
+    def _global_parent_summary(self, row: sqlite3.Row) -> CaptureGlobalParentSummary:
+        self._verify_global_health_set(row["global_parent_id"], row)
+        self._verify_global_exclusion_set(row["global_parent_id"], row)
+        return CaptureGlobalParentSummary(
+            global_parent_id=row["global_parent_id"],
+            provider_id=CaptureGlobalProvider(row["provider_id"]),
+            config_root_digest=row["config_root_digest"],
+            profile_id=CaptureProfile(row["profile_id"]),
+            capability_manifest_digest=row["capability_manifest_digest"],
+            host_version=row["host_version"],
+            compatibility_status=CompatibilityStatus(row["compatibility_status"]),
+            generation=row["generation"],
+            state=CaptureGlobalParentState(row["state"]),
+            health_marker_count=row["health_marker_count"],
+            health_set_digest=row["health_set_digest"],
+            exclusion_count=row["exclusion_count"],
+            exclusion_set_digest=row["exclusion_set_digest"],
+            created_at=_stored_timestamp(row["created_at"]),
+            updated_at=_stored_timestamp(row["updated_at"]),
+        )
+
+    def list_global_parents(
+        self,
+        *,
+        provider_id: CaptureGlobalProvider | None = None,
+        state: CaptureGlobalParentState | None = None,
+    ) -> tuple[CaptureGlobalParentSummary, ...]:
+        """Return authenticated global parents in stable identity order."""
+
+        self._require_maintenance()
+        if provider_id is not None and type(provider_id) is not CaptureGlobalProvider:
+            raise CaptureStoreStateError()
+        if state is not None and type(state) is not CaptureGlobalParentState:
+            raise CaptureStoreStateError()
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                identities = self._connection.execute(
+                    """
+                    SELECT global_parent_id
+                    FROM capture_global_parents
+                    WHERE (? IS NULL OR provider_id = ?)
+                      AND (? IS NULL OR state = ?)
+                    ORDER BY global_parent_id
+                    LIMIT ?
+                    """,
+                    (
+                        None if provider_id is None else provider_id.value,
+                        None if provider_id is None else provider_id.value,
+                        None if state is None else state.value,
+                        None if state is None else state.value,
+                        _MAX_CAPTURE_QUERY_RESULTS + 1,
+                    ),
+                ).fetchall()
+                if len(identities) > _MAX_CAPTURE_QUERY_RESULTS:
+                    raise CaptureStoreStateError()
+                summaries = tuple(
+                    self._global_parent_summary(
+                        self._global_parent_row(identity["global_parent_id"])
+                    )
+                    for identity in identities
+                )
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return summaries
+
+    def get_global_parent(self, global_parent_id: str) -> CaptureGlobalParentSummary:
+        """Return one authenticated global parent."""
+
+        self._ensure_open()
+        if type(global_parent_id) is not str:
+            raise CaptureStoreError()
+        with self._lock:
+            self._ensure_open()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                summary = self._global_parent_summary(self._global_parent_row(global_parent_id))
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return summary
+
+    def _global_child_binding(self, row: sqlite3.Row) -> CaptureGlobalChildBinding:
+        return CaptureGlobalChildBinding(
+            global_parent_id=row["global_parent_id"],
+            connection_id=row["connection_id"],
+            project_digest=row["project_digest"],
+            created_at=_stored_timestamp(row["created_at"]),
+        )
+
+    def enroll_global_child(
+        self,
+        global_parent_id: str,
+        canonical_project_identity: bytes,
+    ) -> CaptureGlobalChildBinding:
+        """Idempotently enroll one enabled project child from an enabled parent."""
+
+        self._ensure_open()
+        if type(global_parent_id) is not str or type(canonical_project_identity) is not bytes:
+            raise CaptureStoreError()
+        try:
+            with self._lock:
+                self._ensure_open()
+                self._revalidate_boundary()
+                self._begin_immediate()
+                try:
+                    parent = self._global_parent_row(global_parent_id)
+                    self._verify_global_health_set(global_parent_id, parent)
+                    self._verify_global_exclusion_set(global_parent_id, parent)
+                    if parent["state"] != CaptureGlobalParentState.ENABLED.value:
+                        raise CaptureStoreStateError()
+                    identity = _derive_global_child_from_project_digest(
+                        context=self._context,
+                        global_parent_id=global_parent_id,
+                        provider_id=CaptureGlobalProvider(parent["provider_id"]),
+                        generation=parent["generation"],
+                        project_digest=self._context.workspace_identity(canonical_project_identity),
+                    )
+                    if self._global_project_is_excluded(
+                        global_parent_id,
+                        identity.project_digest,
+                    ):
+                        raise CaptureStoreStateError()
+                    existing = self._connection.execute(
+                        """
+                        SELECT *
+                        FROM capture_global_children
+                        WHERE global_parent_id = ? AND project_digest = ?
+                        """,
+                        (global_parent_id, identity.project_digest),
+                    ).fetchone()
+                    if existing is not None:
+                        checked = self._global_child_row(
+                            global_parent_id,
+                            identity.project_digest,
+                        )
+                        self._connection.rollback()
+                        self._revalidate_boundary()
+                        return self._global_child_binding(checked)
+                    inventory = self._connection.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM capture_global_children
+                        WHERE global_parent_id = ?
+                        """,
+                        (global_parent_id,),
+                    ).fetchone()
+                    if inventory is None or type(inventory[0]) is not int or inventory[0] < 0:
+                        raise CaptureStoreIntegrityError()
+                    if inventory[0] >= MAX_GLOBAL_CHILDREN_PER_PARENT:
+                        raise CaptureStoreStateError()
+                    if (
+                        self._connection.execute(
+                            """
+                            SELECT 1
+                            FROM connections
+                            WHERE connection_id = ?
+                            """,
+                            (identity.connection_id,),
+                        ).fetchone()
+                        is not None
+                    ):
+                        raise CaptureStoreIntegrityError()
+                    timestamp = _now()
+                    connection_material: dict[str, object] = {
+                        "connection_id": identity.connection_id,
+                        "project_digest": identity.project_digest,
+                        "profile_id": parent["profile_id"],
+                        "capability_manifest_digest": (parent["capability_manifest_digest"]),
+                        "host_version": parent["host_version"],
+                        "compatibility_status": parent["compatibility_status"],
+                        "state": CaptureConnectionState.ENABLED.value,
+                        "created_at": timestamp,
+                        "updated_at": timestamp,
+                    }
+                    connection_tag = self._integrity.tag(
+                        "connection",
+                        _connection_material(connection_material),
+                    )
+                    self._connection.execute(
+                        """
+                        INSERT INTO connections(
+                            connection_id, project_digest, profile_id,
+                            capability_manifest_digest, host_version,
+                            compatibility_status, state,
+                            created_at, updated_at, row_tag
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            identity.connection_id,
+                            identity.project_digest,
+                            parent["profile_id"],
+                            parent["capability_manifest_digest"],
+                            parent["host_version"],
+                            parent["compatibility_status"],
+                            CaptureConnectionState.ENABLED.value,
+                            timestamp,
+                            timestamp,
+                            connection_tag,
+                        ),
+                    )
+                    child_material: dict[str, object] = {
+                        "global_parent_id": global_parent_id,
+                        "connection_id": identity.connection_id,
+                        "project_digest": identity.project_digest,
+                        "created_at": timestamp,
+                    }
+                    child_tag = self._integrity.tag(
+                        "global_child",
+                        _global_child_material(child_material),
+                    )
+                    self._connection.execute(
+                        """
+                        INSERT INTO capture_global_children(
+                            global_parent_id, connection_id, project_digest,
+                            created_at, row_tag
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            global_parent_id,
+                            identity.connection_id,
+                            identity.project_digest,
+                            timestamp,
+                            child_tag,
+                        ),
+                    )
+                    self._connection.commit()
+                except BaseException:
+                    self._rollback()
+                    raise
+                self._revalidate_boundary()
+                return CaptureGlobalChildBinding(
+                    global_parent_id=global_parent_id,
+                    connection_id=identity.connection_id,
+                    project_digest=identity.project_digest,
+                    created_at=_stored_timestamp(timestamp),
+                )
+        except CaptureStoreError:
+            raise
+        except Exception:
+            raise CaptureStoreError() from None
+
+    def resolve_global_child(
+        self,
+        global_parent_id: str,
+        canonical_project_identity: bytes,
+    ) -> CaptureGlobalChildBinding:
+        """Resolve an already-enrolled child without allowing enrollment."""
+
+        self._ensure_open()
+        if type(global_parent_id) is not str or type(canonical_project_identity) is not bytes:
+            raise CaptureStoreError()
+        try:
+            with self._lock:
+                self._ensure_open()
+                self._revalidate_boundary()
+                self._connection.execute("BEGIN")
+                try:
+                    parent = self._global_parent_row(global_parent_id)
+                    self._verify_global_health_set(global_parent_id, parent)
+                    self._verify_global_exclusion_set(global_parent_id, parent)
+                    if parent["state"] != CaptureGlobalParentState.ENABLED.value:
+                        raise CaptureStoreStateError()
+                    identity = _derive_global_child_from_project_digest(
+                        context=self._context,
+                        global_parent_id=global_parent_id,
+                        provider_id=CaptureGlobalProvider(parent["provider_id"]),
+                        generation=parent["generation"],
+                        project_digest=self._context.workspace_identity(canonical_project_identity),
+                    )
+                    if self._global_project_is_excluded(
+                        global_parent_id,
+                        identity.project_digest,
+                    ):
+                        raise CaptureStoreStateError()
+                    binding = self._global_child_binding(
+                        self._global_child_row(
+                            global_parent_id,
+                            identity.project_digest,
+                        )
+                    )
+                    self._connection.commit()
+                except BaseException:
+                    self._rollback()
+                    raise
+                self._revalidate_boundary()
+                return binding
+        except CaptureStoreError:
+            raise
+        except Exception:
+            raise CaptureStoreError() from None
+
+    def list_global_children(
+        self,
+        global_parent_id: str,
+    ) -> tuple[CaptureGlobalChildBinding, ...]:
+        """Return every authenticated child below one global parent."""
+
+        self._require_maintenance()
+        if type(global_parent_id) is not str:
+            raise CaptureStoreStateError()
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                parent = self._global_parent_row(global_parent_id)
+                self._verify_global_health_set(global_parent_id, parent)
+                self._verify_global_exclusion_set(global_parent_id, parent)
+                identities = self._connection.execute(
+                    """
+                    SELECT project_digest
+                    FROM capture_global_children
+                    WHERE global_parent_id = ?
+                    ORDER BY project_digest
+                    LIMIT ?
+                    """,
+                    (global_parent_id, MAX_GLOBAL_CHILDREN_PER_PARENT + 1),
+                ).fetchall()
+                if len(identities) > MAX_GLOBAL_CHILDREN_PER_PARENT:
+                    raise CaptureStoreIntegrityError()
+                bindings = tuple(
+                    self._global_child_binding(
+                        self._global_child_row(
+                            global_parent_id,
+                            identity["project_digest"],
+                        )
+                    )
+                    for identity in identities
+                )
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return bindings
+
+    def _global_exclusion_binding(
+        self,
+        row: sqlite3.Row,
+    ) -> CaptureGlobalExclusionBinding:
+        return CaptureGlobalExclusionBinding(
+            global_parent_id=row["global_parent_id"],
+            project_digest=row["project_digest"],
+            created_at=_stored_timestamp(row["created_at"]),
+        )
+
+    def replace_global_exclusions(
+        self,
+        global_parent_id: str,
+        canonical_project_identities: tuple[bytes, ...],
+    ) -> tuple[CaptureGlobalExclusionBinding, ...]:
+        """Atomically replace one parent's bounded path-free exclusion set."""
+
+        self._require_maintenance()
+        if (
+            type(global_parent_id) is not str
+            or type(canonical_project_identities) is not tuple
+            or len(canonical_project_identities) > MAX_GLOBAL_EXCLUSIONS_PER_PARENT
+            or any(type(identity) is not bytes for identity in canonical_project_identities)
+        ):
+            raise CaptureStoreStateError()
+        try:
+            project_digests = tuple(
+                sorted(
+                    self._context.workspace_identity(identity)
+                    for identity in canonical_project_identities
+                )
+            )
+            if len(set(project_digests)) != len(project_digests):
+                raise CaptureStoreStateError()
+            with self._lock:
+                self._require_maintenance()
+                self._revalidate_boundary()
+                self._begin_immediate()
+                try:
+                    parent = self._global_parent_row(global_parent_id)
+                    self._verify_global_health_set(global_parent_id, parent)
+                    existing = self._verify_global_exclusion_set(
+                        global_parent_id,
+                        parent,
+                    )
+                    if parent["state"] == CaptureGlobalParentState.DELETING.value:
+                        raise CaptureStoreStateError()
+                    if tuple(row["project_digest"] for row in existing) == project_digests:
+                        bindings = tuple(self._global_exclusion_binding(row) for row in existing)
+                        self._connection.rollback()
+                        self._revalidate_boundary()
+                        return bindings
+                    self._connection.execute(
+                        """
+                        DELETE FROM capture_global_exclusions
+                        WHERE global_parent_id = ?
+                        """,
+                        (global_parent_id,),
+                    )
+                    timestamp = _now()
+                    for project_digest in project_digests:
+                        material: dict[str, object] = {
+                            "global_parent_id": global_parent_id,
+                            "project_digest": project_digest,
+                            "created_at": timestamp,
+                        }
+                        row_tag = self._integrity.tag(
+                            "global_exclusion",
+                            _global_exclusion_material(material),
+                        )
+                        self._connection.execute(
+                            """
+                            INSERT INTO capture_global_exclusions(
+                                global_parent_id, project_digest, created_at, row_tag
+                            ) VALUES (?, ?, ?, ?)
+                            """,
+                            (
+                                global_parent_id,
+                                project_digest,
+                                timestamp,
+                                row_tag,
+                            ),
+                        )
+                    rows = self._load_verified_global_exclusion_rows(global_parent_id)
+                    parent_material = dict(parent)
+                    parent_material["exclusion_count"] = len(rows)
+                    parent_material["exclusion_set_digest"] = self._global_exclusion_set_digest(
+                        rows
+                    )
+                    parent_material["updated_at"] = timestamp
+                    parent_tag = self._integrity.tag(
+                        "global_parent",
+                        _global_parent_material(parent_material),
+                    )
+                    result = self._connection.execute(
+                        """
+                        UPDATE capture_global_parents
+                        SET exclusion_count = ?, exclusion_set_digest = ?,
+                            updated_at = ?, row_tag = ?
+                        WHERE global_parent_id = ?
+                        """,
+                        (
+                            parent_material["exclusion_count"],
+                            parent_material["exclusion_set_digest"],
+                            timestamp,
+                            parent_tag,
+                            global_parent_id,
+                        ),
+                    )
+                    if result.rowcount != 1:
+                        raise CaptureStoreIntegrityError()
+                    updated_parent = self._global_parent_row(global_parent_id)
+                    self._verify_global_health_set(
+                        global_parent_id,
+                        updated_parent,
+                    )
+                    self._verify_global_exclusion_set(
+                        global_parent_id,
+                        updated_parent,
+                    )
+                    bindings = tuple(self._global_exclusion_binding(row) for row in rows)
+                    self._connection.commit()
+                except BaseException:
+                    self._rollback()
+                    raise
+                self._revalidate_boundary()
+                return bindings
+        except CaptureStoreError:
+            raise
+        except Exception:
+            raise CaptureStoreError() from None
+
+    def list_global_exclusions(
+        self,
+        global_parent_id: str,
+    ) -> tuple[CaptureGlobalExclusionBinding, ...]:
+        """Return one complete authenticated global exclusion set."""
+
+        self._require_maintenance()
+        if type(global_parent_id) is not str:
+            raise CaptureStoreStateError()
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                parent = self._global_parent_row(global_parent_id)
+                self._verify_global_health_set(global_parent_id, parent)
+                rows = self._verify_global_exclusion_set(
+                    global_parent_id,
+                    parent,
+                )
+                bindings = tuple(self._global_exclusion_binding(row) for row in rows)
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return bindings
+
+    def global_child_is_excluded(
+        self,
+        global_parent_id: str,
+        canonical_project_identity: bytes,
+    ) -> bool:
+        """Check one canonical project identity against authenticated policy."""
+
+        self._ensure_open()
+        if type(global_parent_id) is not str or type(canonical_project_identity) is not bytes:
+            raise CaptureStoreError()
+        try:
+            project_digest = self._context.workspace_identity(canonical_project_identity)
+            with self._lock:
+                self._ensure_open()
+                self._revalidate_boundary()
+                self._connection.execute("BEGIN")
+                try:
+                    parent = self._global_parent_row(global_parent_id)
+                    self._verify_global_health_set(global_parent_id, parent)
+                    self._verify_global_exclusion_set(
+                        global_parent_id,
+                        parent,
+                    )
+                    excluded = self._global_project_is_excluded(
+                        global_parent_id,
+                        project_digest,
+                    )
+                    self._connection.commit()
+                except BaseException:
+                    self._rollback()
+                    raise
+                self._revalidate_boundary()
+                return excluded
+        except CaptureStoreError:
+            raise
+        except Exception:
+            raise CaptureStoreError() from None
+
+    def _global_health_counter(self, row: sqlite3.Row) -> CaptureGlobalHealthCounter:
+        return CaptureGlobalHealthCounter(
+            global_parent_id=row["global_parent_id"],
+            code=CaptureGlobalHealthCode(row["code"]),
+            count=row["count"],
+            saturated=bool(row["saturated"]),
+            created_at=_stored_timestamp(row["created_at"]),
+            updated_at=_stored_timestamp(row["updated_at"]),
+        )
+
+    def _record_global_parent_health(
+        self,
+        parent: sqlite3.Row,
+        code: CaptureGlobalHealthCode,
+    ) -> CaptureGlobalHealthCounter:
+        global_parent_id = parent["global_parent_id"]
+        row = self._connection.execute(
+            """
+            SELECT *
+            FROM capture_global_health
+            WHERE global_parent_id = ? AND code = ?
+            """,
+            (global_parent_id, code.value),
+        ).fetchone()
+        timestamp = _now()
+        if row is None:
+            marker_id = self._integrity.tag(
+                "global_health_id",
+                _global_health_identity_material(
+                    global_parent_id=global_parent_id,
+                    code=code,
+                ),
+            )
+            material: dict[str, object] = {
+                "marker_id": marker_id,
+                "global_parent_id": global_parent_id,
+                "code": code.value,
+                "count": 1,
+                "saturated": 0,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }
+            row_tag = self._integrity.tag(
+                "global_health",
+                _global_health_material(material),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO capture_global_health(
+                    marker_id, global_parent_id, code, count,
+                    saturated, created_at, updated_at, row_tag
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    marker_id,
+                    global_parent_id,
+                    code.value,
+                    1,
+                    0,
+                    timestamp,
+                    timestamp,
+                    row_tag,
+                ),
+            )
+        else:
+            verified = next(
+                (
+                    candidate
+                    for candidate in self._load_verified_global_health_rows(global_parent_id)
+                    if candidate["code"] == code.value
+                ),
+                None,
+            )
+            if verified is None:
+                raise CaptureStoreIntegrityError()
+            if verified["saturated"] == 1:
+                return self._global_health_counter(verified)
+            material = dict(verified)
+            material["count"] = min(
+                verified["count"] + 1,
+                MAX_GLOBAL_HEALTH_COUNT,
+            )
+            material["saturated"] = int(material["count"] == MAX_GLOBAL_HEALTH_COUNT)
+            material["updated_at"] = timestamp
+            row_tag = self._integrity.tag(
+                "global_health",
+                _global_health_material(material),
+            )
+            result = self._connection.execute(
+                """
+                UPDATE capture_global_health
+                SET count = ?, saturated = ?, updated_at = ?, row_tag = ?
+                WHERE marker_id = ?
+                """,
+                (
+                    material["count"],
+                    material["saturated"],
+                    timestamp,
+                    row_tag,
+                    verified["marker_id"],
+                ),
+            )
+            if result.rowcount != 1:
+                raise CaptureStoreIntegrityError()
+        rows = self._load_verified_global_health_rows(global_parent_id)
+        parent_material = dict(parent)
+        parent_material["health_marker_count"] = len(rows)
+        parent_material["health_set_digest"] = self._global_health_set_digest(rows)
+        parent_material["updated_at"] = timestamp
+        parent_tag = self._integrity.tag(
+            "global_parent",
+            _global_parent_material(parent_material),
+        )
+        result = self._connection.execute(
+            """
+            UPDATE capture_global_parents
+            SET health_marker_count = ?, health_set_digest = ?,
+                updated_at = ?, row_tag = ?
+            WHERE global_parent_id = ?
+            """,
+            (
+                parent_material["health_marker_count"],
+                parent_material["health_set_digest"],
+                timestamp,
+                parent_tag,
+                global_parent_id,
+            ),
+        )
+        if result.rowcount != 1:
+            raise CaptureStoreIntegrityError()
+        updated_parent = self._global_parent_row(global_parent_id)
+        self._verify_global_health_set(global_parent_id, updated_parent)
+        updated = next(
+            (candidate for candidate in rows if candidate["code"] == code.value),
+            None,
+        )
+        if updated is None:
+            raise CaptureStoreIntegrityError()
+        return self._global_health_counter(updated)
+
+    def mark_global_parent_health(
+        self,
+        global_parent_id: str,
+        code: CaptureGlobalHealthCode,
+    ) -> CaptureGlobalHealthCounter:
+        """Atomically increment one saturating parent-global health counter."""
+
+        self._ensure_open()
+        if type(global_parent_id) is not str or type(code) is not CaptureGlobalHealthCode:
+            raise CaptureStoreError()
+        with self._lock:
+            self._ensure_open()
+            self._revalidate_boundary()
+            self._begin_immediate()
+            try:
+                parent = self._global_parent_row(global_parent_id)
+                self._verify_global_health_set(global_parent_id, parent)
+                self._verify_global_exclusion_set(global_parent_id, parent)
+                if parent["state"] != CaptureGlobalParentState.ENABLED.value:
+                    raise CaptureStoreStateError()
+                counter = self._record_global_parent_health(parent, code)
+                self._connection.commit()
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return counter
+
+    def list_global_parent_health(
+        self,
+        global_parent_id: str,
+    ) -> tuple[CaptureGlobalHealthCounter, ...]:
+        """Return the complete authenticated health set for one parent."""
+
+        self._require_maintenance()
+        if type(global_parent_id) is not str:
+            raise CaptureStoreStateError()
+        with self._lock:
+            self._require_maintenance()
+            self._revalidate_boundary()
+            try:
+                self._connection.execute("BEGIN")
+                parent = self._global_parent_row(global_parent_id)
+                rows = self._verify_global_health_set(global_parent_id, parent)
+                self._verify_global_exclusion_set(global_parent_id, parent)
+                counters = tuple(self._global_health_counter(row) for row in rows)
+                self._connection.commit()
+            except CaptureStoreError:
+                self._rollback()
+                raise
+            except Exception:
+                self._rollback()
+                raise CaptureStoreIntegrityError() from None
+            except BaseException:
+                self._rollback()
+                raise
+            self._revalidate_boundary()
+            return counters
 
     def _connection_summary(self, row: sqlite3.Row) -> CaptureConnectionSummary:
         from saliencegate.capture.connections import CaptureConnectionSummary
@@ -2737,6 +4119,44 @@ class CaptureStore:
             ).fetchall()
             for connection_row in connection_rows:
                 self._connection_row(connection_row["connection_id"])
+            global_parent_rows = self._connection.execute(
+                """
+                SELECT global_parent_id
+                FROM capture_global_parents
+                ORDER BY global_parent_id
+                """
+            ).fetchall()
+            for parent_identity in global_parent_rows:
+                global_parent_id = parent_identity["global_parent_id"]
+                parent = self._global_parent_row(global_parent_id)
+                self._verify_global_health_set(global_parent_id, parent)
+                self._verify_global_exclusion_set(global_parent_id, parent)
+            global_child_counts = self._connection.execute(
+                """
+                SELECT global_parent_id, COUNT(*) AS child_count
+                FROM capture_global_children
+                GROUP BY global_parent_id
+                ORDER BY global_parent_id
+                """
+            ).fetchall()
+            if any(
+                type(row["child_count"]) is not int
+                or not 0 <= row["child_count"] <= MAX_GLOBAL_CHILDREN_PER_PARENT
+                for row in global_child_counts
+            ):
+                raise CaptureStoreIntegrityError()
+            global_child_rows = self._connection.execute(
+                """
+                SELECT global_parent_id, project_digest
+                FROM capture_global_children
+                ORDER BY global_parent_id, project_digest
+                """
+            ).fetchall()
+            for child_identity in global_child_rows:
+                self._global_child_row(
+                    child_identity["global_parent_id"],
+                    child_identity["project_digest"],
+                )
             session_rows = self._connection.execute(
                 """
                 SELECT connection_id, session_id

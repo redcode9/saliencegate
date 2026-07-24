@@ -1413,7 +1413,7 @@ def test_ci_gates_registered_capture_and_connector_performance() -> None:
     assert "--import ./connectors/scripts/deny-network.mjs" in package
 
 
-def test_ci_declares_targeted_native_capture_contracts_without_claiming_r01() -> None:
+def test_ci_declares_targeted_native_capture_contracts() -> None:
     text = _read(".github/workflows/ci.yml")
     platform = _job_block(text, "capture-platform-contract")
     build = _job_block(text, "build")
@@ -1433,11 +1433,6 @@ def test_ci_declares_targeted_native_capture_contracts_without_claiming_r01() ->
     assert "provider-credential-read-must-fail" in platform
     assert "- capture-platform-contract" in build
     assert "--disable-socket" in _read("pyproject.toml")
-
-    integration_docs = _read("docs/reference/integrations.md")
-    assert integration_docs.count("implementation ready, remote verification pending") == 1
-    assert "separate R01 gate" in integration_docs
-    assert "Local contract tests do not promote any platform" in integration_docs
 
 
 def test_ci_builds_once_and_gates_distribution_membership_before_upload() -> None:

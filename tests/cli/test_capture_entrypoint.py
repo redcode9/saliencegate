@@ -26,6 +26,8 @@ def test_connect_parser_exposes_the_locked_provider_surface(provider: str) -> No
         "command": "connect",
         "provider": provider,
         "project": "/synthetic/project",
+        "global_scope": False,
+        "exclude": None,
         "dry_run": True,
         "json": True,
     }
@@ -49,12 +51,14 @@ def test_capture_query_parsers_expose_the_locked_surface() -> None:
         "command": "disconnect",
         "provider": "pi",
         "project": None,
+        "global_scope": False,
         "json": True,
     }
     assert vars(status) == {
         "command": "status",
         "provider": "opencode",
         "project": "/synthetic/project",
+        "global_scope": False,
         "json": False,
     }
     assert vars(sessions) == {
@@ -152,7 +156,7 @@ def test_connect_help_is_short_and_copyable(run_cli: RunCli) -> None:
     assert "--project PROJECT" in completed.stdout
     assert "--dry-run" in completed.stdout
     assert "--json" in completed.stdout
-    assert len(completed.stdout.splitlines()) <= 12
+    assert len(completed.stdout.splitlines()) <= 14
 
 
 def test_feedback_help_is_exact_and_copyable(run_cli: RunCli) -> None:

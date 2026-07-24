@@ -1,9 +1,9 @@
 # Universal Shadow Capture integration contract
 
-This page freezes the normative provider contract for Universal Shadow Capture v1 in the
-unpublished local SalienceGate 0.2.0 candidate. A connector conforms only when its installed package
-contains the matching audited capability manifest. Documentation alone is not evidence that a
-connector is installed or has observed an event; capture status must report that separately.
+This page defines the normative provider contract for Universal Shadow Capture v1 in SalienceGate
+0.2.0. A connector conforms only when its installed package contains the matching audited
+capability manifest. Documentation alone is not evidence that a connector is installed or has
+observed an event; capture status must report that separately.
 
 The contract was audited on **2026-07-19**. The allowlists below describe native fields with
 evidence authority; those fields may exist briefly in bounded memory. Provider identifiers and
@@ -22,10 +22,16 @@ event gives `cwd` no evidence authority.
 | `opencode-plugin/v1` | OpenCode `1.18.3`, release commit [`127bdb3`](https://github.com/anomalyco/opencode/commit/127bdb30784d508cc556c71a0f32b508a3061517) | `<repo>/.opencode/plugins/saliencegate.js`, the documented project plugin directory | `message.part.updated`, `session.idle`, `session.error`, `session.compacted`, `session.deleted`, and plugin `dispose` |
 | `pi-extension/v1` | `@earendil-works/pi-coding-agent` `0.80.10`, tag commit [`8dc7883`](https://github.com/earendil-works/pi/commit/8dc78834cde4e329284cf505f9e3f99763df5529) | `<repo>/.pi/extensions/saliencegate.ts`; Pi must trust the project before loading it | `session_start`, `before_agent_start`, `tool_execution_start`, `tool_execution_end`, `agent_settled`, `session_compact`, `session_tree`, `session_shutdown` |
 
-The native runner workflow is prepared but has not been run remotely from this unpublished branch.
-Ubuntu 24.04 and Windows 2025 are **implementation ready, remote verification pending**. The
-macOS 15 job is prepared as the third native boundary; remote evidence for all three runners is the
-separate R01 gate. Local contract tests do not promote any platform to remotely verified status.
+| Provider | Project-local managed files | User-global managed files |
+|---|---|---|
+| Codex | `<project>/.codex/config.toml` | `CODEX_HOME/config.toml` (default `~/.codex/config.toml`) |
+| Claude Code | `<project>/.claude/settings.local.json` | `CLAUDE_CONFIG_DIR/settings.json` (default `~/.claude/settings.json`) |
+| OpenCode | `<project>/.opencode/plugins/saliencegate.js` and `saliencegate.bootstrap.json` | `OPENCODE_CONFIG_DIR/plugins/saliencegate.js` and `saliencegate.bootstrap.json` (default below `~/.config/opencode`) |
+| Pi | `<project>/.pi/extensions/saliencegate.ts` and `saliencegate.bootstrap.json` | `PI_CODING_AGENT_DIR/extensions/saliencegate.ts` and `saliencegate.bootstrap.json` (default below `~/.pi/agent`) |
+
+A user-global callback resolves its project, honors authenticated exclusions, and derives one
+authenticated child connection for that project. A matching project-local integration takes
+precedence, and neither scope modifies provider trust settings.
 
 Installation must never bypass, pre-approve, or weaken provider trust. Project-local JavaScript,
 TypeScript, hook commands, and sidecars execute with the user's operating-system authority. Users

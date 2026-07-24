@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-SalienceGate is pre-release software. Security fixes are applied to the current `main` branch. No
-released version is supported yet.
+SalienceGate is early-stage software. Security fixes are applied to the latest `0.2.x` release and
+the current `main` branch.
 
 ## Reporting a vulnerability
 

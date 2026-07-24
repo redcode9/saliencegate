@@ -81,10 +81,8 @@ remaining limit. Every other bounded case is `insufficient_evidence`. None is a 
 task-outcome claim.
 
 The repository contains synthetic fixtures that exercise these branches, not a real-world sample.
-The prepared Ubuntu, Windows, and macOS native connector workflows have not been run remotely from
-this unpublished branch. The current assessment is therefore
-`insufficient_real_world_evidence`; remote compatibility evidence and the externally reviewed E01
-study are separate future authorization gates.
+The current assessment is therefore `insufficient_real_world_evidence`; real-world compatibility
+and externally reviewed study evidence would be required for broader claims.
 
 ## Profile evidence and omissions
 

@@ -213,7 +213,7 @@ export class WindowedBatchTransport {
   async flush(
     coordinates: WindowCoordinates,
     records: readonly CanonicalJson[],
-    options: { force?: boolean } = {},
+    options: { force?: boolean; workspacePath?: string } = {},
   ): Promise<WindowedCaptureFlushResult> {
     try {
       if (
@@ -243,6 +243,9 @@ export class WindowedBatchTransport {
         bootstrap: this.#bootstrap,
         batchID: this.#batchID(),
         sessionID: coordinates.sessionID,
+        ...(options.workspacePath === undefined
+          ? {}
+          : { workspacePath: options.workspacePath }),
         windowDiscriminator: coordinates.windowDiscriminator,
         events,
       });

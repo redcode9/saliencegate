@@ -147,21 +147,105 @@ def _parser() -> _SafeArgumentParser:
     doctor.add_argument("--capture", action="store_true")
     doctor.add_argument("--json", action="store_true")
 
-    connect = commands.add_parser("connect", help="Install passive project capture")
-    connect.add_argument("provider", choices=_CAPTURE_PROVIDERS)
-    connect.add_argument("--project")
-    connect.add_argument("--dry-run", action="store_true")
-    connect.add_argument("--json", action="store_true")
+    setup = commands.add_parser(
+        "setup",
+        help="Choose providers and connect them per project or globally",
+    )
+    setup.add_argument(
+        "--install-only",
+        action="store_true",
+        help="Finish installation without connecting a provider",
+    )
+    setup.add_argument(
+        "--provider",
+        action="append",
+        choices=(*_CAPTURE_PROVIDERS, "all"),
+        help="Provider to connect; repeat it or use 'all'",
+    )
+    setup.add_argument(
+        "--scope",
+        choices=("project", "global"),
+        help="Connect the current project or every project for this user",
+    )
+    setup.add_argument("--project", help="Project path (project scope only)")
+    setup.add_argument(
+        "--exclude",
+        action="append",
+        help="Project path excluded from global capture; repeat as needed",
+    )
+    setup_action = setup.add_mutually_exclusive_group()
+    setup_action.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the plan without changing files",
+    )
+    setup_action.add_argument(
+        "--yes",
+        action="store_true",
+        help="Apply the displayed plan without an interactive confirmation",
+    )
+    setup_action.add_argument(
+        "--confirm",
+        help="Apply only when this exact confirmation phrase matches the plan",
+    )
+    setup.add_argument("--json", action="store_true", help="Emit JSON")
 
-    disconnect = commands.add_parser("disconnect", help="Remove passive project capture")
+    connect = commands.add_parser("connect", help="Install passive capture")
+    connect.add_argument("provider", choices=_CAPTURE_PROVIDERS)
+    connect_scope = connect.add_mutually_exclusive_group()
+    connect_scope.add_argument("--project", help="Project path; defaults to the current project")
+    connect_scope.add_argument(
+        "--global",
+        dest="global_scope",
+        action="store_true",
+        help="Connect every project for the current user",
+    )
+    connect.add_argument(
+        "--exclude",
+        action="append",
+        help="Exclude a project from global capture; repeatable",
+    )
+    connect.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the change without applying it",
+    )
+    connect.add_argument("--json", action="store_true", help="Emit JSON")
+
+    disconnect = commands.add_parser("disconnect", help="Remove passive capture")
     disconnect.add_argument("provider", choices=_CAPTURE_PROVIDERS)
-    disconnect.add_argument("--project")
-    disconnect.add_argument("--json", action="store_true")
+    disconnect_scope = disconnect.add_mutually_exclusive_group()
+    disconnect_scope.add_argument(
+        "--project",
+        help="Project path; defaults to the current project",
+    )
+    disconnect_scope.add_argument(
+        "--global",
+        dest="global_scope",
+        action="store_true",
+        help="Disconnect the user-global integration",
+    )
+    disconnect.add_argument("--json", action="store_true", help="Emit JSON")
 
     status = commands.add_parser("status", help="Show passive capture status")
-    status.add_argument("provider", nargs="?", choices=_CAPTURE_PROVIDERS)
-    status.add_argument("--project")
-    status.add_argument("--json", action="store_true")
+    status.add_argument(
+        "provider",
+        nargs="?",
+        choices=_CAPTURE_PROVIDERS,
+        help="Provider; global status shows all providers when omitted",
+    )
+    status_scope = status.add_mutually_exclusive_group()
+    status_scope.add_argument(
+        "--project",
+        help="Project path; defaults to the current project",
+    )
+    status_scope.add_argument(
+        "--global",
+        dest="global_scope",
+        action="store_true",
+        help="Show user-global integrations",
+    )
+    status.add_argument("--json", action="store_true", help="Emit JSON")
 
     sessions = commands.add_parser("sessions", help="List captured project sessions")
     sessions.add_argument("--provider", choices=_CAPTURE_PROVIDERS)
@@ -341,45 +425,223 @@ def _dispatch_doctor(arguments: argparse.Namespace) -> ExitCode:
     return _doctor_exit(report)
 
 
+def _dispatch_setup(arguments: argparse.Namespace) -> ExitCode:
+    from saliencegate.commands.setup import (
+        SetupScope,
+        apply_setup,
+        cancel_setup,
+        normalize_setup_providers,
+        planned_setup,
+        prepare_setup,
+        render_setup_json,
+        render_setup_plan_human,
+        render_setup_result_human,
+    )
+    from saliencegate.commands.setup_wizard import (
+        collect_setup_wizard_selection,
+        confirm_setup_plan,
+    )
+
+    selection_values = (
+        arguments.install_only,
+        arguments.provider is not None,
+        arguments.scope is not None,
+        arguments.project is not None,
+        arguments.exclude is not None,
+    )
+    action_values = (
+        arguments.dry_run,
+        arguments.yes,
+        arguments.confirm is not None,
+        arguments.json,
+    )
+    interactive_wizard = not any(selection_values)
+    if interactive_wizard:
+        if any(action_values):
+            raise CaptureCommandInputError()
+        wizard = collect_setup_wizard_selection(
+            read_line=input,
+            write_text=_write_stdout,
+        )
+        install_only = wizard.install_only
+        providers = wizard.providers
+        scope = wizard.scope
+        project = wizard.project
+        exclusions = wizard.exclusions
+        exact_global_all = (
+            wizard.scope is SetupScope.GLOBAL and providers == normalize_setup_providers(("all",))
+        )
+    else:
+        install_only = arguments.install_only
+        exact_global_all = (
+            not arguments.install_only
+            and arguments.provider == ["all"]
+            and (arguments.scope == "global" or arguments.scope is SetupScope.GLOBAL)
+        )
+        providers = (
+            () if arguments.provider is None else normalize_setup_providers(arguments.provider)
+        )
+        scope = arguments.scope
+        project = arguments.project
+        exclusions = () if arguments.exclude is None else tuple(arguments.exclude)
+
+    if exclusions and scope != "global" and scope is not SetupScope.GLOBAL:
+        raise CaptureCommandInputError()
+
+    if exact_global_all:
+        from saliencegate.integrations.global_installation import (
+            global_provider_is_available,
+        )
+
+        providers = tuple(
+            provider for provider in providers if global_provider_is_available(provider)
+        )
+        if not providers:
+            raise CaptureCommandUnavailableError()
+
+    from saliencegate.commands.global_capture import GlobalSetupHandler
+
+    prepared = prepare_setup(
+        install_only=install_only,
+        providers=providers,
+        scope=scope,
+        project=project,
+        global_handler=GlobalSetupHandler(
+            exclusions=tuple(Path(value).expanduser() for value in exclusions),
+        ),
+    )
+    planned = planned_setup(prepared)
+    if arguments.dry_run:
+        if arguments.json:
+            _write_stdout(render_setup_json(planned))
+        else:
+            _write_stdout(render_setup_plan_human(prepared.plan))
+            _write_stdout(render_setup_result_human(planned))
+        return ExitCode.SUCCESS
+
+    if arguments.confirm is not None and arguments.confirm != prepared.plan.confirmation_phrase:
+        raise CaptureCommandInputError()
+    if arguments.json and not (arguments.yes or arguments.confirm is not None):
+        raise CaptureCommandInputError()
+
+    if not arguments.json:
+        _write_stdout(render_setup_plan_human(prepared.plan))
+    if (
+        (interactive_wizard and prepared.plan.install_only)
+        or arguments.yes
+        or arguments.confirm is not None
+        or confirm_setup_plan(prepared.plan, read_line=input)
+    ):
+        report = apply_setup(prepared)
+    else:
+        report = cancel_setup(prepared)
+    _write_stdout(
+        render_setup_json(report) if arguments.json else render_setup_result_human(report)
+    )
+    return ExitCode.SUCCESS
+
+
 def _dispatch_connect(arguments: argparse.Namespace) -> ExitCode:
+    if arguments.global_scope:
+        from saliencegate.commands.global_capture import (
+            render_global_connect_human,
+            render_global_connect_json,
+            run_global_connect,
+        )
+
+        global_report = run_global_connect(
+            provider=arguments.provider,
+            exclusions=() if arguments.exclude is None else tuple(arguments.exclude),
+            dry_run=arguments.dry_run,
+        )
+        _write_stdout(
+            render_global_connect_json(global_report)
+            if arguments.json
+            else render_global_connect_human(global_report)
+        )
+        return ExitCode.SUCCESS
+    if arguments.exclude is not None:
+        raise CaptureCommandInputError()
     from saliencegate.commands.capture.connect import (
         render_connect_human,
         render_connect_json,
         run_connect,
     )
 
-    report = run_connect(
+    connect_report = run_connect(
         provider=arguments.provider,
         project=arguments.project,
         dry_run=arguments.dry_run,
     )
-    _write_stdout(render_connect_json(report) if arguments.json else render_connect_human(report))
+    _write_stdout(
+        render_connect_json(connect_report)
+        if arguments.json
+        else render_connect_human(connect_report)
+    )
     return ExitCode.SUCCESS
 
 
 def _dispatch_disconnect(arguments: argparse.Namespace) -> ExitCode:
+    if arguments.global_scope:
+        from saliencegate.commands.global_capture import (
+            render_global_disconnect_human,
+            render_global_disconnect_json,
+            run_global_disconnect,
+        )
+
+        global_report = run_global_disconnect(provider=arguments.provider)
+        _write_stdout(
+            render_global_disconnect_json(global_report)
+            if arguments.json
+            else render_global_disconnect_human(global_report)
+        )
+        return ExitCode.SUCCESS
     from saliencegate.commands.capture.disconnect import (
         render_disconnect_human,
         render_disconnect_json,
         run_disconnect,
     )
 
-    report = run_disconnect(provider=arguments.provider, project=arguments.project)
+    disconnect_report = run_disconnect(
+        provider=arguments.provider,
+        project=arguments.project,
+    )
     _write_stdout(
-        render_disconnect_json(report) if arguments.json else render_disconnect_human(report)
+        render_disconnect_json(disconnect_report)
+        if arguments.json
+        else render_disconnect_human(disconnect_report)
     )
     return ExitCode.SUCCESS
 
 
 def _dispatch_status(arguments: argparse.Namespace) -> ExitCode:
+    if arguments.global_scope:
+        from saliencegate.commands.global_capture import (
+            render_global_status_human,
+            render_global_status_json,
+            run_global_status,
+        )
+
+        global_report = run_global_status(provider=arguments.provider)
+        _write_stdout(
+            render_global_status_json(global_report)
+            if arguments.json
+            else render_global_status_human(global_report)
+        )
+        return ExitCode.SUCCESS
     from saliencegate.commands.capture.status import (
         render_status_human,
         render_status_json,
         run_status,
     )
 
-    report = run_status(provider=arguments.provider, project=arguments.project)
-    _write_stdout(render_status_json(report) if arguments.json else render_status_human(report))
+    status_report = run_status(
+        provider=arguments.provider,
+        project=arguments.project,
+    )
+    _write_stdout(
+        render_status_json(status_report) if arguments.json else render_status_human(status_report)
+    )
     return ExitCode.SUCCESS
 
 
@@ -660,6 +922,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _dispatch_demo(arguments)
         if arguments.command == "doctor":
             return _dispatch_doctor(arguments)
+        if arguments.command == "setup":
+            return _dispatch_setup(arguments)
         if arguments.command == "connect":
             return _dispatch_connect(arguments)
         if arguments.command == "disconnect":

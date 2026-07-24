@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import path from "node:path";
 
 import {
   MAX_CAPTURE_EVENT_BYTES,
@@ -43,6 +44,26 @@ function exactText(value: unknown): string | undefined {
     return undefined;
   }
   return value;
+}
+
+function pluginWorkspacePath(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, "directory");
+  if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable) {
+    return undefined;
+  }
+  const directory = descriptor.value;
+  if (
+    typeof directory !== "string" ||
+    directory.length === 0 ||
+    directory.includes("\0") ||
+    !isWellFormedUnicode(directory) ||
+    Buffer.byteLength(directory, "utf8") > 4_096 ||
+    (!path.posix.isAbsolute(directory) && !path.win32.isAbsolute(directory))
+  ) {
+    return undefined;
+  }
+  return directory;
 }
 
 function flushTargets(value: unknown): Set<string> {
@@ -103,6 +124,7 @@ class OpenCodePluginRuntime {
       environment?: NodeJS.ProcessEnv;
       writeChunk?: CaptureChunkWriter;
       batchID?: () => string;
+      workspacePath?: string;
     },
   ) {
     this.#transport = new OpenCodeBatchTransport(bootstrap, options);
@@ -380,12 +402,16 @@ export function createOpenCodePlugin(
     batchID?: () => string;
   },
 ): OpenCodePlugin {
-  return async (_input: unknown) => {
+  return async (input: unknown) => {
     let runtime: OpenCodePluginRuntime | undefined;
     try {
       const loader = options.loadBootstrap ?? loadOpenCodeBootstrap;
       const bootstrap = await loader(options.bootstrapURL);
-      runtime = new OpenCodePluginRuntime(bootstrap, options);
+      const workspacePath = pluginWorkspacePath(input);
+      runtime = new OpenCodePluginRuntime(bootstrap, {
+        ...options,
+        ...(workspacePath === undefined ? {} : { workspacePath }),
+      });
     } catch {
       runtime = undefined;
     }

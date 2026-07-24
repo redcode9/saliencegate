@@ -28,7 +28,7 @@ from saliencegate.security.windows import (
 )
 
 APPLICATION_ID: Final = 0x53474350  # "SGCP"
-LATEST_SCHEMA_VERSION: Final = 2
+LATEST_SCHEMA_VERSION: Final = 3
 
 _MIGRATION_NAME = re.compile(r"^(?P<version>[0-9]{4})_(?P<name>[a-z][a-z0-9_]*)\.sql$")
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")

@@ -1426,6 +1426,19 @@ def build_capture_hook_dependencies(
         ):
             raise ClaudeCodeIntegrationError()
         environment = environment_without_provider_credentials(environ)
+        from saliencegate.integrations.global_runtime import (
+            try_build_global_capture_hook_dependencies,
+        )
+
+        global_dependencies = try_build_global_capture_hook_dependencies(
+            ProviderAlias.CLAUDE_CODE,
+            source,
+            connection_id=connection_id,
+            environ=environment,
+            capture_executable=capture_executable,
+        )
+        if global_dependencies is not None:
+            return global_dependencies
         document = read_bounded_json(source, limits=CAPTURE_NATIVE_JSON_LIMITS)
         session_native = _exact_text(
             document.get("session_id"),

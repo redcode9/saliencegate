@@ -45,16 +45,18 @@ errors never echo project paths, provider-native identifiers, input values, or e
 
 ## Passive capture lifecycle
 
-Universal Shadow Capture is project-bound and local. The supported provider aliases are exactly
-`codex`, `claude-code`, `opencode`, and `pi`. `connect`, `disconnect`, and `status` accept an
-explicit `--project`; otherwise they use the current directory. `sessions`, `report`, and
-`feedback` always use the current directory as the project boundary. None of these commands calls a
-model, reads a transcript, or gains decision authority.
+Universal Shadow Capture supports project-local and user-global connections. The provider aliases
+are exactly `codex`, `claude-code`, `opencode`, and `pi`. `setup` configures one or all providers;
+`connect`, `disconnect`, and `status` select either `--project` or `--global`. Without either flag,
+project commands use the current directory. `sessions`, `report`, and `feedback` always use the
+current directory as the project boundary. A project-local integration takes precedence over the
+matching global integration, and SalienceGate never changes provider trust settings. None of these
+commands calls a model, reads a transcript, or gains decision authority.
 
 The intended operator sequence is:
 
-1. inspect `connect PROVIDER --dry-run` and the provider-specific managed files;
-2. keep the provider's ordinary project trust enabled, then run `connect PROVIDER`;
+1. run `setup`, or inspect a scripted `setup ... --dry-run`, and review the managed files;
+2. retain the provider's ordinary trust policy, then confirm the plan;
 3. run one provider session and distinguish installation from observation with `status`;
 4. select a short SalienceGate session identifier with `sessions` and inspect it with `report`;
 5. run `disconnect PROVIDER` to stop admission while retaining existing evidence;
@@ -63,24 +65,62 @@ The intended operator sequence is:
 The complete provider paths, selected callbacks, version policy, exclusions, and recovery rules are
 in the [integration contract](integrations.md).
 
+## `setup`
+
+Artifact-compatible after installation:
+
+```text
+saliencegate setup
+saliencegate setup --install-only
+  [--dry-run | --yes | --confirm PHRASE]
+  [--json]
+saliencegate setup --provider codex|claude-code|opencode|pi|all
+  [--provider codex|claude-code|opencode|pi]
+  --scope project [--project PATH]
+  [--dry-run | --yes | --confirm PHRASE]
+  [--json]
+saliencegate setup --provider codex|claude-code|opencode|pi|all
+  [--provider codex|claude-code|opencode|pi]
+  --scope global [--exclude PATH]...
+  [--dry-run | --yes | --confirm PHRASE]
+  [--json]
+```
+
+With no arguments, `setup` opens a wizard for install-only, current-project, selected-project, or
+user-global setup. `all` must be used alone; in global scope it selects the detected providers that
+already have a user configuration and usable host command. Explicit provider selections remain
+fail-closed when unavailable. Otherwise `--provider` may be repeated. Project scope defaults to the
+current directory when `--project` is omitted. Global exclusions must name existing project
+directories and may be repeated.
+
+Every form builds the complete plan before mutation. `--dry-run` stops after that plan. `--yes`
+accepts it non-interactively, while `--confirm` must match the displayed scope-and-provider phrase.
+JSON mutation requires one of those two explicit approvals. Setup reports that provider trust
+changes are false.
+
 ## `connect`
 
 Artifact-compatible after installation:
 
 ```text
 saliencegate connect codex|claude-code|opencode|pi
-  [--project PATH]
+  [--project PATH | --global]
+  [--exclude PATH]...
   [--dry-run]
   [--json]
 ```
 
-`connect` plans or installs one authenticated project-local integration. A dry-run validates the
-requested project, provider contract, collision rules, and managed-file plan, but it does not
-create the installation key, capture store, receipt, launcher, or provider configuration. A normal
-connect probes the live Codex or Claude Code version, preflights the provider side, registers a
-pending local connection, publishes the managed integration, and enables admission last. OpenCode
-and Pi use exact pinned versions in their sealed connector specifications rather than launching the
-host during connect.
+`connect` plans or installs one authenticated integration. Project scope is the default;
+`--exclude` is valid only with `--global` and may be repeated. A dry-run validates the selected
+scope, provider contract, collision rules, and managed-file plan without creating the installation
+key, capture store, receipt, launcher, or provider configuration.
+
+A normal project connect registers a pending local connection, publishes the managed integration,
+and enables admission last. A global connect publishes into the provider's user configuration,
+registers one authenticated parent, and automatically derives an authenticated child when that
+provider first reports a non-excluded project. A matching project-local installation suppresses the
+global route for that provider. Codex and Claude Code probe their supported live versions; OpenCode
+and Pi use exact pinned versions without launching the host during connect.
 
 The operation preserves unrelated configuration and fails closed on malformed selected config,
 ownership ambiguity, an unsafe path, unexpected managed-file drift, an unsupported host version,
@@ -93,7 +133,8 @@ read-only Git review result for every managed project file. It distinguishes an 
 tree, an unavailable probe, files ignored by repository rules, files Git would surface, and files
 already tracked. JSON is one canonical `capture-connect/v1` record with the same bounded result and
 counts. Neither mode changes `.gitignore` or includes a project path, command, identifier, or
-digest.
+digest. Global output instead reports managed-file and exclusion counts; its JSON schema is
+`global-capture-connect/v1`.
 
 ## `disconnect`
 
@@ -101,19 +142,21 @@ Artifact-compatible after installation:
 
 ```text
 saliencegate disconnect codex|claude-code|opencode|pi
-  [--project PATH]
+  [--project PATH | --global]
   [--json]
 ```
 
-`disconnect` disables admission, drains the authenticated spool, reverses only the owned provider
-configuration or bridge files, and marks the matching local connections disabled. It restores an
-otherwise unchanged Codex or Claude Code config and removes the owned OpenCode or Pi bundle and
-bootstrap. Receipt and journal bindings prevent an unrelated look-alike file from being removed.
-Drift or ambiguous ownership fails closed for manual inspection.
+Project-local `disconnect` disables admission, drains the authenticated spool, reverses only the
+owned provider configuration or bridge files, and marks matching local connections disabled.
+Global `disconnect` removes only that provider's authenticated user-global files and disables its
+parent; derived project children remain as retained local evidence. Receipt and journal bindings
+prevent an unrelated look-alike file from being removed. Drift or ambiguous ownership fails closed
+for manual inspection.
 
 Disconnect is the connector uninstall operation; it deliberately retains the installation key,
 SQLite observations, spool boundary, disabled connection receipts, session records, feedback, and
 deletion tombstones. It does not imply data deletion. JSON uses `capture-disconnect/v1`.
+Global JSON uses `global-capture-disconnect/v1`.
 
 ## `status`
 
@@ -121,12 +164,12 @@ Artifact-compatible after installation:
 
 ```text
 saliencegate status [codex|claude-code|opencode|pi]
-  [--project PATH]
+  [--project PATH | --global]
   [--json]
 ```
 
-Without a provider argument, `status` returns all four profiles. It drains an available spool,
-authenticates the project connection and managed installation, and reports one of
+Without a provider argument, either scope returns all four profiles. Project status drains an
+available spool, authenticates the project connection and managed installation, and reports one of
 `not_installed`, `installed_not_observed`, `active_observed`, `degraded`, or `drifted`. The
 `installed` enum value is reserved for a future host-attested state and is not emitted by v1.
 Installation alone is not observation: `installed_not_observed` remains explicit until a lifecycle
@@ -137,6 +180,9 @@ quarantine counts, queued and dropped spool-event counts, the oldest short Salie
 identifier, total local capture bytes, and closed drift codes. It reports neither storage paths nor
 provider-native identifiers. JSON uses `capture-status/v1` with four bounded
 `capture-provider-status/v1` records when no provider is selected.
+
+Global status reports `not_installed`, `enabled`, `disabled`, or `drifted`, plus bounded project
+child and exclusion counts. Its JSON schema is `global-capture-status/v1`.
 
 ## `sessions`
 

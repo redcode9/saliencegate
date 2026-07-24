@@ -31,6 +31,9 @@ _DOMAINS = {
     "turn_id": b"saliencegate:capture:turn-id:v1",
     "transport_batch_ref": b"saliencegate:capture:transport-batch-ref:v1",
     "transport_chunk_digest": b"saliencegate:capture:transport-chunk-digest:v1",
+    "global_config_root": b"saliencegate:capture:global-config-root:v1",
+    "global_parent_id": b"saliencegate:capture:global-parent-id:v1",
+    "global_child_id": b"saliencegate:capture:global-child-id:v1",
     "integrity_tag": b"saliencegate:capture:integrity-tag:v1",
 }
 
@@ -119,6 +122,21 @@ class CaptureDigestContext:
         """Key the exact canonical bytes of one bounded bridge chunk."""
 
         return self._derive("transport_chunk_digest", value)
+
+    def global_config_root(self, value: bytes) -> str:
+        """Pseudonymize one canonical provider-user configuration root."""
+
+        return self._derive("global_config_root", value)
+
+    def global_parent_id(self, value: bytes) -> str:
+        """Derive one provider-global installation identity."""
+
+        return self._derive("global_parent_id", value)
+
+    def global_child_id(self, value: bytes) -> str:
+        """Derive one project child identity below a global installation."""
+
+        return self._derive("global_child_id", value)
 
     def integrity_tag(self, value: bytes) -> str:
         return self._derive("integrity_tag", value)

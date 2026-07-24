@@ -2,6 +2,7 @@ export const saliencegateBootstrap = new URL("./saliencegate.bootstrap.json", im
 
 // connectors/opencode/src/plugin.ts
 import { Buffer as Buffer4 } from "node:buffer";
+import path3 from "node:path";
 
 // connectors/bridge-core/src/canonical.ts
 import { Buffer as Buffer2 } from "node:buffer";
@@ -118,6 +119,11 @@ import { Buffer as Buffer3 } from "node:buffer";
 var SHA256 = /^[0-9a-f]{64}$/;
 var CONNECTION_ID = /^sg-[0-9a-f]{48}$/;
 var WINDOWS_ABSOLUTE = /^[A-Za-z]:[\\/]/;
+var WINDOWS_UNC_ABSOLUTE = /^\\\\[^\\]+\\[^\\]+/;
+var MAX_WORKSPACE_PATH_BYTES = 4096;
+function validWorkspacePath(value) {
+  return value.length > 0 && isWellFormedUnicode(value) && Buffer3.byteLength(value, "utf8") <= MAX_WORKSPACE_PATH_BYTES && !value.includes("\0") && (value.startsWith("/") || WINDOWS_ABSOLUTE.test(value) || WINDOWS_UNC_ABSOLUTE.test(value));
+}
 function validateBootstrap(value) {
   const keys = Object.keys(value).sort();
   const expected = [
@@ -154,6 +160,7 @@ function documentFor(input) {
     bootstrap: input.bootstrap,
     batch_id: input.batchID,
     session_id: input.sessionID,
+    ...input.workspacePath === void 0 ? {} : { workspace_path: input.workspacePath },
     chunk_index: input.chunkIndex,
     chunk_count: input.chunkCount,
     events: input.events
@@ -175,7 +182,7 @@ function encodedSize(input) {
 function buildCaptureChunks(input) {
   try {
     const bootstrap = validateBootstrap(input.bootstrap);
-    if (typeof input.batchID !== "string" || !SHA256.test(input.batchID) || typeof input.sessionID !== "string" || input.sessionID.length === 0 || Buffer3.byteLength(input.sessionID, "utf8") > MAX_CAPTURE_SESSION_ID_BYTES || !Array.isArray(input.events) || input.events.length > 1e4) {
+    if (typeof input.batchID !== "string" || !SHA256.test(input.batchID) || typeof input.sessionID !== "string" || input.sessionID.length === 0 || Buffer3.byteLength(input.sessionID, "utf8") > MAX_CAPTURE_SESSION_ID_BYTES || input.workspacePath !== void 0 && (typeof input.workspacePath !== "string" || !validWorkspacePath(input.workspacePath)) || !Array.isArray(input.events) || input.events.length > 1e4) {
       throw new BridgeContractError();
     }
     canonicalizeJson(input.sessionID);
@@ -185,6 +192,7 @@ function buildCaptureChunks(input) {
         bootstrap,
         batchID: input.batchID,
         sessionID: input.sessionID,
+        ...input.workspacePath === void 0 ? {} : { workspacePath: input.workspacePath },
         chunkIndex: 0,
         events: [normalized]
       }) <= MAX_CAPTURE_BATCH_BYTES ? normalized : oversizeEvent(input.sessionID);
@@ -197,6 +205,7 @@ function buildCaptureChunks(input) {
         bootstrap,
         batchID: input.batchID,
         sessionID: input.sessionID,
+        ...input.workspacePath === void 0 ? {} : { workspacePath: input.workspacePath },
         chunkIndex: groups.length,
         events: candidate
       }) > MAX_CAPTURE_BATCH_BYTES)) {
@@ -213,6 +222,7 @@ function buildCaptureChunks(input) {
         bootstrap,
         batchID: input.batchID,
         sessionID: input.sessionID,
+        ...input.workspacePath === void 0 ? {} : { workspacePath: input.workspacePath },
         chunkIndex: index,
         chunkCount: groups.length,
         events: group
@@ -902,6 +912,7 @@ var OpenCodeBatchTransport = class {
   #invocation;
   #writeChunk;
   #batchID;
+  #workspacePath;
   #pendingGaps = /* @__PURE__ */ new Map();
   #gapGeneration = 0n;
   #activeWrites = 0;
@@ -914,6 +925,7 @@ var OpenCodeBatchTransport = class {
     });
     this.#writeChunk = options.writeChunk ?? spawnCaptureChunk;
     this.#batchID = options.batchID ?? (() => randomBytes(32).toString("hex"));
+    this.#workspacePath = options.workspacePath;
   }
   pendingSessionIDs() {
     return [...this.#pendingGaps.keys()];
@@ -973,6 +985,7 @@ var OpenCodeBatchTransport = class {
         bootstrap: this.#bootstrap,
         batchID: this.#batchID(),
         sessionID,
+        ...this.#workspacePath === void 0 ? {} : { workspacePath: this.#workspacePath },
         events
       });
       let delivered = 0;
@@ -1022,6 +1035,18 @@ function exactText2(value) {
     return void 0;
   }
   return value;
+}
+function pluginWorkspacePath(value) {
+  if (!isRecord3(value)) return void 0;
+  const descriptor = Object.getOwnPropertyDescriptor(value, "directory");
+  if (descriptor === void 0 || !("value" in descriptor) || !descriptor.enumerable) {
+    return void 0;
+  }
+  const directory = descriptor.value;
+  if (typeof directory !== "string" || directory.length === 0 || directory.includes("\0") || !isWellFormedUnicode(directory) || Buffer4.byteLength(directory, "utf8") > 4096 || !path3.posix.isAbsolute(directory) && !path3.win32.isAbsolute(directory)) {
+    return void 0;
+  }
+  return directory;
 }
 function flushTargets(value) {
   const result = /* @__PURE__ */ new Set();
@@ -1272,19 +1297,23 @@ var OpenCodePluginRuntime = class {
   }
 };
 function createOpenCodePlugin(options) {
-  return async (_input) => {
+  return async (input) => {
     let runtime;
     try {
       const loader = options.loadBootstrap ?? loadOpenCodeBootstrap;
       const bootstrap = await loader(options.bootstrapURL);
-      runtime = new OpenCodePluginRuntime(bootstrap, options);
+      const workspacePath = pluginWorkspacePath(input);
+      runtime = new OpenCodePluginRuntime(bootstrap, {
+        ...options,
+        ...workspacePath === void 0 ? {} : { workspacePath }
+      });
     } catch {
       runtime = void 0;
     }
     return {
-      event: async (input) => {
+      event: async (input2) => {
         try {
-          await runtime?.event(input.event);
+          await runtime?.event(input2.event);
         } catch {
         }
       },

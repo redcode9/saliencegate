@@ -75,6 +75,7 @@ function toolEvent(sessionID: string, callID: string, status: "pending" | "compl
 
 function document(write: CaptureChunkWrite): {
   session_id: string;
+  workspace_path?: string;
   events: Array<Record<string, unknown>>;
   chunk_index: number;
   chunk_count: number;
@@ -275,7 +276,11 @@ test("error and deletion boundaries flush their matching reduced session buffers
       return true;
     },
   });
-  const hooks = await plugin({});
+  const workspacePath =
+    process.platform === "win32"
+      ? "C:\\workspace\\saliencegate"
+      : "/workspace/saliencegate";
+  const hooks = await plugin({ directory: workspacePath });
 
   await hooks.event({ event: toolEvent("session-error", "call-error", "pending") });
   await hooks.event({
@@ -296,6 +301,9 @@ test("error and deletion boundaries flush their matching reduced session buffers
   assert.deepEqual(
     writes.map((write) => document(write).events.at(-1)?.kind),
     ["controller_failed", "session_finished"],
+  );
+  assert.ok(
+    writes.every((write) => document(write).workspace_path === workspacePath),
   );
 });
 

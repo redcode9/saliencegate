@@ -40,6 +40,7 @@ export type CaptureBatchDocument = Readonly<{
   bootstrap: BootstrapBinding;
   batch_id: string;
   session_id: string;
+  workspace_path?: string;
   chunk_index: number;
   chunk_count: number;
   events: readonly CanonicalJson[];

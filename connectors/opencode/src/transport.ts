@@ -96,6 +96,7 @@ export class OpenCodeBatchTransport {
   readonly #invocation: LauncherInvocation;
   readonly #writeChunk: CaptureChunkWriter;
   readonly #batchID: () => string;
+  readonly #workspacePath: string | undefined;
   readonly #pendingGaps = new Map<string, bigint>();
   #gapGeneration = 0n;
   #activeWrites = 0;
@@ -107,6 +108,7 @@ export class OpenCodeBatchTransport {
       environment?: NodeJS.ProcessEnv;
       writeChunk?: CaptureChunkWriter;
       batchID?: () => string;
+      workspacePath?: string;
     } = {},
   ) {
     this.#bootstrap = bootstrap;
@@ -117,6 +119,7 @@ export class OpenCodeBatchTransport {
     });
     this.#writeChunk = options.writeChunk ?? spawnCaptureChunk;
     this.#batchID = options.batchID ?? (() => randomBytes(32).toString("hex"));
+    this.#workspacePath = options.workspacePath;
   }
 
   pendingSessionIDs(): string[] {
@@ -203,6 +206,9 @@ export class OpenCodeBatchTransport {
         bootstrap: this.#bootstrap,
         batchID: this.#batchID(),
         sessionID,
+        ...(this.#workspacePath === undefined
+          ? {}
+          : { workspacePath: this.#workspacePath }),
         events,
       });
       let delivered = 0;

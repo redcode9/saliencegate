@@ -72,6 +72,7 @@ export type PiObservedEvent =
   | PiSessionShutdownEvent;
 
 export type PiExtensionContext = Readonly<{
+  cwd?: string;
   sessionManager: Readonly<{
     getSessionId(): string;
   }>;

@@ -1,6 +1,10 @@
 import { Buffer } from "node:buffer";
 
-import { canonicalizeJson, encodeCanonicalJson } from "./canonical.ts";
+import {
+  canonicalizeJson,
+  encodeCanonicalJson,
+  isWellFormedUnicode,
+} from "./canonical.ts";
 import {
   BridgeContractError,
   MAX_CAPTURE_BATCH_BYTES,
@@ -16,12 +20,27 @@ import {
 const SHA256 = /^[0-9a-f]{64}$/;
 const CONNECTION_ID = /^sg-[0-9a-f]{48}$/;
 const WINDOWS_ABSOLUTE = /^[A-Za-z]:[\\/]/;
+const WINDOWS_UNC_ABSOLUTE = /^\\\\[^\\]+\\[^\\]+/;
+const MAX_WORKSPACE_PATH_BYTES = 4_096;
+
+function validWorkspacePath(value: string): boolean {
+  return (
+    value.length > 0 &&
+    isWellFormedUnicode(value) &&
+    Buffer.byteLength(value, "utf8") <= MAX_WORKSPACE_PATH_BYTES &&
+    !value.includes("\0") &&
+    (value.startsWith("/") ||
+      WINDOWS_ABSOLUTE.test(value) ||
+      WINDOWS_UNC_ABSOLUTE.test(value))
+  );
+}
 
 export type WindowedCaptureBatchDocument = Readonly<{
   schema_version: "capture-batch/v1";
   bootstrap: BootstrapBinding;
   batch_id: string;
   session_id: string;
+  workspace_path?: string;
   window_discriminator: string;
   chunk_index: number;
   chunk_count: number;
@@ -113,6 +132,7 @@ function documentFor(input: {
   bootstrap: BootstrapBinding;
   batchID: string;
   sessionID: string;
+  workspacePath?: string;
   windowDiscriminator: string;
   chunkIndex: number;
   chunkCount: number;
@@ -123,6 +143,9 @@ function documentFor(input: {
     bootstrap: input.bootstrap,
     batch_id: input.batchID,
     session_id: input.sessionID,
+    ...(input.workspacePath === undefined
+      ? {}
+      : { workspace_path: input.workspacePath }),
     window_discriminator: input.windowDiscriminator,
     chunk_index: input.chunkIndex,
     chunk_count: input.chunkCount,
@@ -134,6 +157,7 @@ function encodedSize(input: {
   bootstrap: BootstrapBinding;
   batchID: string;
   sessionID: string;
+  workspacePath?: string;
   windowDiscriminator: string;
   chunkIndex: number;
   events: readonly CanonicalJson[];
@@ -152,6 +176,7 @@ export function buildWindowedCaptureChunks(input: {
   bootstrap: BootstrapBinding;
   batchID: string;
   sessionID: string;
+  workspacePath?: string;
   windowDiscriminator: string;
   events: readonly unknown[];
 }): WindowedCaptureChunk[] {
@@ -163,6 +188,9 @@ export function buildWindowedCaptureChunks(input: {
       typeof input.sessionID !== "string" ||
       input.sessionID.length === 0 ||
       Buffer.byteLength(input.sessionID, "utf8") > MAX_CAPTURE_SESSION_ID_BYTES ||
+      (input.workspacePath !== undefined &&
+        (typeof input.workspacePath !== "string" ||
+          !validWorkspacePath(input.workspacePath))) ||
       typeof input.windowDiscriminator !== "string" ||
       !SHA256.test(input.windowDiscriminator) ||
       !Array.isArray(input.events) ||
@@ -181,6 +209,9 @@ export function buildWindowedCaptureChunks(input: {
         bootstrap,
         batchID: input.batchID,
         sessionID: input.sessionID,
+        ...(input.workspacePath === undefined
+          ? {}
+          : { workspacePath: input.workspacePath }),
         windowDiscriminator: input.windowDiscriminator,
         chunkIndex: 0,
         events: [normalized],
@@ -199,6 +230,9 @@ export function buildWindowedCaptureChunks(input: {
             bootstrap,
             batchID: input.batchID,
             sessionID: input.sessionID,
+            ...(input.workspacePath === undefined
+              ? {}
+              : { workspacePath: input.workspacePath }),
             windowDiscriminator: input.windowDiscriminator,
             chunkIndex: groups.length,
             events: candidate,
@@ -218,6 +252,9 @@ export function buildWindowedCaptureChunks(input: {
         bootstrap,
         batchID: input.batchID,
         sessionID: input.sessionID,
+        ...(input.workspacePath === undefined
+          ? {}
+          : { workspacePath: input.workspacePath }),
         windowDiscriminator: input.windowDiscriminator,
         chunkIndex: index,
         chunkCount: groups.length,
@@ -253,6 +290,7 @@ export function inspectWindowedChunkCoverage(
         chunk.schema_version !== "capture-batch/v1" ||
         chunk.batch_id !== first.batch_id ||
         chunk.session_id !== first.session_id ||
+        chunk.workspace_path !== first.workspace_path ||
         chunk.window_discriminator !== first.window_discriminator ||
         chunk.chunk_count !== first.chunk_count ||
         !Number.isInteger(chunk.chunk_index) ||

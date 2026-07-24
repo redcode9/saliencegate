@@ -2,6 +2,8 @@ export const saliencegateBootstrap = new URL("./saliencegate.bootstrap.json", im
 
 // connectors/pi/src/extension.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
+import { Buffer as Buffer4 } from "node:buffer";
+import path3 from "node:path";
 
 // connectors/bridge-core/src/canonical.ts
 import { Buffer as Buffer2 } from "node:buffer";
@@ -223,6 +225,11 @@ import { Buffer as Buffer3 } from "node:buffer";
 var SHA256 = /^[0-9a-f]{64}$/;
 var CONNECTION_ID = /^sg-[0-9a-f]{48}$/;
 var WINDOWS_ABSOLUTE = /^[A-Za-z]:[\\/]/;
+var WINDOWS_UNC_ABSOLUTE = /^\\\\[^\\]+\\[^\\]+/;
+var MAX_WORKSPACE_PATH_BYTES = 4096;
+function validWorkspacePath(value) {
+  return value.length > 0 && isWellFormedUnicode(value) && Buffer3.byteLength(value, "utf8") <= MAX_WORKSPACE_PATH_BYTES && !value.includes("\0") && (value.startsWith("/") || WINDOWS_ABSOLUTE.test(value) || WINDOWS_UNC_ABSOLUTE.test(value));
+}
 function validateBootstrap(value) {
   const keys = Object.keys(value).sort();
   const expected = [
@@ -271,6 +278,7 @@ function documentFor(input) {
     bootstrap: input.bootstrap,
     batch_id: input.batchID,
     session_id: input.sessionID,
+    ...input.workspacePath === void 0 ? {} : { workspace_path: input.workspacePath },
     window_discriminator: input.windowDiscriminator,
     chunk_index: input.chunkIndex,
     chunk_count: input.chunkCount,
@@ -290,7 +298,7 @@ function encodedSize(input) {
 function buildWindowedCaptureChunks(input) {
   try {
     const bootstrap = validateBootstrap(input.bootstrap);
-    if (typeof input.batchID !== "string" || !SHA256.test(input.batchID) || typeof input.sessionID !== "string" || input.sessionID.length === 0 || Buffer3.byteLength(input.sessionID, "utf8") > MAX_CAPTURE_SESSION_ID_BYTES || typeof input.windowDiscriminator !== "string" || !SHA256.test(input.windowDiscriminator) || !Array.isArray(input.events) || input.events.length > 1e4) {
+    if (typeof input.batchID !== "string" || !SHA256.test(input.batchID) || typeof input.sessionID !== "string" || input.sessionID.length === 0 || Buffer3.byteLength(input.sessionID, "utf8") > MAX_CAPTURE_SESSION_ID_BYTES || input.workspacePath !== void 0 && (typeof input.workspacePath !== "string" || !validWorkspacePath(input.workspacePath)) || typeof input.windowDiscriminator !== "string" || !SHA256.test(input.windowDiscriminator) || !Array.isArray(input.events) || input.events.length > 1e4) {
       throw new BridgeContractError();
     }
     canonicalizeJson(input.sessionID);
@@ -304,6 +312,7 @@ function buildWindowedCaptureChunks(input) {
         bootstrap,
         batchID: input.batchID,
         sessionID: input.sessionID,
+        ...input.workspacePath === void 0 ? {} : { workspacePath: input.workspacePath },
         windowDiscriminator: input.windowDiscriminator,
         chunkIndex: 0,
         events: [normalized]
@@ -317,6 +326,7 @@ function buildWindowedCaptureChunks(input) {
         bootstrap,
         batchID: input.batchID,
         sessionID: input.sessionID,
+        ...input.workspacePath === void 0 ? {} : { workspacePath: input.workspacePath },
         windowDiscriminator: input.windowDiscriminator,
         chunkIndex: groups.length,
         events: candidate
@@ -334,6 +344,7 @@ function buildWindowedCaptureChunks(input) {
         bootstrap,
         batchID: input.batchID,
         sessionID: input.sessionID,
+        ...input.workspacePath === void 0 ? {} : { workspacePath: input.workspacePath },
         windowDiscriminator: input.windowDiscriminator,
         chunkIndex: index,
         chunkCount: groups.length,
@@ -499,6 +510,7 @@ var WindowedBatchTransport = class {
         bootstrap: this.#bootstrap,
         batchID: this.#batchID(),
         sessionID: coordinates.sessionID,
+        ...options.workspacePath === void 0 ? {} : { workspacePath: options.workspacePath },
         windowDiscriminator: coordinates.windowDiscriminator,
         events
       });
@@ -980,6 +992,18 @@ function contextSessionID(value) {
     return void 0;
   }
 }
+function contextWorkspacePath(value) {
+  try {
+    const cwd = value.cwd;
+    if (typeof cwd !== "string" || cwd.length === 0 || cwd.includes("\0") || Buffer4.byteLength(cwd, "utf8") > 4096 || !path3.posix.isAbsolute(cwd) && !path3.win32.isAbsolute(cwd)) {
+      return void 0;
+    }
+    encodeCanonicalJson(cwd);
+    return cwd;
+  } catch {
+    return void 0;
+  }
+}
 function asCanonicalRecord(record) {
   return normalizeWindowedCaptureEvent(
     record,
@@ -1007,7 +1031,10 @@ var PiExtensionRuntime = class {
     const terminal = hasTerminal(records);
     active.records = [];
     active.bytes = 0;
-    const result = await this.#transport.flush(active.coordinates, records, { force });
+    const result = await this.#transport.flush(active.coordinates, records, {
+      force,
+      ...active.workspacePath === void 0 ? {} : { workspacePath: active.workspacePath }
+    });
     if (result === "not_started" && terminal) {
       const retained = records.filter(
         (record) => typeof record === "object" && record !== null && !Array.isArray(record) && record.kind === "session_finished"
@@ -1073,9 +1100,11 @@ var PiExtensionRuntime = class {
       sessionID,
       windowDiscriminator: discriminator
     });
+    const workspacePath = contextWorkspacePath(context);
     const active = {
       reducer,
       coordinates: reducer.coordinates(),
+      ...workspacePath === void 0 ? {} : { workspacePath },
       records: [],
       bytes: 0
     };
@@ -1086,7 +1115,8 @@ var PiExtensionRuntime = class {
     const active = this.#active;
     if (active === void 0) return;
     const sessionID = contextSessionID(context);
-    if (sessionID !== active.coordinates.sessionID || !isRecord3(value) || dataValue3(value, "type") !== expectedType) {
+    const workspacePath = contextWorkspacePath(context);
+    if (sessionID !== active.coordinates.sessionID || active.workspacePath !== void 0 && workspacePath !== void 0 && workspacePath !== active.workspacePath || !isRecord3(value) || dataValue3(value, "type") !== expectedType) {
       await this.#append(active, active.reducer.degrade("missing_field"));
     } else {
       await this.#append(active, active.reducer.reduce(value));

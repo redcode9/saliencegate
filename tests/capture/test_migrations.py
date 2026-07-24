@@ -31,6 +31,10 @@ from saliencegate.security import (
 EXPECTED_TABLES = frozenset(
     {
         "capture_events",
+        "capture_global_children",
+        "capture_global_exclusions",
+        "capture_global_health",
+        "capture_global_parents",
         "capture_heads",
         "capture_health",
         "capture_sessions",
@@ -84,7 +88,7 @@ def initialized_store(tmp_path: Path) -> Path:
     path = tmp_path / "capture.sqlite3"
     receipt = initialize_capture_store(path)
     assert receipt.schema_version == LATEST_SCHEMA_VERSION
-    assert receipt.applied_versions == (1, 2)
+    assert receipt.applied_versions == (1, 2, 3)
     assert repr(receipt) == "CaptureMigrationReceipt(<redacted>)"
     return path
 
@@ -93,11 +97,12 @@ def test_capture_migration_constants_and_packaged_resource_are_frozen() -> None:
     migrations = discover_capture_migrations()
 
     assert APPLICATION_ID == 0x53474350
-    assert LATEST_SCHEMA_VERSION == 2
-    assert tuple(migration.version for migration in migrations) == (1, 2)
+    assert LATEST_SCHEMA_VERSION == 3
+    assert tuple(migration.version for migration in migrations) == (1, 2, 3)
     assert tuple(migration.name for migration in migrations) == (
         "capture_store",
         "transport_receipts",
+        "global_scopes",
     )
     assert all(
         migration.checksum == hashlib.sha256(migration.sql.encode("utf-8")).hexdigest()
@@ -149,8 +154,8 @@ def test_initialize_builds_exact_capture_schema_and_current_store_is_a_no_op(
     applied = initialize_capture_store(path, busy_timeout_ms=2_000)
     reapplied = initialize_capture_store(path, busy_timeout_ms=2_000)
 
-    assert (applied.schema_version, applied.applied_versions) == (2, (1, 2))
-    assert (reapplied.schema_version, reapplied.applied_versions) == (2, ())
+    assert (applied.schema_version, applied.applied_versions) == (3, (1, 2, 3))
+    assert (reapplied.schema_version, reapplied.applied_versions) == (3, ())
     migrations = discover_capture_migrations()
     with _connect(path) as connection:
         assert _tables(connection) == EXPECTED_TABLES
@@ -184,8 +189,65 @@ def test_initialize_authenticates_and_upgrades_a_version_one_store(tmp_path: Pat
 
     receipt = initialize_capture_store(path)
 
-    assert (receipt.schema_version, receipt.applied_versions) == (2, (2,))
+    assert (receipt.schema_version, receipt.applied_versions) == (3, (2, 3))
     with _connect(path) as connection:
+        assert _tables(connection) == EXPECTED_TABLES
+        assert validate_capture_store_schema(connection) is None
+
+
+def test_initialize_upgrades_v2_without_rewriting_existing_project_connections(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "capture-v2.sqlite3"
+    first_two = discover_capture_migrations()[:2]
+    with sqlite3.connect(path, isolation_level=None) as connection:
+        for migration in first_two:
+            for statement in migration_module._parse_statements(migration.sql):
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO schema_migrations(version, name, checksum) VALUES (?, ?, ?)",
+                (migration.version, migration.name, migration.checksum),
+            )
+            connection.execute(f"PRAGMA user_version = {migration.version}")
+        connection.execute(
+            """
+            INSERT INTO connections(
+                connection_id, project_digest, profile_id,
+                capability_manifest_digest, host_version,
+                compatibility_status, state, created_at, updated_at, row_tag
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "existing-project-connection",
+                "8" * 64,
+                "codex-hooks/v1",
+                "9" * 64,
+                "0.144.6",
+                "verified",
+                "enabled",
+                "2026-07-25T00:00:00+00:00",
+                "2026-07-25T00:00:00+00:00",
+                "a" * 64,
+            ),
+        )
+    path.chmod(0o600)
+
+    receipt = initialize_capture_store(path)
+
+    assert (receipt.schema_version, receipt.applied_versions) == (3, (3,))
+    with _connect(path) as connection:
+        row = connection.execute(
+            """
+            SELECT connection_id, project_digest, state
+            FROM connections
+            """
+        ).fetchone()
+        assert tuple(row) == (
+            "existing-project-connection",
+            "8" * 64,
+            "enabled",
+        )
+        assert connection.execute("SELECT COUNT(*) FROM capture_global_parents").fetchone()[0] == 0
         assert _tables(connection) == EXPECTED_TABLES
         assert validate_capture_store_schema(connection) is None
 
@@ -367,9 +429,9 @@ def test_migration_history_cardinality_mismatch_is_refused(
             connection.execute(
                 """
                 INSERT INTO schema_migrations(version, name, checksum)
-                VALUES (3, 'unexpected', ?)
+                VALUES (?, 'unexpected', ?)
                 """,
-                ("e" * 64,),
+                (LATEST_SCHEMA_VERSION + 1, "e" * 64),
             )
         connection.commit()
 
@@ -378,7 +440,7 @@ def test_migration_history_cardinality_mismatch_is_refused(
 
     _assert_content_free_error(captured.value, MIGRATION_INTEGRITY_MESSAGE, initialized_store)
     with _connect(initialized_store) as connection:
-        expected_count = 0 if history_shape == "missing" else 3
+        expected_count = 0 if history_shape == "missing" else LATEST_SCHEMA_VERSION + 1
         assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == (
             expected_count
         )
@@ -512,7 +574,7 @@ def test_initialize_recovers_a_preexisting_empty_private_database(tmp_path: Path
 
     receipt = initialize_capture_store(path)
 
-    assert receipt.applied_versions == (1, 2)
+    assert receipt.applied_versions == (1, 2, 3)
     with _connect(path) as connection:
         assert connection.execute("PRAGMA application_id").fetchone()[0] == APPLICATION_ID
         assert connection.execute("PRAGMA user_version").fetchone()[0] == LATEST_SCHEMA_VERSION

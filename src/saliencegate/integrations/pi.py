@@ -156,6 +156,7 @@ class _PiBatch:
     bootstrap: IntegrationBootstrap
     batch_id: str
     session_id: str
+    workspace_path: str | None
     window_discriminator: str
     chunk_index: int
     chunk_count: int
@@ -189,11 +190,16 @@ def _parse_batch(source: bytes) -> _PiBatch:
                 "events",
             }
         ),
+        optional=frozenset({"workspace_path"}),
     )
     if document["schema_version"] != "capture-batch/v1":
         raise PiIntegrationError()
     batch_id = _exact_text(document["batch_id"], maximum=64)
     session_id = _exact_text(document["session_id"], maximum=_MAX_SESSION_ID_BYTES)
+    workspace_value = document.get("workspace_path")
+    workspace_path = (
+        None if workspace_value is None else _exact_text(workspace_value, maximum=4_096)
+    )
     window_discriminator = _exact_text(document["window_discriminator"], maximum=64)
     chunk_index = document["chunk_index"]
     chunk_count = document["chunk_count"]
@@ -203,6 +209,14 @@ def _parse_batch(source: bytes) -> _PiBatch:
         or _SHA256.fullmatch(batch_id) is None
         or session_id is None
         or _NATIVE_SESSION_ID.fullmatch(session_id) is None
+        or (
+            workspace_value is not None
+            and (
+                workspace_path is None
+                or not Path(workspace_path).is_absolute()
+                or ".." in Path(workspace_path).parts
+            )
+        )
         or window_discriminator is None
         or _SHA256.fullmatch(window_discriminator) is None
         or type(chunk_index) is not int
@@ -218,6 +232,7 @@ def _parse_batch(source: bytes) -> _PiBatch:
         bootstrap=_bootstrap_from_document(document["bootstrap"]),
         batch_id=batch_id,
         session_id=session_id,
+        workspace_path=workspace_path,
         window_discriminator=window_discriminator,
         chunk_index=chunk_index,
         chunk_count=chunk_count,
@@ -965,6 +980,19 @@ def build_capture_hook_dependencies(
         ):
             raise PiIntegrationError()
         environment = environment_without_provider_credentials(environ)
+        from saliencegate.integrations.global_runtime import (
+            try_build_global_capture_hook_dependencies,
+        )
+
+        global_dependencies = try_build_global_capture_hook_dependencies(
+            ProviderAlias.PI,
+            source,
+            connection_id=connection_id,
+            environ=environment,
+            capture_executable=capture_executable,
+        )
+        if global_dependencies is not None:
+            return global_dependencies
         batch = _parse_batch(source)
         if (
             batch.bootstrap.profile is not PI_PROFILE

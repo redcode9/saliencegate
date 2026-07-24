@@ -8,10 +8,10 @@ from tomllib import loads
 from scripts.check_public_docs import (
     OBSERVATIONAL_CLAIM_DOCUMENTS,
     PUBLIC_DOCUMENT_EXCLUSIONS,
-    README_LOCAL_AMBIENT_CAPTURE_COMMAND,
-    README_LOCAL_CAPTURE_COMMANDS,
+    README_CLI_COMMANDS,
+    README_INSTALL_COMMANDS,
     _public_paths,
-    count_readme_local_capture_command,
+    count_readme_command,
     scan_text,
     validate_markdown_links,
 )
@@ -40,16 +40,12 @@ REQUIRED_DOCUMENTS = (
 )
 README_HEADINGS = (
     "# SalienceGate",
-    "## Try it locally",
-    "## Analyze a trajectory",
-    "## What happens inside",
-    "## What the examples show",
-    "## Use SalienceGate",
-    "## Reproduce the research",
-    "## Available today",
-    "## Limits",
+    "## Install",
+    "## Connect",
+    "## Inspect and disconnect",
+    "## How it works",
+    "## Privacy and limits",
     "## Development",
-    "## Citation",
     "## License",
 )
 
@@ -75,39 +71,26 @@ def test_readme_uses_the_required_concrete_structure() -> None:
     assert all(lines.count(heading) == 1 for heading in README_HEADINGS)
     positions = [lines.index(heading) for heading in README_HEADINGS]
     assert positions == sorted(positions)
-    assert 1_000 <= len(readme.split()) <= 1_200
+    assert 550 <= len(readme.split()) <= 850
 
-    introduction = readme.split("\n## Try it locally\n", maxsplit=1)[0]
-    assert "Build with it:" in introduction
-    assert "Study it:" in introduction
-    assert "It is not a memory database." in introduction
+    introduction = readme.split("\n## Install\n", maxsplit=1)[0]
+    assert all(provider in introduction for provider in ("Codex", "Claude Code", "OpenCode", "Pi"))
 
     assert readme.count("![") == 3
     for asset in (
+        "docs/assets/readme/saliencegate-logo.svg",
+        "docs/assets/readme/install-flow.svg",
         "docs/assets/readme/pipeline.svg",
-        "docs/assets/readme/capture-headlines.svg",
-        "docs/assets/readme/reference-run.svg",
     ):
         assert readme.count(asset) == 1
 
-    assert readme.count("Artifact-compatible after installation:") >= 2
-    assert readme.count("Run from a checkout:") >= 2
-    local_quickstart = readme.split("\n## Try it locally\n", maxsplit=1)[1].split(
-        "\n## Analyze a trajectory\n", maxsplit=1
-    )[0]
-    assert local_quickstart.count('VENV="$HOME/.local/share/saliencegate/quickstart-venv"') == 1
-    assert local_quickstart.count('SG="$VENV/bin/saliencegate"') == 1
-    assert sum(line.startswith("VENV=") for line in local_quickstart.splitlines()) == 1
-    assert sum(line.startswith("SG=") for line in local_quickstart.splitlines()) == 1
     assert all(
-        count_readme_local_capture_command(local_quickstart, command) == 1
-        for command in README_LOCAL_CAPTURE_COMMANDS
+        count_readme_command(readme, command) == 1
+        for command in (*README_INSTALL_COMMANDS, *README_CLI_COMMANDS)
     )
-    expected_invocations = len(README_LOCAL_CAPTURE_COMMANDS)
-    assert local_quickstart.count("$SG") == expected_invocations
-    assert local_quickstart.count('"$SG"') == expected_invocations
-    assert README_LOCAL_AMBIENT_CAPTURE_COMMAND.search(local_quickstart) is None
-    limits = readme.split("\n## Limits\n", maxsplit=1)[1].split("\n## Development\n", maxsplit=1)[0]
+    limits = readme.split("\n## Privacy and limits\n", maxsplit=1)[1].split(
+        "\n## Development\n", maxsplit=1
+    )[0]
     assert sum(line.startswith("- ") for line in limits.splitlines()) <= 5
 
 
@@ -199,27 +182,7 @@ def test_relative_markdown_links_reject_a_tracked_symlink_target(tmp_path: Path)
     assert any("non-regular target docs/linked.md" in finding for finding in findings)
 
 
-def test_launch_docs_expose_the_real_demo_review_gate_and_evidence_boundary() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    readme_flat = " ".join(readme.split())
-    required_readme_fragments = (
-        "saliencegate demo",
-        "synthetic_diagnostic",
-        "confirmatory: false",
-        "external_claims_supported: false",
-        "180 candidates",
-        "900 outcome-free previews",
-        "six visible families",
-        "docs/reference/state-decay-v2-review.md",
-        "saliencegate-review build-pack",
-        "human review gate remains closed",
-        "Analyze a trajectory",
-        "four of the nine",
-        "descriptive_observational",
-        "docs/reference/shadow-mode.md",
-    )
-    assert all(fragment in readme_flat for fragment in required_readme_fragments)
-
+def test_review_guide_exposes_the_review_gate_and_evidence_boundary() -> None:
     guide = (ROOT / "docs/reference/state-decay-v2-review.md").read_text(encoding="utf-8")
     for command in ("build-pack", "review", "status", "build-envelope"):
         assert f"saliencegate-review {command}" in guide
@@ -306,30 +269,9 @@ def test_feedback_docs_freeze_the_local_evaluation_and_activation_boundary() -> 
 
 
 def test_shadow_docs_freeze_the_observational_sdk_and_cli_boundary() -> None:
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
     guide = (ROOT / "docs/reference/shadow-mode.md").read_text(encoding="utf-8")
     cli = (ROOT / "docs/reference/cli.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-
-    readme_section = readme.split("## Analyze a trajectory\n", maxsplit=1)[1].split(
-        "\n## What happens inside\n", maxsplit=1
-    )[0]
-    readme_section_flat = " ".join(readme_section.split())
-    for fragment in (
-        "saliencegate.shadow",
-        "saliencegate shadow analyze",
-        "four of the nine",
-        "flagged",
-        "not_flagged",
-        "indeterminate",
-        "not_applicable",
-        "descriptive_observational",
-        "model calls",
-        "budget reservations",
-        "memory revisions",
-        "decision authority",
-    ):
-        assert fragment in readme_section_flat
 
     for fragment in (
         "examples/shadow_asyncio.py",
@@ -384,7 +326,7 @@ def test_shadow_docs_freeze_the_observational_sdk_and_cli_boundary() -> None:
     assert "Shadow Mode SDK" in changelog
     assert "four supported deterministic detectors" in " ".join(changelog.split())
 
-    folded_shadow_docs = f"{readme_section}\n{guide}".casefold()
+    folded_shadow_docs = guide.casefold()
     for forbidden_claim in (
         "improves task success",
         "task-success improvement",

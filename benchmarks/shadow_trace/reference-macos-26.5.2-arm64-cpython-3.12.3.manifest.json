@@ -2,7 +2,7 @@
   "schema_version": "shadow-trace-benchmark-evidence-manifest/v1",
   "report": {
     "path": "benchmarks/shadow_trace/reference-macos-26.5.2-arm64-cpython-3.12.3.json",
-    "sha256": "653c132eaaa524d44811b4016676be77a94e3fb2b2636911cf2c3381963099e6"
+    "sha256": "ae746224e54e97b43838f09ff1796cc59ab5554c64cfd6a1e08e733ffea17e01"
   },
   "benchmark_script": {
     "path": "scripts/benchmark_shadow_trace.py",
@@ -10,10 +10,10 @@
   },
   "runtime_source": {
     "path": "src/saliencegate",
-    "git_tracked_regular_file_count": 195,
+    "git_tracked_regular_file_count": 202,
     "digest_algorithm": "sha256",
     "framing": "uint64be(path_utf8_length) || path_utf8 || uint64be(content_length) || content",
-    "sha256": "7bd384b5e843872ee3548528cfedadca5302f0ebb583bcc1108cc8b0fb30d4b1"
+    "sha256": "fbd129b55b2008c6347e4d8973d2a9d36e42f1ac85368df15292dc25c5eb375b"
   },
   "socket_guard": {
     "path": "scripts/run_without_sockets.py",

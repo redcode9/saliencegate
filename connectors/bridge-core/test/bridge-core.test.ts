@@ -128,6 +128,42 @@ test("windowed chunk coverage detects gaps and rejects mixed discriminators", ()
   );
 });
 
+test("capture batches bind an optional absolute workspace path", () => {
+  const workspacePath =
+    process.platform === "win32"
+      ? "C:\\workspace\\saliencegate"
+      : "/workspace/saliencegate";
+  const opencode = buildCaptureChunks({
+    bootstrap,
+    batchID: "1".repeat(64),
+    sessionID: "workspace-session",
+    workspacePath,
+    events: [],
+  });
+  const pi = buildWindowedCaptureChunks({
+    bootstrap: { ...bootstrap, profile: "pi-extension/v1" },
+    batchID: "2".repeat(64),
+    sessionID: "workspace-session",
+    workspacePath,
+    windowDiscriminator: "3".repeat(64),
+    events: [],
+  });
+
+  assert.equal(opencode[0]!.document.workspace_path, workspacePath);
+  assert.equal(pi[0]!.document.workspace_path, workspacePath);
+  assert.throws(
+    () =>
+      buildCaptureChunks({
+        bootstrap,
+        batchID: "4".repeat(64),
+        sessionID: "workspace-session",
+        workspacePath: "relative/project",
+        events: [],
+      }),
+    BridgeContractError,
+  );
+});
+
 test("canonicalization rejects cycles, accessors, unsupported values, and non-finite numbers", () => {
   const cycle: Record<string, unknown> = {};
   cycle.self = cycle;

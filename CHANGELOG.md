@@ -2,10 +2,12 @@
 
 This file records notable changes to SalienceGate.
 
-The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The project will use
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html) when public releases begin.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
+
+## 0.2.0 - 2026-07-25
 
 ### Added
 
@@ -80,3 +82,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
   bounded headlines and an explicit descriptive-evidence boundary.
 - Installed wheel and source-distribution verification for the local capture lifecycle, alongside
   offline connector bundle and network-denial checks.
+- One-command, per-user installation for macOS, Linux, and Windows with a guided CLI setup.
+- User-global capture for Codex, Claude Code, OpenCode, and Pi, including project exclusions,
+  automatic project enrollment, status inspection, and reversible disconnects.

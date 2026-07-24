@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 280" width="100%" role="img" aria-labelledby="saliencegate-logo-title saliencegate-logo-desc" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+  <title id="saliencegate-logo-title">SalienceGate</title>
+  <desc id="saliencegate-logo-desc">SalienceGate wordmark with a signal passing through a gate.</desc>
+  <rect data-surface="true" width="1200" height="280" rx="28" fill="#f6f1e8"/>
+  <g aria-hidden="true">
+    <rect x="54" y="40" width="200" height="200" rx="44" fill="#315f6f"/>
+    <path d="M101 193V92h106v101" fill="none" stroke="#f6f1e8" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="m 77 145h154" fill="none" stroke="#d48a2c" stroke-width="14" stroke-linecap="round"/>
+    <circle cx="154" cy="145" r="18" fill="#d48a2c" stroke="#f6f1e8" stroke-width="8"/>
+  </g>
+  <text x="302" y="174" fill="#22211f" font-size="92" font-weight="750" letter-spacing="-3">Salience<tspan fill="#315f6f">Gate</tspan></text>
+</svg>

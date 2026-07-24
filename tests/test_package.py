@@ -237,6 +237,7 @@ CAPTURE_RUNTIME_FILES = {
 CAPTURE_RESOURCE_FILES = {
     "saliencegate/capture/migrations/0001_capture_store.sql",
     "saliencegate/capture/migrations/0002_transport_receipts.sql",
+    "saliencegate/capture/migrations/0003_global_scopes.sql",
     "saliencegate/integrations/assets/opencode-plugin.js",
     "saliencegate/integrations/assets/pi-extension.js",
     "saliencegate/integrations/fixtures/claude-code-hooks-v1.json",
@@ -552,6 +553,18 @@ def test_source_distribution_declares_the_complete_shadow_example_membership() -
     } == {path.name for path in (ROOT / "examples/atif-shadow").iterdir()}
 
 
+def test_source_distribution_declares_release_installer_assets() -> None:
+    metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    includes = metadata["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
+    posix_installer = ROOT / "scripts/install.sh"
+    powershell_installer = ROOT / "scripts/install.ps1"
+
+    assert "/scripts" in includes
+    assert posix_installer.is_file()
+    assert posix_installer.stat().st_mode & stat.S_IXUSR
+    assert powershell_installer.is_file()
+
+
 def test_wheel_declares_the_installed_capture_migration_resources() -> None:
     metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     artifacts = metadata["tool"]["hatch"]["build"]["targets"]["wheel"]["artifacts"]
@@ -696,6 +709,8 @@ def test_built_sdist_has_exact_reviewable_membership_and_payloads(
         "scripts/benchmark_capture_hook.py",
         "scripts/benchmark_capture_report.py",
         "scripts/artifact_socket_guard.py",
+        "scripts/install.ps1",
+        "scripts/install.sh",
         "scripts/run_capture_hook_benchmark.py",
         "scripts/run_without_sockets.py",
         "scripts/render_capture_headlines.py",

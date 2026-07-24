@@ -1,4 +1,6 @@
 import { randomBytes } from "node:crypto";
+import { Buffer } from "node:buffer";
+import path from "node:path";
 
 import {
   SerialSessionQueue,
@@ -66,6 +68,25 @@ function contextSessionID(value: PiExtensionContext): string | undefined {
   }
 }
 
+function contextWorkspacePath(value: PiExtensionContext): string | undefined {
+  try {
+    const cwd = value.cwd;
+    if (
+      typeof cwd !== "string" ||
+      cwd.length === 0 ||
+      cwd.includes("\0") ||
+      Buffer.byteLength(cwd, "utf8") > 4_096 ||
+      (!path.posix.isAbsolute(cwd) && !path.win32.isAbsolute(cwd))
+    ) {
+      return undefined;
+    }
+    encodeCanonicalJson(cwd);
+    return cwd;
+  } catch {
+    return undefined;
+  }
+}
+
 function asCanonicalRecord(record: ReducedPiRecord): CanonicalJson {
   return normalizeWindowedCaptureEvent(
     record,
@@ -87,6 +108,7 @@ function hasTerminal(records: readonly CanonicalJson[]): boolean {
 type ActiveWindow = {
   reducer: PiWindowReducer;
   coordinates: WindowCoordinates;
+  workspacePath?: string;
   records: CanonicalJson[];
   bytes: number;
 };
@@ -118,7 +140,12 @@ class PiExtensionRuntime {
     const terminal = hasTerminal(records);
     active.records = [];
     active.bytes = 0;
-    const result = await this.#transport.flush(active.coordinates, records, { force });
+    const result = await this.#transport.flush(active.coordinates, records, {
+      force,
+      ...(active.workspacePath === undefined
+        ? {}
+        : { workspacePath: active.workspacePath }),
+    });
     if (result === "not_started" && terminal) {
       const retained = records.filter(
         (record) =>
@@ -202,9 +229,11 @@ class PiExtensionRuntime {
       sessionID,
       windowDiscriminator: discriminator,
     });
+    const workspacePath = contextWorkspacePath(context);
     const active: ActiveWindow = {
       reducer,
       coordinates: reducer.coordinates(),
+      ...(workspacePath === undefined ? {} : { workspacePath }),
       records: [],
       bytes: 0,
     };
@@ -222,8 +251,12 @@ class PiExtensionRuntime {
     const active = this.#active;
     if (active === undefined) return;
     const sessionID = contextSessionID(context);
+    const workspacePath = contextWorkspacePath(context);
     if (
       sessionID !== active.coordinates.sessionID ||
+      (active.workspacePath !== undefined &&
+        workspacePath !== undefined &&
+        workspacePath !== active.workspacePath) ||
       !isRecord(value) ||
       dataValue(value, "type") !== expectedType
     ) {
