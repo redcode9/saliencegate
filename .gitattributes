@@ -1,0 +1,2 @@
+/src/saliencegate/integrations/launchers/posix.sh text eol=lf
+/src/saliencegate/integrations/launchers/windows.cmd text eol=lf

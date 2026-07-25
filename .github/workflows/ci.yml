@@ -251,6 +251,7 @@ jobs:
           uv sync --locked --dev --no-install-project
           uv sync --locked --dev --no-build-isolation
       - name: Exercise native capture, launcher, and file-security boundaries
+        if: runner.os != 'Windows'
         env:
           HOME: ${{ runner.temp }}/capture-platform-home
           USERPROFILE: ${{ runner.temp }}/capture-platform-home
@@ -268,6 +269,38 @@ jobs:
           tests/integrations/test_hook.py
           tests/integrations/test_installation.py
           tests/integrations/test_launcher_renderer.py
+      - name: Prepare the Windows test root
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:USERPROFILE "saliencegate-ci-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $root | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $root "temp") | Out-Null
+          "SALIENCEGATE_CI_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Exercise native Windows capture, launcher, and file-security boundaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $home = Join-Path $env:SALIENCEGATE_CI_ROOT "home"
+          $env:HOME = $home
+          $env:USERPROFILE = $home
+          $env:XDG_CACHE_HOME = Join-Path $home "cache"
+          $env:XDG_CONFIG_HOME = Join-Path $home "config"
+          $env:XDG_DATA_HOME = Join-Path $home "data"
+          $env:XDG_STATE_HOME = Join-Path $home "state"
+          $env:APPDATA = Join-Path $home "appdata"
+          $env:LOCALAPPDATA = Join-Path $home "localappdata"
+          $env:TEMP = Join-Path $env:SALIENCEGATE_CI_ROOT "temp"
+          $env:TMP = $env:TEMP
+          $tests = @(
+            "tests/security/test_windows.py"
+            "tests/capture/test_store_security.py"
+            "tests/capture/test_spool.py"
+            "tests/integrations/test_hook.py"
+            "tests/integrations/test_installation.py"
+            "tests/integrations/test_launcher_renderer.py"
+          )
+          uv run --locked pytest -q --basetemp (Join-Path $env:SALIENCEGATE_CI_ROOT "pytest") @tests
 
   build:
     name: Build distributions once

@@ -1436,6 +1436,10 @@ def test_ci_declares_targeted_native_capture_contracts() -> None:
         assert test_path in platform
     assert "HOME: ${{ runner.temp }}/capture-platform-home" in platform
     assert "USERPROFILE: ${{ runner.temp }}/capture-platform-home" in platform
+    assert "SALIENCEGATE_CI_ROOT=$root" in platform
+    assert "$env:HOME = $home" in platform
+    assert '$env:TEMP = Join-Path $env:SALIENCEGATE_CI_ROOT "temp"' in platform
+    assert '--basetemp (Join-Path $env:SALIENCEGATE_CI_ROOT "pytest")' in platform
     assert "provider-credential-read-must-fail" in platform
     assert "- capture-platform-contract" in build
     assert "--disable-socket" in _read("pyproject.toml")

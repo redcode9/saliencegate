@@ -4,7 +4,7 @@ import os
 import shlex
 import subprocess
 import sys
-from pathlib import PureWindowsPath
+from pathlib import PurePosixPath, PureWindowsPath
 
 import pytest
 
@@ -20,8 +20,8 @@ PROFILE = CaptureProfile.CODEX_HOOKS_V1
 CONNECTION_ID = "sg-0123456789abcdef0123456789abcdef0123456789abcdef"
 
 
-def test_posix_renderer_shell_quotes_every_operational_value(tmp_path) -> None:
-    executable = tmp_path / "capture ' $HOME $(touch injected); & target"
+def test_posix_renderer_shell_quotes_every_operational_value() -> None:
+    executable = PurePosixPath("/tmp/capture ' $HOME $(touch injected); & target")
 
     rendered = render_capture_launcher(
         executable=executable,
