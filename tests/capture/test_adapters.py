@@ -5,6 +5,7 @@ from typing import get_args, get_origin, get_type_hints
 
 import pytest
 from pydantic import ValidationError
+
 from saliencegate.capture.adapters import (
     CAPTURE_ADAPTER_PROTOCOL_VERSION,
     CaptureAdapter,
@@ -17,7 +18,6 @@ from saliencegate.capture.capabilities import (
     capture_capability_digest,
     capture_profile,
 )
-
 from saliencegate.capture.identities import CaptureDigestContext
 from saliencegate.capture.schema import CaptureIntake
 

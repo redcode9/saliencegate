@@ -58,10 +58,14 @@ unset OPENAI_ORG_ID
 unset OPENAI_PROJECT
 unset OPENAI_PROJECT_ID
 
+# POSIX shells may replace stdin with /dev/null for asynchronous lists. Preserve
+# the provider stream before starting the capture process in the background.
+exec 3<&0
 "$capture_executable" \
     --profile "$capture_profile" \
-    --connection "$capture_connection" <&0 &
+    --connection "$capture_connection" <&3 3<&- &
 capture_child_pid=$!
+exec 3<&-
 
 (
     "$capture_sleep" 2

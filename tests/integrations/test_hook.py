@@ -1272,8 +1272,23 @@ def _python_target(path: Path, body: str) -> Path:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX launcher contract")
+@pytest.mark.parametrize(
+    "shell",
+    (
+        pytest.param(None, id="shebang"),
+        pytest.param(
+            "/bin/dash",
+            marks=pytest.mark.skipif(
+                not Path("/bin/dash").is_file(),
+                reason="dash is unavailable",
+            ),
+            id="dash",
+        ),
+    ),
+)
 def test_posix_launcher_preserves_stdin_fixed_argv_and_absorbs_child_output_and_exit(
     tmp_path: Path,
+    shell: str | None,
 ) -> None:
     captured_stdin = tmp_path / "captured stdin"
     captured_argv = tmp_path / "captured argv"
@@ -1289,8 +1304,13 @@ def test_posix_launcher_preserves_stdin_fixed_argv_and_absorbs_child_output_and_
     launcher = _render_posix_launcher(tmp_path / "launcher", executable=executable)
     payload = b'{"canonical":"payload"}'
 
+    command = (
+        (str(launcher), "ignored-provider-argv")
+        if shell is None
+        else (shell, str(launcher), "ignored-provider-argv")
+    )
     completed = subprocess.run(
-        (str(launcher), "ignored-provider-argv"),
+        command,
         input=payload,
         capture_output=True,
         check=False,

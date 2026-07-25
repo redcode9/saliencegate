@@ -114,7 +114,7 @@ jobs:
 
   shadow-trace-performance:
     name: Shadow trace reference budgets
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - name: Check out the source revision
@@ -138,7 +138,7 @@ jobs:
           uv sync --locked --dev --no-build-isolation
       - name: Enforce the 1000-record time and memory budgets
         env:
-          SALIENCEGATE_BENCHMARK_RUNNER_IMAGE: ubuntu-24.04
+          SALIENCEGATE_BENCHMARK_RUNNER_IMAGE: macos-15
         run: uv run --locked python scripts/benchmark_shadow_trace.py --assert-budgets
 
   capture-performance:

@@ -1353,12 +1353,12 @@ def test_ci_gates_the_documented_shadow_trace_reference_budgets() -> None:
     performance = _job_block(text, "shadow-trace-performance")
     build = _job_block(text, "build")
 
-    assert "runs-on: ubuntu-24.04" in performance
+    assert "runs-on: macos-15" in performance
     assert 'python-version: "3.12"' in performance
     assert re.search(r"(?m)^    timeout-minutes: 30$", performance)
     assert "uv sync --locked --dev --no-install-project" in performance
     assert "uv sync --locked --dev --no-build-isolation" in performance
-    assert "SALIENCEGATE_BENCHMARK_RUNNER_IMAGE: ubuntu-24.04" in performance
+    assert "SALIENCEGATE_BENCHMARK_RUNNER_IMAGE: macos-15" in performance
     assert (
         "uv run --locked python scripts/benchmark_shadow_trace.py --assert-budgets" in performance
     )

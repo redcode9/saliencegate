@@ -9,7 +9,6 @@ from typing import Any
 from uuid import UUID
 
 import pytest
-from saliencegate.shadow.session import ShadowSession
 from tests.shadow.conftest import NOW, RUN_ID
 
 from saliencegate.domain import (
@@ -40,6 +39,7 @@ from saliencegate.shadow.errors import (
 )
 from saliencegate.shadow.inputs import ShadowObservationSource
 from saliencegate.shadow.observation import derive_shadow_extraction_report_digest
+from saliencegate.shadow.session import ShadowSession
 from saliencegate.signals import (
     DetectionContext,
     DetectorContractError,
