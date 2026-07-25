@@ -281,15 +281,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $home = Join-Path $env:SALIENCEGATE_CI_ROOT "home"
-          $env:HOME = $home
-          $env:USERPROFILE = $home
-          $env:XDG_CACHE_HOME = Join-Path $home "cache"
-          $env:XDG_CONFIG_HOME = Join-Path $home "config"
-          $env:XDG_DATA_HOME = Join-Path $home "data"
-          $env:XDG_STATE_HOME = Join-Path $home "state"
-          $env:APPDATA = Join-Path $home "appdata"
-          $env:LOCALAPPDATA = Join-Path $home "localappdata"
+          $captureHome = Join-Path $env:SALIENCEGATE_CI_ROOT "home"
+          $env:HOME = $captureHome
+          $env:USERPROFILE = $captureHome
+          $env:XDG_CACHE_HOME = Join-Path $captureHome "cache"
+          $env:XDG_CONFIG_HOME = Join-Path $captureHome "config"
+          $env:XDG_DATA_HOME = Join-Path $captureHome "data"
+          $env:XDG_STATE_HOME = Join-Path $captureHome "state"
+          $env:APPDATA = Join-Path $captureHome "appdata"
+          $env:LOCALAPPDATA = Join-Path $captureHome "localappdata"
           $env:TEMP = Join-Path $env:SALIENCEGATE_CI_ROOT "temp"
           $env:TMP = $env:TEMP
           $tests = @(
