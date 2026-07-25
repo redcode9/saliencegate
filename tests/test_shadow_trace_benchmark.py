@@ -139,6 +139,8 @@ def test_protocol_uses_warmup_plus_five_isolated_measurements_and_fixed_budgets(
 
     monkeypatch.setattr(benchmark, "_assert_provider_free", lambda: None)
     monkeypatch.setattr(benchmark, "_run_isolated_sample", fake_isolated_sample)
+    monkeypatch.delenv("ImageOS", raising=False)
+    monkeypatch.delenv("ImageVersion", raising=False)
     monkeypatch.setenv("SALIENCEGATE_BENCHMARK_RUNNER_IMAGE", "ubuntu-24.04")
 
     report = benchmark.run_benchmark()

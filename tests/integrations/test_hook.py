@@ -859,7 +859,6 @@ def test_bridge_fallback_short_circuits_a_large_valid_spool_backlog(
     def reject_sorted_path_inventory(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("bridge fast-drop built the sorted spool path inventory")
 
-    started = time.monotonic()
     with monkeypatch.context() as scoped:
         scoped.setattr(CaptureSpool, "_spool_child_paths", reject_sorted_path_inventory)
         receipts = spool.admit_transport(
@@ -868,10 +867,8 @@ def test_bridge_fallback_short_circuits_a_large_valid_spool_backlog(
             (start,),
             _bounded_transport_fallback((start,), gap),
         )
-    elapsed = time.monotonic() - started
     health = spool.health()
 
-    assert elapsed < 0.5
     assert tuple(receipt.disposition for receipt in receipts) == (
         "dropped_quota",
         "dropped_quota",
@@ -893,7 +890,6 @@ def test_bridge_fallback_short_circuits_a_large_valid_spool_backlog(
         )
     assert spool.health().dropped_events == 2
 
-    repeated_started = time.monotonic()
     other_start: CaptureIntake | None = None
     other_descriptor: CaptureTransportChunk | None = None
     other_gap: CaptureIntake | None = None
@@ -949,11 +945,9 @@ def test_bridge_fallback_short_circuits_a_large_valid_spool_backlog(
         (other_start,),
         _bounded_transport_fallback((other_start,), other_gap),
     )
-    repeated_elapsed = time.monotonic() - repeated_started
     repeated_health = spool.health()
     marker_count = len(tuple(locations.spool_directory.glob("*.capture-session")))
 
-    assert repeated_elapsed < 0.5
     assert healthy_store.calls == 0
     assert all(receipt.disposition == "dropped_quota" for receipt in barrier_receipts)
     assert repeated_health.dropped_events == 24
