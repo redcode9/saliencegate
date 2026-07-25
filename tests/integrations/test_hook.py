@@ -304,6 +304,7 @@ def test_transport_reader_preserves_valid_noncanonical_provider_json(document: b
         b'{"n":NaN}',
         b'{"n":Infinity}',
     ),
+    ids=("string-limit", "item-limit", "depth-limit", "nan", "infinity"),
 )
 def test_transport_reader_rejects_string_item_depth_and_number_limit_overflow(
     document: bytes,
@@ -322,6 +323,7 @@ def test_transport_reader_rejects_string_item_depth_and_number_limit_overflow(
         b"\xff",
         b" " * (MAX_CAPTURE_NATIVE_BYTES + 1),
     ),
+    ids=("empty", "nonobject", "duplicate", "trailing", "non-utf8", "byte-limit"),
 )
 def test_transport_reader_rejects_nonobject_duplicate_trailing_and_oversized_input(
     document: bytes,
