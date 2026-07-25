@@ -340,7 +340,6 @@ jobs:
             runner: windows-2025
     env:
       PYTHONPATH: ""
-      ARTIFACT_ROOT: ${{ runner.temp }}/saliencegate-artifact-only
     steps:
       - name: Select Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -358,6 +357,8 @@ jobs:
           name: python-distributions
           path: ${{ runner.temp }}/saliencegate-artifact-only/dist
       - name: Recover the shared artifact verifier from the sdist
+        env:
+          ARTIFACT_ROOT: ${{ runner.temp }}/saliencegate-artifact-only
         shell: python
         run: |
           import os
@@ -396,6 +397,8 @@ jobs:
               with target.open("xb") as output:
                   output.write(stream.read())
       - name: Prove documented commands from wheel and sdist
+        env:
+          ARTIFACT_ROOT: ${{ runner.temp }}/saliencegate-artifact-only
         shell: python
         run: |
           import os
@@ -436,7 +439,6 @@ jobs:
             runner: windows-2025
     env:
       PYTHONPATH: ""
-      ARTIFACT_ROOT: ${{ runner.temp }}/saliencegate-connector-artifact-only
       ANTHROPIC_API_KEY: provider-credential-read-must-fail
       AZURE_OPENAI_API_KEY: provider-credential-read-must-fail
       OPENAI_API_KEY: provider-credential-read-must-fail
@@ -467,6 +469,8 @@ jobs:
           name: python-distributions
           path: ${{ runner.temp }}/saliencegate-connector-artifact-only/dist
       - name: Recover the connector artifact verifiers from the sdist
+        env:
+          ARTIFACT_ROOT: ${{ runner.temp }}/saliencegate-connector-artifact-only
         shell: python
         run: |
           import os
@@ -514,6 +518,7 @@ jobs:
                       output.write(stream.read())
       - name: Prove installed callbacks and bundles with network and credentials denied
         env:
+          ARTIFACT_ROOT: ${{ runner.temp }}/saliencegate-connector-artifact-only
           HOME: ${{ runner.temp }}/saliencegate-connector-artifact-only/home
           XDG_CACHE_HOME: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/cache
           XDG_CONFIG_HOME: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/config
