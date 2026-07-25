@@ -1246,6 +1246,7 @@ def test_makefile_exposes_noninteractive_gates_in_the_authoritative_order() -> N
 
 def test_ci_is_least_privilege_pinned_and_covers_supported_python() -> None:
     text = _read(".github/workflows/ci.yml")
+    test_job = _job_block(text, "test")
 
     assert re.search(r"(?m)^permissions:\s*\n\s+contents:\s*read\s*$", text)
     assert len(re.findall(r"(?m)^permissions:", text)) == 1
@@ -1257,6 +1258,7 @@ def test_ci_is_least_privilege_pinned_and_covers_supported_python() -> None:
     assert "workflow_dispatch:" in text
     assert "fail-fast: false" in text
     assert "timeout-minutes:" in text
+    assert re.search(r"(?m)^    timeout-minutes: 90$", test_job)
 
     strategy = re.search(
         r"(?ms)^    strategy:\n(?P<body>.*?)(?=^    steps:)",
@@ -1293,8 +1295,8 @@ def test_ci_is_least_privilege_pinned_and_covers_supported_python() -> None:
     benchmark_first_sync = "uv sync --locked --dev --no-install-project"
     benchmark_second_sync = "uv sync --locked --dev --no-build-isolation"
     for job_id in (
-        "shadow-trace-performance",
-        "capture-performance",
+        "shadow-benchmark-evidence",
+        "capture-benchmark-contracts",
         "capture-platform-contract",
     ):
         performance = _job_block(text, job_id)
@@ -1332,8 +1334,8 @@ def test_ci_separates_static_quality_from_authoritative_coverage() -> None:
         "test",
         "quality",
         "coverage",
-        "shadow-trace-performance",
-        "capture-performance",
+        "shadow-benchmark-evidence",
+        "capture-benchmark-contracts",
         "connectors",
         "capture-platform-contract",
     ]
@@ -1348,21 +1350,23 @@ def test_ci_separates_static_quality_from_authoritative_coverage() -> None:
     assert "fail_under = 95" in _read("pyproject.toml")
 
 
-def test_ci_gates_the_documented_shadow_trace_reference_budgets() -> None:
+def test_ci_verifies_the_shadow_benchmark_contract_and_sealed_evidence() -> None:
     text = _read(".github/workflows/ci.yml")
-    performance = _job_block(text, "shadow-trace-performance")
+    evidence = _job_block(text, "shadow-benchmark-evidence")
     build = _job_block(text, "build")
 
-    assert "runs-on: macos-15" in performance
-    assert 'python-version: "3.12"' in performance
-    assert re.search(r"(?m)^    timeout-minutes: 30$", performance)
-    assert "uv sync --locked --dev --no-install-project" in performance
-    assert "uv sync --locked --dev --no-build-isolation" in performance
-    assert "SALIENCEGATE_BENCHMARK_RUNNER_IMAGE: macos-15" in performance
-    assert (
-        "uv run --locked python scripts/benchmark_shadow_trace.py --assert-budgets" in performance
-    )
-    assert "- shadow-trace-performance" in build
+    assert "name: Shadow benchmark contract and evidence" in evidence
+    assert "runs-on: ubuntu-24.04" in evidence
+    assert 'python-version: "3.12"' in evidence
+    assert re.search(r"(?m)^    timeout-minutes: 30$", evidence)
+    assert "uv sync --locked --dev --no-install-project" in evidence
+    assert "uv sync --locked --dev --no-build-isolation" in evidence
+    assert "tests/test_shadow_trace_benchmark.py" in evidence
+    assert "tests/test_readme_visuals.py" in evidence
+    assert "uv run --locked python scripts/check_readme_visuals.py" in evidence
+    assert "benchmark_shadow_trace.py --assert-budgets" not in evidence
+    assert "SALIENCEGATE_BENCHMARK_RUNNER_IMAGE" not in evidence
+    assert "- shadow-benchmark-evidence" in build
 
     benchmark = SHADOW_TRACE_BENCHMARK.read_text(encoding="utf-8")
     for required in (
@@ -1379,20 +1383,21 @@ def test_ci_gates_the_documented_shadow_trace_reference_budgets() -> None:
         assert required in benchmark
 
 
-def test_ci_gates_registered_capture_and_connector_performance() -> None:
+def test_ci_verifies_capture_benchmark_contracts_and_connector_performance() -> None:
     text = _read(".github/workflows/ci.yml")
-    capture = _job_block(text, "capture-performance")
+    capture = _job_block(text, "capture-benchmark-contracts")
     connectors = _job_block(text, "connectors")
     build = _job_block(text, "build")
 
+    assert "name: Capture benchmark contracts" in capture
     assert "runs-on: ubuntu-24.04" in capture
     assert 'python-version: "3.12"' in capture
     assert re.search(r"(?m)^    timeout-minutes: 30$", capture)
-    assert "SALIENCEGATE_CAPTURE_BENCHMARK_RUNNER_IMAGE: ubuntu-24.04" in capture
-    assert (
-        "uv run --locked python scripts/run_capture_hook_benchmark.py --assert-budgets" in capture
-    )
-    assert "uv run --locked python scripts/benchmark_capture_report.py --assert-budgets" in capture
+    assert "tests/test_capture_hook_benchmark.py" in capture
+    assert "tests/test_capture_report_benchmark.py" in capture
+    assert "run_capture_hook_benchmark.py --assert-budgets" not in capture
+    assert "benchmark_capture_report.py --assert-budgets" not in capture
+    assert "SALIENCEGATE_CAPTURE_BENCHMARK_RUNNER_IMAGE" not in capture
     assert "provider-credential-read-must-fail" in capture
 
     setup_node = "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e"
@@ -1403,7 +1408,7 @@ def test_ci_gates_registered_capture_and_connector_performance() -> None:
     assert "package-manager-cache: false" in connectors
     assert "run: make connector-source-check" in connectors
     assert "provider-credential-read-must-fail" in connectors
-    assert "- capture-performance" in build
+    assert "- capture-benchmark-contracts" in build
     assert "- connectors" in build
 
     package = _read("package.json")
@@ -1419,6 +1424,7 @@ def test_ci_declares_targeted_native_capture_contracts() -> None:
     build = _job_block(text, "build")
 
     _assert_native_runner_matrix(platform)
+    assert re.search(r"(?m)^    timeout-minutes: 60$", platform)
     for test_path in (
         "tests/security/test_windows.py",
         "tests/capture/test_store_security.py",

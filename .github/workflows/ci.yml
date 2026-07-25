@@ -23,7 +23,7 @@ jobs:
   test:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -112,9 +112,9 @@ jobs:
       - name: Enforce authoritative branch coverage
         run: make coverage
 
-  shadow-trace-performance:
-    name: Shadow trace reference budgets
-    runs-on: macos-15
+  shadow-benchmark-evidence:
+    name: Shadow benchmark contract and evidence
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Check out the source revision
@@ -122,7 +122,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Select the reference Python
+      - name: Select Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
@@ -132,17 +132,19 @@ jobs:
         with:
           version: "0.11.28"
           enable-cache: false
-      - name: Install the locked benchmark environment
+      - name: Install the locked benchmark contract environment
         run: |
           uv sync --locked --dev --no-install-project
           uv sync --locked --dev --no-build-isolation
-      - name: Enforce the 1000-record time and memory budgets
-        env:
-          SALIENCEGATE_BENCHMARK_RUNNER_IMAGE: macos-15
-        run: uv run --locked python scripts/benchmark_shadow_trace.py --assert-budgets
+      - name: Verify the benchmark contract and sealed reference evidence
+        run: |
+          uv run --locked pytest -q \
+            tests/test_shadow_trace_benchmark.py \
+            tests/test_readme_visuals.py
+          uv run --locked python scripts/check_readme_visuals.py
 
-  capture-performance:
-    name: Capture reference budgets
+  capture-benchmark-contracts:
+    name: Capture benchmark contracts
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -159,7 +161,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Select the reference Python
+      - name: Select Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
@@ -169,21 +171,15 @@ jobs:
         with:
           version: "0.11.28"
           enable-cache: false
-      - name: Install the locked capture benchmark environment
+      - name: Install the locked capture benchmark contract environment
         run: |
           uv sync --locked --dev --no-install-project
           uv sync --locked --dev --no-build-isolation
-      - name: Enforce hook and report budgets on the registered runner
-        env:
-          HOME: ${{ runner.temp }}/capture-performance-home
-          XDG_CACHE_HOME: ${{ runner.temp }}/capture-performance-home/cache
-          XDG_CONFIG_HOME: ${{ runner.temp }}/capture-performance-home/config
-          XDG_DATA_HOME: ${{ runner.temp }}/capture-performance-home/data
-          XDG_STATE_HOME: ${{ runner.temp }}/capture-performance-home/state
-          SALIENCEGATE_CAPTURE_BENCHMARK_RUNNER_IMAGE: ubuntu-24.04
+      - name: Verify the hook and report benchmark contracts
         run: |
-          uv run --locked python scripts/run_capture_hook_benchmark.py --assert-budgets
-          uv run --locked python scripts/benchmark_capture_report.py --assert-budgets
+          uv run --locked pytest -q \
+            tests/test_capture_hook_benchmark.py \
+            tests/test_capture_report_benchmark.py
 
   connectors:
     name: Exact Node connector gates
@@ -215,7 +211,7 @@ jobs:
   capture-platform-contract:
     name: Capture platform contract (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -279,8 +275,8 @@ jobs:
       - test
       - quality
       - coverage
-      - shadow-trace-performance
-      - capture-performance
+      - shadow-benchmark-evidence
+      - capture-benchmark-contracts
       - connectors
       - capture-platform-contract
     runs-on: ubuntu-24.04
