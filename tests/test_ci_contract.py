@@ -1463,6 +1463,7 @@ def test_ci_declares_targeted_native_capture_contracts() -> None:
         assert test_path in platform
     assert "HOME: ${{ runner.temp }}/capture-platform-home" in platform
     assert "USERPROFILE: ${{ runner.temp }}/capture-platform-home" in platform
+    assert '$root = Join-Path $env:SystemDrive "saliencegate-ci-' in platform
     assert "SALIENCEGATE_CI_ROOT=$root" in platform
     assert "/inheritance:r /grant:r" in platform
     assert '"*${ownerSid}:(OI)(CI)F"' in platform

@@ -334,7 +334,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $root = Join-Path $env:USERPROFILE "saliencegate-ci-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $root = Join-Path $env:SystemDrive "saliencegate-ci-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           New-Item -ItemType Directory -Path $root | Out-Null
           $ownerSid = [Security.Principal.WindowsIdentity]::GetCurrent().Owner.Value
           & icacls.exe $root /inheritance:r /grant:r "*${ownerSid}:(OI)(CI)F"
