@@ -738,7 +738,7 @@ def _revalidate_before_publication(
         output.revalidate()
         publication.authorization.revalidate()
         if sqlite is not None:
-            sqlite.revalidate()
+            sqlite._revalidate_closed_sqlite()
     except Exception:
         failed = True
     if failed:
@@ -929,7 +929,7 @@ def _revalidate_atif_before_publication(
         if source.aliases(output) or source.aliases(publication.authorization):
             raise SecureFileError()
         if sqlite is not None:
-            sqlite.revalidate()
+            sqlite._revalidate_closed_sqlite()
             if (
                 source.aliases(sqlite)
                 or output.aliases(sqlite)

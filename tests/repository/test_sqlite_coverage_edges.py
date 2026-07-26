@@ -82,14 +82,23 @@ async def test_aclose_is_idempotent_after_sync_close(tmp_path: Path) -> None:
     await repository.aclose()
 
 
-def test_close_connection_reports_revalidation_failure(tmp_path: Path) -> None:
+@pytest.mark.parametrize("failure_stage", ("live", "closed"))
+def test_close_connection_reports_revalidation_failure(
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
     repository = sqlite_repository(tmp_path / "boundary-close.sqlite3")
 
     class Authorization:
         cleaned = False
 
         def _revalidate_mutable_sqlite(self) -> None:
-            raise SecureFileError()
+            if failure_stage == "live":
+                raise SecureFileError()
+
+        def _revalidate_closed_sqlite(self) -> None:
+            if failure_stage == "closed":
+                raise SecureFileError()
 
         def _cleanup_created_sqlite_sidecars(self) -> None:
             self.cleaned = True

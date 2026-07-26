@@ -246,6 +246,27 @@ def test_pre_statement_revalidation_pins_the_transient_journal_identity(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="private SQLite sidecars require POSIX")
+@pytest.mark.parametrize("suffix", ("-wal", "-shm", "-journal"))
+def test_closed_sqlite_revalidation_allows_removal_but_rejects_replacement(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    parent = _private_directory(tmp_path / "store")
+    target = parent / "shadow.sqlite3"
+    authorization = authorize_private_sqlite_path(target)
+    sidecars = (*_sqlite_sidecars(target), _sqlite_journal(target))
+    for sidecar in sidecars:
+        sidecar.unlink()
+
+    authorization._revalidate_closed_sqlite()
+
+    replaced = Path(f"{target}{suffix}")
+    _private_file(replaced, b"safe-looking-replacement")
+    with pytest.raises(SecureFileError):
+        authorization._revalidate_closed_sqlite()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private SQLite sidecars require POSIX")
 def test_sidecar_cleanup_is_identity_checked_and_never_removes_preexisting_files(
     tmp_path: Path,
 ) -> None:

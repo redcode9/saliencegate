@@ -456,7 +456,7 @@ def initialize_capture_store(
             isolation_level=None,
             uri=True,
         )
-        authorization._revalidate_mutable_sqlite()
+        authorization._revalidate_before_sqlite_statements()
         applied = apply_capture_migrations(connection)
         _configure_initialized_store(connection, busy_timeout_ms=busy_timeout_ms)
         validate_capture_store_schema(connection)

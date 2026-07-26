@@ -323,6 +323,8 @@ def test_authorization_kind_specific_accessors_fail_closed() -> None:
         _ = _dummy_authorization().target_exists
     with pytest.raises(SecureFileError):
         _dummy_authorization(files._AuthorizationKind.STABLE_READ)._revalidate_mutable_sqlite()
+    with pytest.raises(SecureFileError):
+        _dummy_authorization(files._AuthorizationKind.STABLE_READ)._revalidate_closed_sqlite()
 
 
 @pytest.mark.parametrize(

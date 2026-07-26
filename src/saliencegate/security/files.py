@@ -221,6 +221,19 @@ class StableFileAuthorization:
         if failed:
             raise SecureFileError()
 
+    def _revalidate_closed_sqlite(self) -> None:
+        """Revalidate a closed SQLite boundary after clean sidecar removal."""
+
+        failed = False
+        try:
+            if self._kind is not _AuthorizationKind.SQLITE:
+                _fail()
+            _revalidate_mutable_sqlite(self, after_close=True)
+        except Exception:
+            failed = True
+        if failed:
+            raise SecureFileError()
+
     def _checked_revalidate(self, *, strict_transient: bool) -> None:
         failed = False
         try:
@@ -1782,6 +1795,8 @@ def _validate_mutable_sqlite_sidecars(
     directory_fd: int,
     database_name: str,
     sidecars: tuple[_SQLiteSidecarAuthorization, ...],
+    *,
+    after_close: bool = False,
 ) -> None:
     if tuple(sidecar.suffix for sidecar in sidecars) != _SQLITE_SIDECAR_SUFFIXES:
         _fail()
@@ -1790,15 +1805,19 @@ def _validate_mutable_sqlite_sidecars(
             _validate_existing_mutable_target(
                 directory_fd,
                 f"{database_name}{sidecar.suffix}",
-                expected=None if sidecar.transient else sidecar.identity,
+                expected=(sidecar.identity if after_close or not sidecar.transient else None),
             )
         except FileNotFoundError:
-            if sidecar.transient:
+            if after_close or sidecar.transient:
                 continue
             raise
 
 
-def _revalidate_mutable_sqlite(authorization: StableFileAuthorization) -> None:
+def _revalidate_mutable_sqlite(
+    authorization: StableFileAuthorization,
+    *,
+    after_close: bool = False,
+) -> None:
     path = Path(authorization.path)
     expected_parent = authorization._parent_identity
     expected_target = authorization._target_identity
@@ -1817,6 +1836,7 @@ def _revalidate_mutable_sqlite(authorization: StableFileAuthorization) -> None:
             directory_fd,
             path.name,
             authorization._sqlite_sidecars,
+            after_close=after_close,
         )
         _verify_parent(path, directory_fd, expected_parent)
         _validate_existing_mutable_target(
@@ -1828,6 +1848,7 @@ def _revalidate_mutable_sqlite(authorization: StableFileAuthorization) -> None:
             directory_fd,
             path.name,
             authorization._sqlite_sidecars,
+            after_close=after_close,
         )
     finally:
         os.close(directory_fd)
