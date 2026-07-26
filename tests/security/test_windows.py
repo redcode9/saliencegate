@@ -25,6 +25,7 @@ from saliencegate.security.windows import (
 
 _OWNER_SID = "S-1-5-21-1000"
 _OTHER_SID = "S-1-5-21-2000"
+_ADMINISTRATORS_SID = "S-1-5-32-544"
 _PATH = PureWindowsPath(r"C:\Users\synthetic\capture.bin")
 
 
@@ -437,6 +438,49 @@ def test_windows_managed_authorizer_accepts_readable_but_write_protected_dacl() 
             kind=WindowsPathKind.FILE,
             operations=operations,
         )
+
+
+def test_windows_managed_authorizer_accepts_protected_administrators_owner_only() -> None:
+    operations = _FakeWindowsOperations(
+        _security(
+            owner_sid=_ADMINISTRATORS_SID,
+            owner_private_dacl=True,
+            owner_write_protected_dacl=True,
+        )
+    )
+
+    authorization = authorize_windows_managed_path(
+        _PATH,
+        kind=WindowsPathKind.FILE,
+        operations=operations,
+    )
+    authorization.revalidate()
+
+    with pytest.raises(WindowsSecurityError):
+        authorize_windows_private_path(
+            _PATH,
+            kind=WindowsPathKind.FILE,
+            operations=operations,
+        )
+
+
+def test_windows_managed_authorizer_rejects_writable_administrators_owner() -> None:
+    operations = _FakeWindowsOperations(
+        _security(
+            owner_sid=_ADMINISTRATORS_SID,
+            owner_private_dacl=False,
+            owner_write_protected_dacl=False,
+        )
+    )
+
+    with pytest.raises(WindowsSecurityError) as captured:
+        authorize_windows_managed_path(
+            _PATH,
+            kind=WindowsPathKind.FILE,
+            operations=operations,
+        )
+
+    _assert_content_free(captured.value, "synthetic")
 
 
 def test_windows_managed_authorizer_rejects_an_untrusted_writable_dacl() -> None:

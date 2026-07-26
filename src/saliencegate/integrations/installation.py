@@ -387,22 +387,19 @@ def _reject_project_symlink_traversal(project_root: Path, path: Path) -> None:
         raise InstallationError() from None
     if os.name == "nt":  # pragma: no cover - exercised by native Windows R01
         operations = NativeWindowsSecurityOperations()
-        owner_sid = operations.current_user_sid()
         windows_current = PureWindowsPath(os.fspath(project_root))
         for index, component in enumerate(relative.parts):
             windows_current /= component
             security = operations.inspect_path(windows_current)
             if security is None:
                 return
-            if (
-                security.owner_sid != owner_sid
-                or security.reparse_tag is not None
-                or security.hardlink_count != 1
-                or (
-                    index < len(relative.parts) - 1
-                    and security.kind is not WindowsPathKind.DIRECTORY
-                )
-            ):
+            authorization = authorize_windows_managed_path(
+                windows_current,
+                kind=security.kind,
+                operations=operations,
+            )
+            authorization.revalidate()
+            if index < len(relative.parts) - 1 and security.kind is not WindowsPathKind.DIRECTORY:
                 raise InstallationError()
         return
     current = project_root

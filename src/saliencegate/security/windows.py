@@ -286,7 +286,7 @@ def authorize_windows_managed_path(
     kind: WindowsPathKind,
     operations: WindowsSecurityOperations,
 ) -> WindowsPathAuthorization:
-    """Authorize a current-user-owned path whose DACL denies untrusted writes."""
+    """Authorize a trusted-owned path whose DACL denies untrusted writes."""
 
     return _content_free_call(
         lambda: _authorize_windows_path(
@@ -473,7 +473,7 @@ def _is_safe_ancestor_security(
     return bool(
         type(security) is WindowsPathSecurity
         and security.kind is WindowsPathKind.DIRECTORY
-        and security.owner_sid in {owner_sid, *_TRUSTED_PRIVILEGED_SIDS}
+        and _is_trusted_managed_owner(security.owner_sid, current_user_sid=owner_sid)
         and (
             security.owner_traversal_protected_dacl
             if is_anchor
@@ -498,13 +498,20 @@ def _validate_authorized_security(
     if (
         type(security) is not WindowsPathSecurity
         or security.kind is not kind
-        or security.owner_sid != owner_sid
+        or not _is_trusted_managed_owner(
+            security.owner_sid,
+            current_user_sid=owner_sid,
+        )
         or not security.owner_write_protected_dacl
         or security.hardlink_count != 1
         or security.reparse_tag is not None
     ):
         raise _NativeWindowsError()
     return security
+
+
+def _is_trusted_managed_owner(value: str, *, current_user_sid: str) -> bool:
+    return value == current_user_sid or value in _TRUSTED_PRIVILEGED_SIDS
 
 
 def _validate_private_security(
