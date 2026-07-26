@@ -673,6 +673,9 @@ _TRUSTED_PRIVILEGED_SIDS = frozenset(
         "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
     }
 )
+# OWNER RIGHTS is evaluated as the object's current owner inside an ACE.  It is safe
+# only for DACL write-scope checks and must never become a trusted object owner.
+_OWNER_RIGHTS_SID = "S-1-3-4"
 _SDDL_REVISION_1 = 1
 _LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
 _LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
@@ -1903,7 +1906,10 @@ class NativeWindowsSecurityOperations:  # pragma: no cover - exercised by native
                 and not owner_ace
             ):
                 ace_sid_text = self._sid_to_text(ace_sid)
-                if ace_sid_text not in _TRUSTED_PRIVILEGED_SIDS:
+                if (
+                    ace_sid_text != _OWNER_RIGHTS_SID
+                    and ace_sid_text not in _TRUSTED_PRIVILEGED_SIDS
+                ):
                     write_protected = False
                     if mask & _UNTRUSTED_TRAVERSAL_ACCESS:
                         traversal_protected = False
