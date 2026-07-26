@@ -483,6 +483,25 @@ def test_windows_managed_authorizer_rejects_writable_administrators_owner() -> N
     _assert_content_free(captured.value, "synthetic")
 
 
+def test_windows_managed_authorizer_rejects_a_protected_untrusted_owner() -> None:
+    operations = _FakeWindowsOperations(
+        _security(
+            owner_sid=_OTHER_SID,
+            owner_private_dacl=False,
+            owner_write_protected_dacl=True,
+        )
+    )
+
+    with pytest.raises(WindowsSecurityError) as captured:
+        authorize_windows_managed_path(
+            _PATH,
+            kind=WindowsPathKind.FILE,
+            operations=operations,
+        )
+
+    _assert_content_free(captured.value, "synthetic")
+
+
 def test_windows_managed_authorizer_rejects_an_untrusted_writable_dacl() -> None:
     operations = _FakeWindowsOperations(
         _security(
