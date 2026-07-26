@@ -1465,7 +1465,7 @@ def test_ci_declares_targeted_native_capture_contracts() -> None:
     assert "USERPROFILE: ${{ runner.temp }}/capture-platform-home" in platform
     assert "SALIENCEGATE_CI_ROOT=$root" in platform
     assert "/inheritance:r /grant:r" in platform
-    assert '"*${currentSid}:(OI)(CI)F"' in platform
+    assert '"*${ownerSid}:(OI)(CI)F"' in platform
     assert "test_native_windows_operations_authorize_a_real_private_directory" in platform
     assert "test_read_only_audit_authenticates_an_empty_spool_without_creating_a_lock" in platform
     assert "test_windows_launcher_preserves_stdin_argv_silence_and_timeout" in platform

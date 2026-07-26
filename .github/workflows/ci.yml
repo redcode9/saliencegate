@@ -336,8 +336,8 @@ jobs:
         run: |
           $root = Join-Path $env:USERPROFILE "saliencegate-ci-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           New-Item -ItemType Directory -Path $root | Out-Null
-          $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-          & icacls.exe $root /inheritance:r /grant:r "*${currentSid}:(OI)(CI)F"
+          $ownerSid = [Security.Principal.WindowsIdentity]::GetCurrent().Owner.Value
+          & icacls.exe $root /inheritance:r /grant:r "*${ownerSid}:(OI)(CI)F"
           if ($LASTEXITCODE -ne 0) {
             throw "Failed to secure the Windows test root"
           }

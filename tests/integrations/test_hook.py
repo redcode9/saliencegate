@@ -1440,6 +1440,7 @@ def test_windows_launcher_encodes_the_native_contract() -> None:
     ):
         assert f'set "{key}="' in source
     assert '"%capture_powershell%" -NoLogo' in source
+    assert "[Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false)" in source
     assert "\npowershell.exe " not in source
     assert source.count("exit /b 0") >= 2
     assert "%*" not in source
