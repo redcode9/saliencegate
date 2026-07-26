@@ -566,7 +566,11 @@ def _canonical_pilot_endpoint(value: object) -> str:
         raise ValueError
 
     address = ip_address(host)
-    if type(address) not in {IPv4Address, IPv6Address} or not address.is_loopback:
+    if (
+        type(address) not in {IPv4Address, IPv6Address}
+        or not address.is_loopback
+        or (type(address) is IPv6Address and address.ipv4_mapped is not None)
+    ):
         raise ValueError
     authority = f"[{address.compressed}]" if type(address) is IPv6Address else str(address)
     if port is not None:

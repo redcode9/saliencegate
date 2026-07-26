@@ -180,13 +180,45 @@ def _peak_rss_bytes() -> int:
             raise CaptureReportBenchmarkError()
         return int(counters.PeakWorkingSetSize)
 
+    system = platform.system()
+    if system == "Linux":
+        try:
+            status = Path("/proc/self/status").read_text(encoding="ascii")
+            return _parse_linux_peak_rss_bytes(status)
+        except CaptureReportBenchmarkError:
+            raise
+        except Exception:
+            raise CaptureReportBenchmarkError() from None
+
     import resource
 
     maximum = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     if type(maximum) not in (int, float) or not math.isfinite(maximum) or maximum <= 0:
         raise CaptureReportBenchmarkError()
-    multiplier = 1 if platform.system() == "Darwin" else 1_024
+    multiplier = 1 if system == "Darwin" else 1_024
     return int(maximum * multiplier)
+
+
+def _parse_linux_peak_rss_bytes(status: str) -> int:
+    if type(status) is not str:
+        raise CaptureReportBenchmarkError()
+    for line in status.splitlines():
+        name, separator, raw_value = line.partition(":")
+        if name != "VmHWM" or separator != ":":
+            continue
+        fields = raw_value.split()
+        if (
+            len(fields) != 2
+            or not fields[0].isascii()
+            or not fields[0].isdigit()
+            or fields[1] != "kB"
+        ):
+            break
+        value = int(fields[0])
+        if value <= 0:
+            break
+        return value * 1_024
+    raise CaptureReportBenchmarkError()
 
 
 def _network_denial_is_active() -> bool:

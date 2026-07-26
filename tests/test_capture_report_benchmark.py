@@ -46,6 +46,35 @@ def test_report_worker_environment_never_reads_ambient_provider_credentials() ->
     assert observed == ["PATH"]
 
 
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    (
+        ("Name:\tpython\nVmHWM:\t65536 kB\n", 64 * 1_024 * 1_024),
+        ("VmPeak:\t999999 kB\nVmHWM: 1 kB\n", 1_024),
+    ),
+)
+def test_linux_peak_rss_parser_uses_the_process_high_water_mark(
+    status: str,
+    expected: int,
+) -> None:
+    assert benchmark._parse_linux_peak_rss_bytes(status) == expected
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        "",
+        "VmHWM: 0 kB\n",
+        "VmHWM: -1 kB\n",
+        "VmHWM: 12 MB\n",
+        "VmHWM: secret kB\n",
+    ),
+)
+def test_linux_peak_rss_parser_rejects_invalid_status(status: str) -> None:
+    with pytest.raises(benchmark.CaptureReportBenchmarkError):
+        benchmark._parse_linux_peak_rss_bytes(status)
+
+
 def test_fresh_socket_denied_worker_builds_a_real_canonical_report(tmp_path: Path) -> None:
     database = tmp_path / "capture.sqlite3"
     session_id = benchmark.prepare_capture_report_fixture(database, event_count=8)

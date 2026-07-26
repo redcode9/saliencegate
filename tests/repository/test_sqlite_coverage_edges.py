@@ -88,7 +88,7 @@ def test_close_connection_reports_revalidation_failure(tmp_path: Path) -> None:
     class Authorization:
         cleaned = False
 
-        def revalidate(self) -> None:
+        def _revalidate_mutable_sqlite(self) -> None:
             raise SecureFileError()
 
         def _cleanup_created_sqlite_sidecars(self) -> None:

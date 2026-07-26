@@ -1271,6 +1271,8 @@ def test_ci_is_least_privilege_pinned_and_covers_supported_python() -> None:
         flags=re.MULTILINE,
     )
     assert matrix_versions == ["3.11", "3.12", "3.13"]
+    assert "UV_PYTHON: ${{ matrix.python-version }}" in test_job
+    assert "sys.version_info[:2]" in test_job
 
     uses_lines = re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)(?:\s+#\s*(\S.*))?$", text)
     assert uses_lines
@@ -1315,6 +1317,7 @@ def test_ci_is_least_privilege_pinned_and_covers_supported_python() -> None:
 
 def test_ci_separates_static_quality_from_authoritative_coverage() -> None:
     text = _read(".github/workflows/ci.yml")
+    test_job = _job_block(text, "test")
     quality = _job_block(text, "quality")
     coverage = _job_block(text, "coverage")
     build = _job_block(text, "build")
@@ -1324,9 +1327,33 @@ def test_ci_separates_static_quality_from_authoritative_coverage() -> None:
         "make format lint typecheck docs-check audit"
     ]
     assert 'python-version: "3.12"' in coverage
-    assert re.search(r"(?m)^    timeout-minutes: 90$", coverage)
-    assert re.findall(r"(?m)^        run: (make [^\n]+)$", coverage) == ["make coverage"]
+    assert re.search(r"(?m)^    timeout-minutes: 30$", coverage)
+    assert "needs:\n      - test" in coverage
+    assert "coverage combine coverage-data" in coverage
+    assert "coverage report --show-missing --fail-under=0" in coverage
+    assert "coverage json --fail-under=0 -o .coverage.json" in coverage
+    assert "scripts/check_coverage_thresholds.py .coverage.json --minimum 95" in coverage
+    assert "actions/download-artifact@" in coverage
+    assert "make coverage" not in coverage
     assert "coverage" not in re.findall(r"(?m)^        run: (make [^\n]+)$", quality)[0].split()
+
+    assert test_job.count("- name: core") == 1
+    assert test_job.count("- name: state-decay-v2") == 1
+    assert test_job.count("- name: review-io") == 1
+    assert test_job.count("- name: review-cli-pack") == 1
+    assert re.search(
+        r"(?m)^\s+tests$\n^\s+--ignore=tests/benchmarks/state_decay_v2$",
+        test_job,
+    )
+    for review_file in (
+        "test_public_review_io.py",
+        "test_public_review.py",
+        "test_public_review_cli.py",
+        "test_public_review_pack.py",
+    ):
+        assert test_job.count(review_file) == 2
+    assert "COVERAGE_FILE: .coverage.${{ matrix.shard.name }}" in test_job
+    assert "include-hidden-files: true" in test_job
 
     needs = re.search(r"(?ms)^    needs:\n(?P<body>.*?)(?=^    [a-z-]+:)", build)
     assert needs is not None
@@ -1437,6 +1464,12 @@ def test_ci_declares_targeted_native_capture_contracts() -> None:
     assert "HOME: ${{ runner.temp }}/capture-platform-home" in platform
     assert "USERPROFILE: ${{ runner.temp }}/capture-platform-home" in platform
     assert "SALIENCEGATE_CI_ROOT=$root" in platform
+    assert "/inheritance:r /grant:r" in platform
+    assert '"*${currentSid}:(OI)(CI)F"' in platform
+    assert "test_native_windows_operations_authorize_a_real_private_directory" in platform
+    assert "test_read_only_audit_authenticates_an_empty_spool_without_creating_a_lock" in platform
+    assert "test_windows_launcher_preserves_stdin_argv_silence_and_timeout" in platform
+    assert platform.count("test_native_windows_") == 5
     assert "$env:HOME = $captureHome" in platform
     assert '$env:TEMP = Join-Path $env:SALIENCEGATE_CI_ROOT "temp"' in platform
     assert '--basetemp (Join-Path $env:SALIENCEGATE_CI_ROOT "pytest")' in platform
@@ -1447,9 +1480,11 @@ def test_ci_declares_targeted_native_capture_contracts() -> None:
 
 def test_ci_builds_once_and_gates_distribution_membership_before_upload() -> None:
     text = _read(".github/workflows/ci.yml")
+    test_job = _job_block(text, "test")
     build = _job_block(text, "build")
 
-    assert text.count("actions/upload-artifact@") == 1
+    assert text.count("actions/upload-artifact@") == 2
+    assert test_job.count("actions/upload-artifact@") == 1
     assert build.count("actions/upload-artifact@") == 1
     assert "SALIENCEGATE_REQUIRE_DISTRIBUTIONS=1" in build
     assert "uv run --locked pytest -q tests/test_package.py" in build
@@ -1463,9 +1498,13 @@ def test_ci_builds_once_and_gates_distribution_membership_before_upload() -> Non
         text,
     )
     upload_steps = [block for block in step_blocks if "actions/upload-artifact@" in block]
-    assert len(upload_steps) == 1
-    uploaded_paths = re.findall(r"(?m)^\s+path:\s*([^\n]+)$", upload_steps[0])
+    assert len(upload_steps) == 2
+    build_upload = next(block for block in upload_steps if "name: python-distributions" in block)
+    coverage_upload = next(block for block in upload_steps if "coverage-${{" in block)
+    uploaded_paths = re.findall(r"(?m)^\s+path:\s*([^\n]+)$", build_upload)
     assert uploaded_paths == ["dist/"]
+    assert "path: .coverage.${{ matrix.shard.name }}" in coverage_upload
+    assert "include-hidden-files: true" in coverage_upload
     assert all(
         forbidden not in "\n".join(uploaded_paths)
         for forbidden in ("trace", "runs", ".artifacts", "reports")
@@ -1837,7 +1876,7 @@ def test_ci_installed_jobs_share_only_the_built_distributions() -> None:
         for job_id in ("installed-core-wheel", "installed-sdist", "installed-model-runtime")
     )
 
-    assert text.count("actions/download-artifact@") == 5
+    assert text.count("actions/download-artifact@") == 6
     for job in installed:
         assert "name: python-distributions" in job
         assert "path: dist/" in job

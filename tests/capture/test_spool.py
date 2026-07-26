@@ -206,7 +206,15 @@ def test_read_only_audit_never_creates_a_missing_spool_boundary(tmp_path: Path) 
 def test_read_only_audit_authenticates_an_empty_spool_without_creating_a_lock(
     tmp_path: Path,
 ) -> None:
-    locations = _locations(tmp_path)
+    locations = (
+        resolve_capture_store_locations(
+            environ={"LOCALAPPDATA": str(tmp_path)},
+            home=tmp_path / "home",
+            platform="windows",
+        )
+        if os.name == "nt"
+        else _locations(tmp_path)
+    )
     CaptureSpool.open(locations, INSTALLATION_KEY)
     before = tuple(sorted(path.name for path in locations.spool_directory.iterdir()))
 

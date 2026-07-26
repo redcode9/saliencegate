@@ -1296,33 +1296,20 @@ def _validate_existing_mutable_target(
     *,
     expected: _StableIdentity | None = None,
 ) -> _StableIdentity:
-    """Pin security identity while allowing SQLite-managed bytes to change."""
+    """Pin a live SQLite identity without disturbing process-scoped POSIX locks."""
 
     named_before = _named_stat(name, directory_fd)
     if not _safe_target(named_before):
         _fail()
-    descriptor = _open_existing_target(name, directory_fd)
-    try:
-        opened_before = os.fstat(descriptor)
-        if not _safe_target(opened_before):
-            _fail()
-        _require_safe_acl(descriptor)
-        identity = _StableIdentity.from_stat(opened_before)
-        opened_after = os.fstat(descriptor)
-        _require_safe_acl(descriptor)
-        named_after = _named_stat(name, directory_fd)
-        if (
-            not _safe_target(opened_after)
-            or not _safe_target(named_after)
-            or _StableIdentity.from_stat(named_before) != identity
-            or _StableIdentity.from_stat(opened_after) != identity
-            or _StableIdentity.from_stat(named_after) != identity
-            or (expected is not None and identity != expected)
-        ):
-            _fail()
-        return identity
-    finally:
-        os.close(descriptor)
+    identity = _StableIdentity.from_stat(named_before)
+    named_after = _named_stat(name, directory_fd)
+    if (
+        not _safe_target(named_after)
+        or _StableIdentity.from_stat(named_after) != identity
+        or (expected is not None and identity != expected)
+    ):
+        _fail()
+    return identity
 
 
 def _unlink_unchanged_private_file(

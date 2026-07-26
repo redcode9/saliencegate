@@ -259,13 +259,13 @@ class SQLiteRunRepository:
                     check_same_thread=False,
                     uri=True,
                 )
-                file_authorization._revalidate_before_sqlite_statements()
+                file_authorization._revalidate_mutable_sqlite()
             self._connection.row_factory = sqlite3.Row
             self._configure_connection()
             apply_migrations(self._connection)
             self._recover_derived_state()
             if file_authorization is not None:
-                file_authorization.revalidate()
+                file_authorization._revalidate_mutable_sqlite()
         except (MigrationError, RepositoryError, ValidationError):
             self._abort_initialization()
             raise
@@ -333,7 +333,7 @@ class SQLiteRunRepository:
         boundary_failed = False
         if authorization is not None:
             try:
-                authorization.revalidate()
+                authorization._revalidate_mutable_sqlite()
             except SecureFileError:
                 boundary_failed = True
         try:

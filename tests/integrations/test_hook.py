@@ -1544,9 +1544,9 @@ public static class CaptureTarget {
         (
             str(command_processor),
             "/d",
-            "/s",
             "/c",
-            f'""{launcher}" ignored-provider-argv"',
+            str(launcher),
+            "ignored-provider-argv",
         ),
         input=payload,
         capture_output=True,
@@ -1569,7 +1569,7 @@ public static class CaptureTarget {
     environment["SG_CAPTURE_TEST_MODE"] = "sleep"
     started = time.monotonic()
     timed = subprocess.run(
-        (str(command_processor), "/d", "/s", "/c", f'""{launcher}""'),
+        (str(command_processor), "/d", "/c", str(launcher)),
         input=b"{}",
         capture_output=True,
         check=False,

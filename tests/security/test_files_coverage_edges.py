@@ -675,6 +675,7 @@ def test_darwin_acl_api_binding_failure_is_fail_closed_and_retried(
 
 
 def test_private_directory_creation_rejects_unsafe_root_and_components(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(files, "_safe_ancestor", lambda _value: False)
@@ -684,7 +685,7 @@ def test_private_directory_creation_rejects_unsafe_root_and_components(
     monkeypatch.setattr(files, "_safe_ancestor", lambda _value: True)
     monkeypatch.setattr(files, "_require_safe_acl", lambda *_args, **_kwargs: None)
     with pytest.raises(files._UnsafeFilePathError):
-        files._open_or_create_private_directory_chain(Path("/private/../target"))
+        files._open_or_create_private_directory_chain(tmp_path / ".." / "target")
 
 
 def test_private_directory_creation_rejects_identity_and_final_mode_races(
@@ -722,7 +723,7 @@ def test_safe_ancestor_walk_rejects_root_component_and_identity_races(
     monkeypatch.setattr(files, "_safe_ancestor", lambda _value: True)
     monkeypatch.setattr(files, "_require_safe_acl", lambda *_args, **_kwargs: None)
     with pytest.raises(files._UnsafeFilePathError):
-        files._open_safe_ancestor_directory(Path("/private/../target"))
+        files._open_safe_ancestor_directory(tmp_path / ".." / "target")
 
     checks = 0
 
@@ -801,7 +802,7 @@ def test_directory_chain_rejects_unsafe_root_component_and_final_parent(
     monkeypatch.setattr(files, "_safe_ancestor", lambda _value: True)
     monkeypatch.setattr(files, "_require_safe_acl", lambda *_args, **_kwargs: None)
     with pytest.raises(files._UnsafeFilePathError):
-        files._open_directory_chain(Path("/private/../target"))
+        files._open_directory_chain(tmp_path / ".." / "target")
 
     monkeypatch.setattr(files, "_safe_parent", lambda _value: False)
     with pytest.raises(files._UnsafeFilePathError):
@@ -932,14 +933,9 @@ def test_parent_open_and_verification_reject_identity_mismatch(
         os.close(descriptor)
 
 
-@pytest.mark.parametrize(
-    "validator",
-    (files._validate_existing_target, files._validate_existing_mutable_target),
-)
-def test_existing_target_validators_reject_an_unsafe_open_descriptor(
+def test_existing_target_validator_rejects_an_unsafe_open_descriptor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    validator: Callable[..., object],
 ) -> None:
     target = tmp_path / "target"
     target.touch(mode=0o600)
@@ -950,7 +946,7 @@ def test_existing_target_validators_reject_an_unsafe_open_descriptor(
     monkeypatch.setattr(files.os, "fstat", lambda _descriptor: unsafe)
     try:
         with pytest.raises(files._UnsafeFilePathError):
-            validator(directory_fd, target.name)
+            files._validate_existing_target(directory_fd, target.name)
     finally:
         os.close(directory_fd)
 
@@ -967,10 +963,9 @@ def test_mutable_target_rejects_a_post_open_metadata_race(
     def safe_then_changed(_value: os.stat_result) -> bool:
         nonlocal calls
         calls += 1
-        return calls < 3
+        return calls < 2
 
     monkeypatch.setattr(files, "_safe_target", safe_then_changed)
-    monkeypatch.setattr(files, "_require_safe_acl", lambda *_args, **_kwargs: None)
     try:
         with pytest.raises(files._UnsafeFilePathError):
             files._validate_existing_mutable_target(directory_fd, target.name)

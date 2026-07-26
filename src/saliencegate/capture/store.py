@@ -749,10 +749,10 @@ class CaptureStore:
                 uri=True,
             )
             connection.row_factory = sqlite3.Row
-            authorization._revalidate_before_sqlite_statements()
+            authorization._revalidate_mutable_sqlite()
             validate_schema(connection)
             cls._configure_connection(connection, busy_timeout_ms=busy_timeout_ms)
-            authorization.revalidate()
+            authorization._revalidate_mutable_sqlite()
             instance = cls.__new__(cls)
             instance._authorization = authorization
             instance._connection = connection

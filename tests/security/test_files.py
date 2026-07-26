@@ -315,6 +315,7 @@ def test_sidecar_cleanup_never_unlinks_placeholders_claimed_by_a_live_peer(
         assert first.execute("PRAGMA journal_mode = WAL").fetchone() == ("wal",)
         first.execute("CREATE TABLE durable(value INTEGER NOT NULL)")
         second = sqlite3.connect(target, isolation_level=None)
+        assert second.execute("SELECT value FROM durable").fetchall() == []
         identities = {sidecar.name: sidecar.lstat().st_ino for sidecar in (wal, shm)}
         first.close()
 
