@@ -267,6 +267,72 @@ def test_closed_sqlite_revalidation_allows_removal_but_rejects_replacement(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="private SQLite sidecars require POSIX")
+def test_closed_sqlite_tombstone_rejects_a_simulated_reused_wal_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = _private_directory(tmp_path / "store")
+    target = parent / "shadow.sqlite3"
+    authorization = authorize_private_sqlite_path(target)
+    wal = _sqlite_sidecars(target)[0]
+    original_identity = authorization._sqlite_sidecars[0].identity
+    wal.unlink()
+
+    authorization._revalidate_closed_sqlite()
+    _private_file(wal, b"replacement-with-a-reused-inode")
+    real_validate = files_module._validate_existing_mutable_target
+
+    def simulate_reused_wal_identity(
+        directory_fd: int,
+        name: str,
+        *,
+        expected: files_module._StableIdentity | None = None,
+    ) -> files_module._StableIdentity:
+        if name == wal.name:
+            real_validate(directory_fd, name, expected=None)
+            return original_identity
+        return real_validate(directory_fd, name, expected=expected)
+
+    monkeypatch.setattr(
+        files_module,
+        "_validate_existing_mutable_target",
+        simulate_reused_wal_identity,
+    )
+
+    with pytest.raises(SecureFileError):
+        authorization._revalidate_closed_sqlite()
+
+    assert wal.read_bytes() == b"replacement-with-a-reused-inode"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private SQLite sidecars require POSIX")
+def test_closed_sqlite_tombstone_is_shared_across_threads(tmp_path: Path) -> None:
+    parent = _private_directory(tmp_path / "store")
+    target = parent / "shadow.sqlite3"
+    authorization = authorize_private_sqlite_path(target)
+    wal = _sqlite_sidecars(target)[0]
+    wal.unlink()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        tuple(executor.map(lambda _index: authorization._revalidate_closed_sqlite(), range(2)))
+
+    assert authorization._closed_sqlite_state.missing_sidecars == {"-wal"}
+    _private_file(wal, b"replacement-after-concurrent-retirement")
+
+    def replacement_is_rejected(_index: int) -> bool:
+        try:
+            authorization._revalidate_closed_sqlite()
+        except SecureFileError:
+            return True
+        return False
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert all(executor.map(replacement_is_rejected, range(2)))
+
+    assert wal.read_bytes() == b"replacement-after-concurrent-retirement"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="private SQLite sidecars require POSIX")
 def test_sidecar_cleanup_is_identity_checked_and_never_removes_preexisting_files(
     tmp_path: Path,
 ) -> None:

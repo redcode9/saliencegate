@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -685,6 +686,7 @@ print(canonical_json(summary).decode("utf-8"))
         (sys.executable, "-c", program),
         capture_output=True,
         check=False,
+        env={key: value for key, value in os.environ.items() if not key.startswith("COV_CORE_")},
         timeout=60.0,
     )
 

@@ -81,7 +81,7 @@ def test_reference_evidence_manifest_binds_every_measured_input() -> None:
     assert validate_evidence_manifest(ROOT, MANIFEST) == ()
     count, digest = runtime_source_digest(ROOT)
     assert count == 202
-    assert digest == "2b2acaf0115a8290ccac2896c19b9c65791f07c647f73bc8fee65d18c9cd4a79"
+    assert digest == "537dbb529d8107896e284e697801db7e72ee4acd335e7789c83da78bd7c11e72"
 
 
 def test_evidence_metadata_binding_ignores_editorial_packaging_fields(tmp_path: Path) -> None:

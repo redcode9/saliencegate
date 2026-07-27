@@ -76,6 +76,26 @@ _ATIF_CLI_PROFILES = {
 
 _CAPTURE_PROVIDERS = ("codex", "claude-code", "opencode", "pi")
 
+_ROOT_USAGE = (
+    "%(prog)s [-h] [--version]\n"
+    "                    {demo,doctor,setup,connect,disconnect,status,sessions,report,"
+    "feedback,delete,replay,shadow,algorithm,pilot,benchmark,inspect,validate}\n"
+    "                    ..."
+)
+_FEEDBACK_USAGE = (
+    "%(prog)s [-h] --label\n"
+    "                             {memory-needed,not-memory-needed,uncertain}\n"
+    "                             [--json]\n"
+    "                             session_id"
+)
+_ALGORITHM_REPLAY_USAGE = (
+    "%(prog)s [-h] [--responses RESPONSES] --condition\n"
+    "                                     "
+    "{no_memory,fixed_step,retrieval_always,always_inject}\n"
+    "                                     --output OUTPUT [--replace] [--json]\n"
+    "                                     trace"
+)
+
 
 class ExitCode(IntEnum):
     SUCCESS = 0
@@ -261,7 +281,11 @@ def _parser() -> _SafeArgumentParser:
     report.add_argument("--replace", action="store_true")
     report.add_argument("--json", action="store_true")
 
-    feedback = commands.add_parser("feedback", help="Record local capture feedback")
+    feedback = commands.add_parser(
+        "feedback",
+        help="Record local capture feedback",
+        usage=_FEEDBACK_USAGE,
+    )
     feedback.add_argument("session_id")
     feedback.add_argument(
         "--label",
@@ -328,7 +352,10 @@ def _parser() -> _SafeArgumentParser:
 
     algorithm = commands.add_parser("algorithm")
     algorithm_commands = algorithm.add_subparsers(dest="algorithm_command", required=True)
-    algorithm_replay = algorithm_commands.add_parser("replay")
+    algorithm_replay = algorithm_commands.add_parser(
+        "replay",
+        usage=_ALGORITHM_REPLAY_USAGE,
+    )
     algorithm_replay.add_argument("trace")
     algorithm_replay.add_argument("--responses")
     algorithm_replay.add_argument(
@@ -365,6 +392,7 @@ def _parser() -> _SafeArgumentParser:
     validate.add_argument("--expected-digest")
     validate.add_argument("--require-confirmatory", action="store_true")
     validate.add_argument("--json", action="store_true")
+    parser.usage = _ROOT_USAGE
     return parser
 
 

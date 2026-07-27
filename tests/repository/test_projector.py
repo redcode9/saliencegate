@@ -882,7 +882,7 @@ def test_invocation_event_index_is_canonical_and_cannot_diverge_from_decisions()
     decision = projection.decisions[DECISION_1_ID]
 
     assert projection.decisions_by_event_sequence == {decision.event_sequence: decision}
-    with pytest.raises(ValueError, match="init=False"):
+    with pytest.raises((TypeError, ValueError), match="init=False"):
         replace(projection, decisions_by_event_sequence={})
     with pytest.raises(ProjectionInvariantError, match="already has a decision"):
         replace(

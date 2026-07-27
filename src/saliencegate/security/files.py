@@ -20,7 +20,7 @@ import sys
 import unicodedata
 from collections.abc import Callable, Iterator
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
@@ -176,6 +176,16 @@ class _SQLiteSidecarAuthorization:
     cleanup_identity: _CompleteIdentity | None
 
 
+class _ClosedSQLiteState:
+    """Retire absent sidecar names so inode reuse cannot revive their authority."""
+
+    __slots__ = ("lock", "missing_sidecars")
+
+    def __init__(self) -> None:
+        self.lock = Lock()
+        self.missing_sidecars: set[str] = set()
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class StableFileAuthorization:
     """A copied path bound to the exact filesystem boundary that was checked."""
@@ -187,6 +197,12 @@ class StableFileAuthorization:
     _target_complete_identity: _CompleteIdentity | None = None
     _kind: _AuthorizationKind = _AuthorizationKind.SQLITE
     _read_policy: StableReadPolicy | None = None
+    _closed_sqlite_state: _ClosedSQLiteState = field(
+        default_factory=_ClosedSQLiteState,
+        init=False,
+        compare=False,
+        repr=False,
+    )
 
     def revalidate(self) -> None:
         """Fail if the parent, database, or SQLite sidecar boundary became unsafe."""
@@ -228,7 +244,12 @@ class StableFileAuthorization:
         try:
             if self._kind is not _AuthorizationKind.SQLITE:
                 _fail()
-            _revalidate_mutable_sqlite(self, after_close=True)
+            state = self._closed_sqlite_state
+            with state.lock:
+                _revalidate_mutable_sqlite(
+                    self,
+                    missing_after_close=state.missing_sidecars,
+                )
         except Exception:
             failed = True
         if failed:
@@ -1796,19 +1817,30 @@ def _validate_mutable_sqlite_sidecars(
     database_name: str,
     sidecars: tuple[_SQLiteSidecarAuthorization, ...],
     *,
-    after_close: bool = False,
+    missing_after_close: set[str] | None = None,
 ) -> None:
     if tuple(sidecar.suffix for sidecar in sidecars) != _SQLITE_SIDECAR_SUFFIXES:
         _fail()
     for sidecar in sidecars:
+        sidecar_name = f"{database_name}{sidecar.suffix}"
+        if missing_after_close is not None and sidecar.suffix in missing_after_close:
+            _require_absent_target(directory_fd, sidecar_name)
+            continue
         try:
             _validate_existing_mutable_target(
                 directory_fd,
-                f"{database_name}{sidecar.suffix}",
-                expected=(sidecar.identity if after_close or not sidecar.transient else None),
+                sidecar_name,
+                expected=(
+                    sidecar.identity
+                    if missing_after_close is not None or not sidecar.transient
+                    else None
+                ),
             )
         except FileNotFoundError:
-            if after_close or sidecar.transient:
+            if missing_after_close is not None:
+                missing_after_close.add(sidecar.suffix)
+                continue
+            if sidecar.transient:
                 continue
             raise
 
@@ -1816,7 +1848,7 @@ def _validate_mutable_sqlite_sidecars(
 def _revalidate_mutable_sqlite(
     authorization: StableFileAuthorization,
     *,
-    after_close: bool = False,
+    missing_after_close: set[str] | None = None,
 ) -> None:
     path = Path(authorization.path)
     expected_parent = authorization._parent_identity
@@ -1836,7 +1868,7 @@ def _revalidate_mutable_sqlite(
             directory_fd,
             path.name,
             authorization._sqlite_sidecars,
-            after_close=after_close,
+            missing_after_close=missing_after_close,
         )
         _verify_parent(path, directory_fd, expected_parent)
         _validate_existing_mutable_target(
@@ -1848,7 +1880,7 @@ def _revalidate_mutable_sqlite(
             directory_fd,
             path.name,
             authorization._sqlite_sidecars,
-            after_close=after_close,
+            missing_after_close=missing_after_close,
         )
     finally:
         os.close(directory_fd)
