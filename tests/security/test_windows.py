@@ -715,3 +715,54 @@ def test_native_windows_socket_guard_allows_asyncio_but_denies_general_sockets(
     assert completed.returncode == 0
     assert completed.stdout == "windows-asyncio-socket-guard-ok\n"
     assert completed.stderr == ""
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="Windows text-mode descriptors translate LF startup records",
+)
+def test_native_windows_artifact_socket_guard_writes_binary_startup_records(
+    tmp_path: Path,
+) -> None:
+    startup_log = tmp_path / "artifact-socket-startups.log"
+    guard = Path(__file__).resolve().parents[2] / "scripts" / "artifact_socket_guard.py"
+    provider_keys = {
+        "ANTHROPIC_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENAI_ORGANIZATION",
+        "OPENAI_ORG_ID",
+        "OPENAI_PROJECT",
+        "OPENAI_PROJECT_ID",
+    }
+    environment = {
+        key: value for key, value in os.environ.items() if key.upper() not in provider_keys
+    }
+    environment.update(
+        {
+            "SALIENCEGATE_ARTIFACT_SOCKET_DENIAL": "1",
+            "SALIENCEGATE_ARTIFACT_SOCKET_STARTUP_LOG": str(startup_log),
+        }
+    )
+
+    for _ in range(2):
+        completed = subprocess.run(
+            (
+                sys.executable,
+                "-I",
+                "-c",
+                "import runpy,sys; runpy.run_path(sys.argv[1])",
+                str(guard),
+            ),
+            env=environment,
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+        assert completed.returncode == 0
+        assert completed.stdout == b""
+        assert completed.stderr == b""
+
+    assert startup_log.read_bytes() == (
+        b"installed-artifact-socket-denial-active\ninstalled-artifact-socket-denial-active\n"
+    )

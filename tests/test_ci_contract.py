@@ -60,6 +60,7 @@ NATIVE_RUNNER_MATRIX = (
     ("macos-15", "macos-15"),
     ("windows-2025", "windows-2025"),
 )
+POSIX_RUNNER_MATRIX = NATIVE_RUNNER_MATRIX[:2]
 
 CORE_GATE_TARGETS = (
     "format",
@@ -1037,7 +1038,10 @@ def _step_containing(job: str, needle: str) -> str:
     return matches[0]
 
 
-def _assert_native_runner_matrix(job: str) -> None:
+def _assert_runner_matrix(
+    job: str,
+    expected: tuple[tuple[str, str], ...],
+) -> None:
     assert "runs-on: ${{ matrix.runner }}" in job
     assert "fail-fast: false" in job
     assert (
@@ -1048,8 +1052,12 @@ def _assert_native_runner_matrix(job: str) -> None:
                 strict=True,
             )
         )
-        == NATIVE_RUNNER_MATRIX
+        == expected
     )
+
+
+def _assert_native_runner_matrix(job: str) -> None:
+    _assert_runner_matrix(job, NATIVE_RUNNER_MATRIX)
 
 
 def _assert_inline_python_step(job: str, needle: str) -> None:
@@ -1574,7 +1582,7 @@ def test_ci_proves_public_atif_semantics_from_artifacts_without_checkout() -> No
     artifact = _job_block(text, "artifact-only-atif")
 
     assert "needs:\n      - build" in artifact
-    _assert_native_runner_matrix(artifact)
+    _assert_runner_matrix(artifact, POSIX_RUNNER_MATRIX)
     assert "Prove ATIF from artifacts only (${{ matrix.platform }})" in artifact
     assert 'PYTHONPATH: ""' in artifact
     assert "actions/download-artifact@" in artifact
@@ -1582,12 +1590,10 @@ def test_ci_proves_public_atif_semantics_from_artifacts_without_checkout() -> No
     assert "GITHUB_WORKSPACE" not in artifact
     assert "tests/fixtures" not in artifact
     assert "${{ runner.temp }}/saliencegate-artifact-only" in artifact
-    assert "if: runner.os != 'Windows'" in artifact
-    assert "if: runner.os == 'Windows'" in artifact
-    assert '$root = Join-Path $env:SystemDrive "saliencegate-atif-' in artifact
-    assert "/inheritance:r /grant:r" in artifact
-    assert '"*${ownerSid}:(OI)(CI)F"' in artifact
-    assert "ARTIFACT_WORK_ROOT=$root" in artifact
+    assert "windows-2025" not in artifact
+    assert "runner.os" not in artifact
+    assert "icacls.exe" not in artifact
+    assert "ARTIFACT_WORK_ROOT=$RUNNER_TEMP" in artifact
     assert artifact.count("shell: python") == 2
     _assert_inline_python_step(artifact, "Recover the shared artifact verifier")
     _assert_inline_python_step(artifact, "Prove documented commands")

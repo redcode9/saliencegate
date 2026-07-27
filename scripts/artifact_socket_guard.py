@@ -82,6 +82,8 @@ if SOCKET_DENIAL_ACTIVE:
     if type(_STARTUP_LOG) is not str or not _STARTUP_LOG:
         raise RuntimeError("installed artifact socket guard has no startup log")
     _flags = os.O_CREAT | os.O_APPEND | os.O_WRONLY
+    if hasattr(os, "O_BINARY"):
+        _flags |= os.O_BINARY
     if hasattr(os, "O_NOFOLLOW"):
         _flags |= os.O_NOFOLLOW
     _descriptor = os.open(_STARTUP_LOG, _flags, 0o600)
