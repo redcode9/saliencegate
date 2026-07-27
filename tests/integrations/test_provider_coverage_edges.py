@@ -2269,6 +2269,29 @@ def test_launcher_materialization_success_and_failure_edges(
     assert raised.type.__name__ == "CaptureCommandUnavailableError"
 
 
+def test_hook_entrypoint_restores_windows_console_script_suffix() -> None:
+    normalized = r"C:\trusted scripts\saliencegate-capture-hook"
+
+    assert (
+        hook._entrypoint_capture_executable(normalized, native_windows=True) == f"{normalized}.exe"
+    )
+    assert (
+        hook._entrypoint_capture_executable(
+            f"{normalized}.EXE",
+            native_windows=True,
+        )
+        == f"{normalized}.EXE"
+    )
+    assert (
+        hook._entrypoint_capture_executable(
+            f"{normalized}.com",
+            native_windows=True,
+        )
+        == f"{normalized}.com"
+    )
+    assert hook._entrypoint_capture_executable(normalized, native_windows=False) == normalized
+
+
 def test_launcher_materialization_ignores_hostile_cwd_and_path_for_default_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

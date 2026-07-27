@@ -754,6 +754,21 @@ def _silence_standard_streams() -> bool:
                 os.close(descriptor)
 
 
+def _entrypoint_capture_executable(
+    argv0: str,
+    *,
+    native_windows: bool | None = None,
+) -> str:
+    """Restore the executable suffix removed by generated Windows console scripts."""
+
+    selected_platform = os.name == "nt" if native_windows is None else native_windows
+    if type(argv0) is not str or type(selected_platform) is not bool:
+        raise CaptureHookError()
+    if selected_platform and not argv0.casefold().endswith((".com", ".exe")):
+        return f"{argv0}.exe"
+    return argv0
+
+
 def entrypoint(arguments: Sequence[str] | None = None) -> int:
     """Provider-facing console entrypoint: silent and fail-open by construction."""
 
@@ -764,7 +779,7 @@ def entrypoint(arguments: Sequence[str] | None = None) -> int:
         return run_capture_hook(
             selected_arguments,
             sys.stdin.buffer,
-            capture_executable=sys.argv[0],
+            capture_executable=_entrypoint_capture_executable(sys.argv[0]),
         )
     except (KeyboardInterrupt, SystemExit):
         raise

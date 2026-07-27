@@ -1516,6 +1516,7 @@ def test_ci_declares_targeted_native_capture_contracts() -> None:
         "tests/security/test_windows.py",
         "tests/capture/test_store_security.py",
         "tests/capture/test_spool.py",
+        "tests/integrations/test_codex.py",
         "tests/integrations/test_hook.py",
         "tests/integrations/test_installation.py",
         "tests/integrations/test_launcher_renderer.py",
@@ -1529,8 +1530,9 @@ def test_ci_declares_targeted_native_capture_contracts() -> None:
     assert '"*${ownerSid}:(OI)(CI)F"' in platform
     assert "test_native_windows_operations_authorize_a_real_private_directory" in platform
     assert "test_read_only_audit_authenticates_an_empty_spool_without_creating_a_lock" in platform
+    assert "test_native_windows_installed_codex_launcher_observes_one_session" in platform
     assert "test_windows_launcher_preserves_stdin_argv_silence_and_timeout" in platform
-    assert platform.count("test_native_windows_") == 5
+    assert platform.count("test_native_windows_") == 6
     assert "$env:HOME = $captureHome" in platform
     assert '$env:TEMP = Join-Path $env:SALIENCEGATE_CI_ROOT "temp"' in platform
     assert '--basetemp (Join-Path $env:SALIENCEGATE_CI_ROOT "pytest")' in platform

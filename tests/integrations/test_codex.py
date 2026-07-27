@@ -10,6 +10,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
+from scripts import smoke_capture_installed
 
 from saliencegate.capture.capabilities import (
     CaptureProfile,
@@ -60,9 +61,14 @@ from saliencegate.integrations.config_files import (
     plan_owned_config_install,
     remove_owned_config_edit,
 )
+from saliencegate.integrations.environment import environment_without_provider_credentials
 from saliencegate.integrations.hook import run_capture_hook
 from saliencegate.integrations.installation import derive_installation_identity
-from saliencegate.integrations.registry import ProviderInstallationKind
+from saliencegate.integrations.registry import (
+    ProviderAlias,
+    ProviderInstallationKind,
+    ProviderInstallationSpec,
+)
 from saliencegate.security import InstallationKey, load_installation_key
 
 CONNECTION_ID = "sg-" + "1" * 48
@@ -426,7 +432,8 @@ def _executable(tmp_path: Path) -> Path:
 
 
 def _capture_executable() -> Path:
-    return (Path(sys.executable).parent / "saliencegate-capture-hook").resolve(strict=True)
+    suffix = ".exe" if os.name == "nt" else ""
+    return (Path(sys.executable).parent / f"saliencegate-capture-hook{suffix}").resolve(strict=True)
 
 
 def test_version_probe_is_bounded_exact_and_reports_compatibility(tmp_path: Path) -> None:
@@ -855,6 +862,96 @@ def test_malformed_critical_hook_marks_attributable_session_coverage_degraded(
     assert snapshot.event_count == (1 if start_session else 0)
     assert tuple(item.code for item in snapshot.health) == (CaptureHealthCode.COVERAGE_DEGRADED,)
     assert snapshot.health[0].count == 1
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="native installed Codex launcher execution is the remote R01 gate",
+)
+def test_native_windows_installed_codex_launcher_observes_one_session(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "launcher path & data"
+    root.mkdir()
+    project = root / "project"
+    project.mkdir()
+    home = root / "home"
+    home.mkdir()
+    environment = environment_without_provider_credentials(os.environ)
+    environment.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "XDG_CACHE_HOME": str(home / "cache"),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_STATE_HOME": str(home / "state"),
+            "APPDATA": str(home / "appdata"),
+            "LOCALAPPDATA": str(home / "localappdata"),
+        }
+    )
+    spec = provider_installation_spec(
+        project,
+        environ=environment,
+        host_version=CODEX_HOST_VERSION,
+    )
+
+    def resolve_spec(
+        alias: ProviderAlias,
+        candidate: Path,
+    ) -> ProviderInstallationSpec:
+        assert alias is ProviderAlias.CODEX
+        assert candidate == project
+        return spec
+
+    capture_executable = _capture_executable()
+    connected = run_connect(
+        provider="codex",
+        project=project,
+        environ=environment,
+        spec_resolver=resolve_spec,
+        capture_executable=capture_executable,
+    )
+    assert connected.capture_enabled is True
+    assert spec.launcher_path.is_file()
+
+    callback = smoke_capture_installed._launcher_command(
+        spec.launcher_path,
+        environment=environment,
+    )
+    assert callback.executable is not None
+    assert callback.launcher_environment is not None
+    process_environment = dict(environment)
+    process_environment["SALIENCEGATE_LAUNCHER"] = callback.launcher_environment
+    payload = _payload("SessionStart")
+    payload["cwd"] = str(project)
+    completed = subprocess.run(
+        callback.command,
+        cwd=project,
+        env=process_environment,
+        executable=callback.executable,
+        shell=False,
+        check=False,
+        capture_output=True,
+        input=canonical_json(payload),
+        timeout=10,
+    )
+    assert (completed.returncode, bool(completed.stdout), bool(completed.stderr)) == (
+        0,
+        False,
+        False,
+    )
+
+    observed = run_status(
+        provider="codex",
+        project=project,
+        environ=environment,
+        spec_resolver=resolve_spec,
+        capture_executable=capture_executable,
+    ).providers[0]
+    assert observed.status is CaptureOperationalStatus.ACTIVE_OBSERVED
+    assert observed.session_count == 1
+    assert observed.drift == ()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="native Windows lifecycle is covered by R01")

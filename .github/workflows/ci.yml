@@ -362,6 +362,7 @@ jobs:
             "tests/security/test_windows.py"
             "tests/capture/test_store_security.py::test_native_windows_operations_authorize_a_real_private_directory"
             "tests/capture/test_spool.py::test_read_only_audit_authenticates_an_empty_spool_without_creating_a_lock"
+            "tests/integrations/test_codex.py::test_native_windows_installed_codex_launcher_observes_one_session"
             "tests/integrations/test_hook.py::test_windows_launcher_encodes_the_native_contract"
             "tests/integrations/test_hook.py::test_windows_launcher_preserves_stdin_argv_silence_and_timeout_with_pinned_watchdog"
             "tests/integrations/test_installation.py::test_native_windows_pristine_missing_operational_parent_is_clean_and_installable"
