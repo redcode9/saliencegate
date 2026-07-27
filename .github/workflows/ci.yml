@@ -450,6 +450,22 @@ jobs:
         with:
           version: "0.11.28"
           enable-cache: false
+      - name: Select the POSIX artifact work root
+        if: runner.os != 'Windows'
+        shell: bash
+        run: echo "ARTIFACT_WORK_ROOT=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Prepare the Windows artifact work root
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:SystemDrive "saliencegate-atif-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $ownerSid = [Security.Principal.WindowsIdentity]::GetCurrent().Owner.Value
+          & icacls.exe $root /inheritance:r /grant:r "*${ownerSid}:(OI)(CI)F"
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to secure the Windows artifact work root"
+          }
+          "ARTIFACT_WORK_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Download the distributions built by CI
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -506,6 +522,7 @@ jobs:
           from pathlib import Path
 
           root = Path(os.environ["ARTIFACT_ROOT"]).resolve(strict=True)
+          work_root = Path(os.environ["ARTIFACT_WORK_ROOT"]).resolve()
           subprocess.run(
               (
                   sys.executable,
@@ -513,7 +530,7 @@ jobs:
                   "--dist-dir",
                   str(root / "dist"),
                   "--work-dir",
-                  str(root / "proof"),
+                  str(work_root / "proof"),
                   "--python",
                   "3.12",
               ),
@@ -562,6 +579,22 @@ jobs:
         with:
           version: "0.11.28"
           enable-cache: false
+      - name: Select the POSIX artifact work root
+        if: runner.os != 'Windows'
+        shell: bash
+        run: echo "ARTIFACT_WORK_ROOT=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Prepare the Windows artifact work root
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:SystemDrive "saliencegate-connectors-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $ownerSid = [Security.Principal.WindowsIdentity]::GetCurrent().Owner.Value
+          & icacls.exe $root /inheritance:r /grant:r "*${ownerSid}:(OI)(CI)F"
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to secure the Windows artifact work root"
+          }
+          "ARTIFACT_WORK_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Download the distributions built by CI
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -618,14 +651,6 @@ jobs:
       - name: Prove installed callbacks and bundles with network and credentials denied
         env:
           ARTIFACT_ROOT: ${{ runner.temp }}/saliencegate-connector-artifact-only
-          HOME: ${{ runner.temp }}/saliencegate-connector-artifact-only/home
-          XDG_CACHE_HOME: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/cache
-          XDG_CONFIG_HOME: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/config
-          XDG_DATA_HOME: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/data
-          XDG_STATE_HOME: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/state
-          USERPROFILE: ${{ runner.temp }}/saliencegate-connector-artifact-only/home
-          APPDATA: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/appdata
-          LOCALAPPDATA: ${{ runner.temp }}/saliencegate-connector-artifact-only/home/localappdata
         shell: python
         run: |
           import os
@@ -634,6 +659,21 @@ jobs:
           from pathlib import Path
 
           root = Path(os.environ["ARTIFACT_ROOT"]).resolve(strict=True)
+          work_root = Path(os.environ["ARTIFACT_WORK_ROOT"]).resolve()
+          home = work_root / "home"
+          environment = dict(os.environ)
+          environment.update(
+              {
+                  "HOME": str(home),
+                  "XDG_CACHE_HOME": str(home / "cache"),
+                  "XDG_CONFIG_HOME": str(home / "config"),
+                  "XDG_DATA_HOME": str(home / "data"),
+                  "XDG_STATE_HOME": str(home / "state"),
+                  "USERPROFILE": str(home),
+                  "APPDATA": str(home / "appdata"),
+                  "LOCALAPPDATA": str(home / "localappdata"),
+              }
+          )
           subprocess.run(
               (
                   sys.executable,
@@ -641,13 +681,14 @@ jobs:
                   "--dist-dir",
                   str(root / "dist"),
                   "--work-dir",
-                  str(root / "proof"),
+                  str(work_root / "proof"),
                   "--node",
                   "node",
                   "--npm",
                   "npm",
               ),
               check=True,
+              env=environment,
           )
           subprocess.run(
               (
@@ -656,7 +697,7 @@ jobs:
                   "--dist-dir",
                   str(root / "dist"),
                   "--work-dir",
-                  str(root / "installed-proof"),
+                  str(work_root / "installed-proof"),
                   "--python",
                   "3.12",
                   "--node",
@@ -664,6 +705,7 @@ jobs:
                   "--capture-connectors-only",
               ),
               check=True,
+              env=environment,
           )
 
   installed-core-wheel:

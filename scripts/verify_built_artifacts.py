@@ -989,7 +989,11 @@ def _resolve_exact_connector_node(command: str) -> Path:
     ):
         raise RuntimeError("installed connector proof could not resolve Node.js")
     completed = _run((resolved, "--version"), capture_output=True)
-    if completed.stdout != f"{_EXPECTED_CONNECTOR_NODE_VERSION}\n".encode() or completed.stderr:
+    if (
+        _normalize_transport_stdout(completed.stdout)
+        != f"{_EXPECTED_CONNECTOR_NODE_VERSION}\n".encode()
+        or completed.stderr
+    ):
         raise RuntimeError("installed connector proof requires exact Node.js 22.19.0")
     return resolved
 

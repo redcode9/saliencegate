@@ -718,6 +718,12 @@ def test_core_artifact_verifier_rejects_noncanonical_windows_transport(
         artifact_verifier._normalize_transport_stdout(payload, platform="nt")
 
 
+def test_connector_node_version_check_normalizes_platform_transport() -> None:
+    source = inspect.getsource(artifact_verifier._resolve_exact_connector_node)
+
+    assert "_normalize_transport_stdout(completed.stdout)" in source
+
+
 @pytest.mark.parametrize(
     ("payload", "platform", "expected"),
     (
@@ -1530,12 +1536,20 @@ def test_ci_proves_public_atif_semantics_from_artifacts_without_checkout() -> No
     assert "GITHUB_WORKSPACE" not in artifact
     assert "tests/fixtures" not in artifact
     assert "${{ runner.temp }}/saliencegate-artifact-only" in artifact
+    assert "if: runner.os != 'Windows'" in artifact
+    assert "if: runner.os == 'Windows'" in artifact
+    assert '$root = Join-Path $env:SystemDrive "saliencegate-atif-' in artifact
+    assert "/inheritance:r /grant:r" in artifact
+    assert '"*${ownerSid}:(OI)(CI)F"' in artifact
+    assert "ARTIFACT_WORK_ROOT=$root" in artifact
     assert artifact.count("shell: python") == 2
     _assert_inline_python_step(artifact, "Recover the shared artifact verifier")
     _assert_inline_python_step(artifact, "Prove documented commands")
     assert 'tarfile.open(sdists[0], mode="r:gz")' in artifact
     assert '("scripts", "verify_built_artifacts.py")' in artifact
     assert 'os.environ["ARTIFACT_ROOT"]' in artifact
+    assert 'os.environ["ARTIFACT_WORK_ROOT"]' in artifact
+    assert 'str(work_root / "proof")' in artifact
     assert "sys.executable" in artifact
     assert '"--dist-dir",' in artifact
     assert '"--work-dir",' in artifact
@@ -1583,6 +1597,12 @@ def test_ci_proves_connector_bundles_from_artifacts_without_checkout() -> None:
     assert "GITHUB_WORKSPACE" not in artifact
     assert "tests/fixtures" not in artifact
     assert "${{ runner.temp }}/saliencegate-connector-artifact-only" in artifact
+    assert "if: runner.os != 'Windows'" in artifact
+    assert "if: runner.os == 'Windows'" in artifact
+    assert '$root = Join-Path $env:SystemDrive "saliencegate-connectors-' in artifact
+    assert "/inheritance:r /grant:r" in artifact
+    assert '"*${ownerSid}:(OI)(CI)F"' in artifact
+    assert "ARTIFACT_WORK_ROOT=$root" in artifact
     assert artifact.count("shell: python") == 2
     _assert_inline_python_step(artifact, "Recover the connector artifact verifiers")
     _assert_inline_python_step(artifact, "Prove installed callbacks and bundles")
@@ -1590,6 +1610,9 @@ def test_ci_proves_connector_bundles_from_artifacts_without_checkout() -> None:
     assert '("scripts", "verify_connector_artifacts.py")' in artifact
     assert '("scripts", "verify_built_artifacts.py")' in artifact
     assert 'os.environ["ARTIFACT_ROOT"]' in artifact
+    assert 'os.environ["ARTIFACT_WORK_ROOT"]' in artifact
+    assert 'str(work_root / "proof")' in artifact
+    assert 'str(work_root / "installed-proof")' in artifact
     assert "sys.executable" in artifact
     assert '"--dist-dir",' in artifact
     assert '"--work-dir",' in artifact
@@ -1607,9 +1630,10 @@ def test_ci_proves_connector_bundles_from_artifacts_without_checkout() -> None:
     assert "astral-sh/setup-uv@" in artifact
     assert 'version: "0.11.28"' in artifact
     assert "provider-credential-read-must-fail" in artifact
-    assert "USERPROFILE:" in artifact
-    assert "APPDATA:" in artifact
-    assert "LOCALAPPDATA:" in artifact
+    assert '"USERPROFILE": str(home)' in artifact
+    assert '"APPDATA": str(home / "appdata")' in artifact
+    assert '"LOCALAPPDATA": str(home / "localappdata")' in artifact
+    assert artifact.count("env=environment") == 2
     installed_verifier = ARTIFACT_VERIFIER.read_text(encoding="utf-8")
     assert 'case_root = work_root / label / "launcher path & data"' in installed_verifier
 
