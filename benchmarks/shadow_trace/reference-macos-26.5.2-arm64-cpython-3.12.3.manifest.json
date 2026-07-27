@@ -17,7 +17,7 @@
   },
   "socket_guard": {
     "path": "scripts/run_without_sockets.py",
-    "sha256": "09baf500018417335d043caca4a0d77e8cf02f44ea30bfaafc447a9f8d6b4e69"
+    "sha256": "2f4300328f4756563a5a4bb4b74f18c11c4ce6146d073feda0d2367ded22477a"
   },
   "project_runtime_metadata": {
     "path": "pyproject.toml",

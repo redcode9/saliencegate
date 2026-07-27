@@ -204,6 +204,52 @@ def test_artifact_startup_guard_rejects_provider_credential_keys(tmp_path: Path)
     assert startup_log.read_bytes() == b"installed-artifact-socket-denial-active\n"
 
 
+def test_artifact_startup_guard_blocks_sockets_without_af_unix(tmp_path: Path) -> None:
+    startup_log = tmp_path / "artifact-startups.log"
+    environment = artifact_verifier._environment_without_provider_credentials(os.environ)
+    environment.update(
+        {
+            "SALIENCEGATE_ARTIFACT_SOCKET_DENIAL": "1",
+            "SALIENCEGATE_ARTIFACT_SOCKET_STARTUP_LOG": str(startup_log),
+        }
+    )
+    source = textwrap.dedent(
+        """
+        import _socket
+        import runpy
+        import socket
+        import sys
+
+        del socket.AF_UNIX
+        guard = runpy.run_path(sys.argv[1])
+        for operation in (
+            lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM),
+            lambda: _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM),
+        ):
+            try:
+                operation()
+            except guard["ArtifactSocketAccessError"]:
+                pass
+            else:
+                raise RuntimeError("socket guard allowed network access")
+        print("af-unix-absent-ok")
+        """
+    )
+
+    completed = subprocess.run(
+        (sys.executable, "-I", "-c", source, str(ARTIFACT_SOCKET_GUARD)),
+        env=environment,
+        check=False,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == b"af-unix-absent-ok\n"
+    assert completed.stderr == b""
+    assert startup_log.read_bytes() == b"installed-artifact-socket-denial-active\n"
+
+
 def test_artifact_guard_canary_receives_a_scrubbed_environment(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

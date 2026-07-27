@@ -10,6 +10,7 @@ from typing import Never
 SOCKET_DENIAL_ACTIVE = os.environ.get("SALIENCEGATE_ARTIFACT_SOCKET_DENIAL") == "1"
 _BLOCKED_MESSAGE = "installed artifact socket or resolver access is disabled"
 _LOW_LEVEL_SOCKET = _socket.socket
+_LOCAL_SOCKET_FAMILY = getattr(socket, "AF_UNIX", None)
 _STARTUP_LOG = os.environ.get("SALIENCEGATE_ARTIFACT_SOCKET_STARTUP_LOG")
 _PROVIDER_CREDENTIAL_KEYS = frozenset(
     {
@@ -44,7 +45,7 @@ class _NetworkBlockedSocket(socket.socket):
         proto: int = 0,
         fileno: int | None = None,
     ) -> _NetworkBlockedSocket:
-        if family != socket.AF_UNIX or fileno is None:
+        if _LOCAL_SOCKET_FAMILY is None or family != _LOCAL_SOCKET_FAMILY or fileno is None:
             raise ArtifactSocketAccessError(_BLOCKED_MESSAGE)
         return super().__new__(cls, family, type, proto, fileno)
 
@@ -59,7 +60,7 @@ class _LowLevelNetworkBlockedSocket(_LOW_LEVEL_SOCKET):
         proto: int = 0,
         fileno: int | None = None,
     ) -> _LowLevelNetworkBlockedSocket:
-        if family != socket.AF_UNIX or fileno is None:
+        if _LOCAL_SOCKET_FAMILY is None or family != _LOCAL_SOCKET_FAMILY or fileno is None:
             raise ArtifactSocketAccessError(_BLOCKED_MESSAGE)
         return _LOW_LEVEL_SOCKET.__new__(cls, family, type, proto, fileno)
 

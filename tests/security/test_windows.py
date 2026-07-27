@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path, PureWindowsPath
 from typing import cast
@@ -679,3 +680,38 @@ def test_native_windows_authorization_rejects_intermediate_junction_substitution
     finally:
         os.rmdir(first)
         os.rename(moved, first)
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="Windows asyncio uses an IPv4 loopback pair for its event loop",
+)
+def test_native_windows_socket_guard_allows_asyncio_but_denies_general_sockets(
+    tmp_path: Path,
+) -> None:
+    probe = tmp_path / "asyncio-socket-guard.py"
+    probe.write_text(
+        "import asyncio\n"
+        "import socket\n"
+        "asyncio.run(asyncio.sleep(0))\n"
+        "try:\n"
+        "    socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+        "except RuntimeError:\n"
+        "    print('windows-asyncio-socket-guard-ok')\n"
+        "else:\n"
+        "    raise RuntimeError('socket guard allowed a general socket')\n",
+        encoding="utf-8",
+    )
+    guard = Path(__file__).resolve().parents[2] / "scripts" / "run_without_sockets.py"
+
+    completed = subprocess.run(
+        (sys.executable, "-I", str(guard), str(probe)),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "windows-asyncio-socket-guard-ok\n"
+    assert completed.stderr == ""
