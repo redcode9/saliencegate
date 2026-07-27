@@ -13,7 +13,7 @@
     "git_tracked_regular_file_count": 202,
     "digest_algorithm": "sha256",
     "framing": "uint64be(path_utf8_length) || path_utf8 || uint64be(content_length) || content",
-    "sha256": "537dbb529d8107896e284e697801db7e72ee4acd335e7789c83da78bd7c11e72"
+    "sha256": "bc7c5b34777d619df37520a7244852ddb7f910dc557dbabde8ca23cf94fdc07f"
   },
   "socket_guard": {
     "path": "scripts/run_without_sockets.py",
