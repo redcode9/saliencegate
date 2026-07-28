@@ -44,7 +44,7 @@ saliencegate-review = "saliencegate.benchmarks.state_decay_v2.review_cli:entrypo
 
 [dependency-groups]
 dev = [
-  "coverage[toml]>=7.10.6,<8",
+  "coverage[toml]>=7.15.2,<8",
   "editables>=0.6,<0.7",
   "hatchling>=1.27,<2",
   "httpx>=0.28.1,<0.29",

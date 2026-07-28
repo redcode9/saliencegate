@@ -895,7 +895,7 @@ provides-extras = ["model-runtime"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "coverage", extras = ["toml"], specifier = ">=7.10.6,<8" },
+    { name = "coverage", extras = ["toml"], specifier = ">=7.15.2,<8" },
     { name = "editables", specifier = ">=0.6,<0.7" },
     { name = "hatchling", specifier = ">=1.27,<2" },
     { name = "httpx", specifier = ">=0.28.1,<0.29" },
