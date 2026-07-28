@@ -1948,6 +1948,25 @@ def test_ci_keeps_the_installed_model_runtime_smoke_config_only() -> None:
     assert "/chat/completions" not in runtime
 
 
+def test_ci_exposes_one_fail_closed_required_gate() -> None:
+    text = _read(".github/workflows/ci.yml")
+    gate = _job_block(text, "required-ci")
+
+    assert text.count("name: Required CI") == 1
+    assert "if: ${{ always() }}" in gate
+    assert "runs-on: ubuntu-24.04" in gate
+    assert "timeout-minutes: 5" in gate
+    assert "CI_RESULTS: ${{ toJSON(needs) }}" in gate
+    assert 'run: jq -e \'all(.[]; .result == "success")\' <<< "$CI_RESULTS"' in gate
+
+    needs = re.search(r"(?ms)^    needs:\n(?P<body>.*?)(?=^    [a-z-]+:)", gate)
+    assert needs is not None
+    needed_jobs = re.findall(r"(?m)^      - ([a-z][a-z-]+)$", needs.group("body"))
+    declared_jobs = re.findall(r"(?m)^  ([a-z0-9][a-z0-9-]*):$", text.partition("jobs:\n")[2])
+    assert declared_jobs[-1] == "required-ci"
+    assert needed_jobs == declared_jobs[:-1]
+
+
 def test_ci_installed_jobs_share_only_the_built_distributions() -> None:
     text = _read(".github/workflows/ci.yml")
     installed = tuple(

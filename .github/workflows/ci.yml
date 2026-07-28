@@ -887,3 +887,28 @@ jobs:
       - name: Construct a loopback configuration without a request
         run: |
           "$RUNNER_TEMP/model-runtime-venv/bin/python" -I scripts/run_without_sockets.py scripts/smoke_model_runtime.py
+
+  required-ci:
+    name: Required CI
+    if: ${{ always() }}
+    needs:
+      - test
+      - quality
+      - coverage
+      - shadow-benchmark-evidence
+      - capture-benchmark-contracts
+      - connectors
+      - capture-platform-contract
+      - build
+      - artifact-only-atif
+      - artifact-only-connectors
+      - installed-core-wheel
+      - installed-sdist
+      - installed-model-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      CI_RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Require every CI job to succeed
+        run: jq -e 'all(.[]; .result == "success")' <<< "$CI_RESULTS"
