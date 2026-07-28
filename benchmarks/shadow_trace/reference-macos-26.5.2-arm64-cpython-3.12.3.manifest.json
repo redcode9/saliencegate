@@ -2,7 +2,7 @@
   "schema_version": "shadow-trace-benchmark-evidence-manifest/v1",
   "report": {
     "path": "benchmarks/shadow_trace/reference-macos-26.5.2-arm64-cpython-3.12.3.json",
-    "sha256": "ab264a6d7afc1d40fc7cd0d83a2d2507a18f2afa15bbe884f48614f754b6f5c9"
+    "sha256": "1a1c11f8e0491f0fcbbf80cfa31923dd8dfdf6a33b5d6c1719c75dc14e1f0cf6"
   },
   "benchmark_script": {
     "path": "scripts/benchmark_shadow_trace.py",
@@ -13,7 +13,7 @@
     "git_tracked_regular_file_count": 202,
     "digest_algorithm": "sha256",
     "framing": "uint64be(path_utf8_length) || path_utf8 || uint64be(content_length) || content",
-    "sha256": "bc7c5b34777d619df37520a7244852ddb7f910dc557dbabde8ca23cf94fdc07f"
+    "sha256": "83e6dcbdd50bbb8a05eb38c1494bc86a82e88a81ffc7bd52c306b48dcc014236"
   },
   "socket_guard": {
     "path": "scripts/run_without_sockets.py",
@@ -28,7 +28,7 @@
       "dependency-groups.dev"
     ],
     "canonicalization": "UTF-8 JSON with sorted keys and compact separators",
-    "sha256": "7f5046d8aebe842c23350565dd41a689dc417f63b82da4830f033519e969f9c9"
+    "sha256": "b09d97ae7aa5a47720a7d35cb1a9233937c164c3b1b6c18c3867856b3eac388f"
   },
   "python_version_file": {
     "path": ".python-version",
@@ -36,7 +36,7 @@
   },
   "dependency_lock": {
     "path": "uv.lock",
-    "sha256": "787d9adb9fff43dd05f3362ec4e6db202eeff1be8710ff357174884ca54b5165"
+    "sha256": "21427efb07de4fdcaf06377ff305e0a0a3c610d474f5008748b1cf75501a8a8a"
   },
   "toolchain": {
     "python": "CPython 3.12.3",

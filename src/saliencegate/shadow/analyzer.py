@@ -665,7 +665,7 @@ async def _analyze_prepared(
     session: ShadowSession,
     prepared: _PreparedAnalysis,
     *,
-    expected_initial_state: _RunState | None | object = _UNSPECIFIED_INITIAL_STATE,
+    expected_initial_state: _RunState | object | None = _UNSPECIFIED_INITIAL_STATE,
 ) -> ShadowTraceReport:
     async with session._lock:
         if session._closed or session._trace_binding is None:

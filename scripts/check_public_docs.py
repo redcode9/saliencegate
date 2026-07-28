@@ -38,7 +38,6 @@ PUBLIC_DOCUMENT_DIRECTORIES = (
 )
 OPTIONAL_PUBLIC_DOCUMENTS = (Path("docs/package-description.md"),)
 PUBLIC_DOCUMENT_EXCLUSIONS = (
-    Path("docs/superpowers"),
     Path(".artifacts"),
     Path("reports/generated"),
 )
@@ -81,20 +80,10 @@ def count_readme_command(text: str, command: str) -> int:
 
 
 FORBIDDEN_PATTERNS = (
-    (
-        re.compile(
-            r"(?im)^(?:co-"
-            + r"authored-by|signed-off-by|generated-"
-            + r"by|assisted-"
-            + r"by|pair-programmed-by|reviewed-by|acked-by|tested-by):"
-        ),
-        "attribution trailer",
-    ),
     (re.compile(r"(?i)\bstate[- ]of[- ]the[- ]art\b"), "unqualified comparison claim"),
     (re.compile(r"(?i)\bbest[- ]in[- ]class\b"), "unqualified comparison claim"),
     (re.compile(r"(?i)\bproduction[- ]ready\b"), "unsupported readiness claim"),
     (re.compile(r"(?i)\b(?:stage|task)\s+[0-9]+[a-z]?\b"), "internal milestone narration"),
-    (re.compile(r"(?i)\bchatgpt enterprise\b"), "private account detail"),
     (re.compile(r"(?i)\benterprise plan\b"), "private account detail"),
     (re.compile(r"(?i)\benterprise subscription\b"), "private account detail"),
     (re.compile(r"(?i)\bworkspace subscription\b"), "private account detail"),

@@ -44,8 +44,8 @@ saliencegate-review = "saliencegate.benchmarks.state_decay_v2.review_cli:entrypo
 
 [dependency-groups]
 dev = [
-  "coverage[toml]>=7.10,<8",
-  "editables>=0.3,<0.4",
+  "coverage[toml]>=7.10.6,<8",
+  "editables>=0.6,<0.7",
   "hatchling>=1.27,<2",
   "httpx>=0.28.1,<0.29",
   "hypothesis>=6.135,<7",
@@ -54,7 +54,7 @@ dev = [
   "pip-audit>=2.9,<3",
   "pytest>=9.0.3,<10",
   "pytest-asyncio>=1.0,<2",
-  "pytest-cov>=6.2,<7",
+  "pytest-cov>=7.1,<8",
   "pytest-socket>=0.7,<1",
   "ruff>=0.12,<1",
 ]
@@ -137,6 +137,7 @@ mypy_path = "src"
 
 [tool.coverage.run]
 branch = true
+patch = ["subprocess"]
 source = ["saliencegate"]
 
 [tool.coverage.report]

@@ -77,23 +77,6 @@ Thumbs.db
 *.swo
 *~
 
-# Local development tools
-/.agents/
-/.codex/
-/.claude/
-/.cursor/
-/.gemini/
-/.continue/
-/.windsurf/
-/.cline/
-/.roo/
-/.aider*
-/docs/superpowers/
-/AGENTS.md
-/CLAUDE.md
-/CODEX.md
-/GEMINI.md
-/.github/copilot-instructions.md
-/.github/agents/
-/.github/prompts/
-/.github/instructions/
+# Local hidden state
+/.*/
+!/.github/

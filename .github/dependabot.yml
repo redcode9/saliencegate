@@ -4,10 +4,29 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
+    versioning-strategy: "increase-if-necessary"
+    open-pull-requests-limit: 3
+    groups:
+      python-dev:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "editables"
+          - "openai-harmony"
+          - "ruff"
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

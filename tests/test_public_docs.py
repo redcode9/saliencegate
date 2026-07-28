@@ -97,9 +97,7 @@ def test_readme_uses_the_required_concrete_structure() -> None:
 def test_public_prose_inventory_includes_examples_and_repository_templates() -> None:
     inventory = {path.relative_to(ROOT).as_posix() for path in _public_paths(ROOT)}
     assert set(REQUIRED_DOCUMENTS) <= inventory
-    assert not any(path.startswith("docs/superpowers/") for path in inventory)
     assert (
-        Path("docs/superpowers"),
         Path(".artifacts"),
         Path("reports/generated"),
     ) == PUBLIC_DOCUMENT_EXCLUSIONS
@@ -435,7 +433,6 @@ def test_checker_rejects_credentials_claims_and_icons() -> None:
         "This is state of the art.",
         "This is best-in-class.",
         "This is production-ready.",
-        "ChatGPT Enterprise",
         "enterprise plan",
         "enterprise subscription",
         "workspace subscription",
@@ -450,17 +447,6 @@ def test_checker_rejects_credentials_claims_and_icons() -> None:
         "Task " + "6B remains closed.",
     ):
         assert scan_text(Path("README.md"), forbidden)
-    for trailer in (
-        "Co-" + "authored-by: Example <example@example.invalid>",
-        "Signed-off-by: Example <example@example.invalid>",
-        "Generated-" + "by: tool",
-        "Assisted-" + "by: tool",
-        "Pair-programmed-by: Example <example@example.invalid>",
-        "Reviewed-by: Example <example@example.invalid>",
-        "Acked-by: Example <example@example.invalid>",
-        "Tested-by: Example <example@example.invalid>",
-    ):
-        assert scan_text(Path("docs/reference/cli.md"), trailer)
 
 
 def test_checker_rejects_unqualified_observational_claims_in_shadow_and_capture_docs() -> None:

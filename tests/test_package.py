@@ -440,7 +440,6 @@ def _assert_no_local_or_generated_state(members: frozenset[str]) -> None:
         assert not folded_parts or folded_parts[0] not in FORBIDDEN_TOP_LEVEL
         assert not any(part.endswith(".egg-info") for part in folded_parts)
         assert not folded_member.endswith(FORBIDDEN_SUFFIXES)
-        assert not folded_member.startswith("docs/superpowers/")
         assert folded_name not in FORBIDDEN_NAMES
         assert not folded_name.startswith((".coverage", ".env"))
         assert not folded_name.endswith("~")

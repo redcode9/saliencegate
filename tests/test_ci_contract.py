@@ -1487,9 +1487,9 @@ def test_ci_verifies_capture_benchmark_contracts_and_connector_performance() -> 
     assert "SALIENCEGATE_CAPTURE_BENCHMARK_RUNNER_IMAGE" not in capture
     assert "provider-credential-read-must-fail" in capture
 
-    setup_node = "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e"
+    setup_node = "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
     assert setup_node in connectors
-    assert "# v6.4.0" in connectors
+    assert "# v7.0.0" in connectors
     assert "node-version: 22.19.0" in connectors
     assert "check-latest: false" in connectors
     assert "package-manager-cache: false" in connectors
@@ -1965,13 +1965,14 @@ def test_ci_installed_jobs_share_only_the_built_distributions() -> None:
                 assert "scripts/run_without_sockets.py" in line
 
 
-def test_ci_fetches_complete_head_history_for_the_public_tree_guard() -> None:
-    text = _read(".github/workflows/ci.yml")
-    checkout_count = text.count("uses: actions/checkout@")
+def test_workflows_use_credentialless_shallow_checkouts() -> None:
+    for path in (".github/workflows/ci.yml", ".github/workflows/release.yml"):
+        text = _read(path)
+        checkout_count = text.count("uses: actions/checkout@")
 
-    assert checkout_count > 0
-    assert text.count("persist-credentials: false") == checkout_count
-    assert text.count("fetch-depth: 0") == checkout_count
+        assert checkout_count > 0
+        assert text.count("persist-credentials: false") == checkout_count
+        assert "fetch-depth: 0" not in text
 
 
 def test_socket_guard_allows_only_local_socket_pairs(tmp_path: Path) -> None:
