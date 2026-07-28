@@ -1647,7 +1647,11 @@ def test_packaged_hook_import_does_not_load_network_or_model_runtime() -> None:
         command,
         capture_output=True,
         check=False,
-        env={key: value for key, value in os.environ.items() if not key.startswith("COV_CORE_")},
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("COV_CORE_", "COVERAGE_PROCESS_"))
+        },
         timeout=5,
     )
 

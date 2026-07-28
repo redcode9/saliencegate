@@ -686,7 +686,11 @@ print(canonical_json(summary).decode("utf-8"))
         (sys.executable, "-c", program),
         capture_output=True,
         check=False,
-        env={key: value for key, value in os.environ.items() if not key.startswith("COV_CORE_")},
+        env={
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("COV_CORE_", "COVERAGE_PROCESS_"))
+        },
         timeout=60.0,
     )
 
