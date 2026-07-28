@@ -89,7 +89,6 @@ if SOCKET_DENIAL_ACTIVE:
     _descriptor = os.open(_STARTUP_LOG, _flags, 0o600)
     try:
         os.write(_descriptor, b"installed-artifact-socket-denial-active\n")
-        os.fsync(_descriptor)
     finally:
         os.close(_descriptor)
     for _module in (socket, _socket):
