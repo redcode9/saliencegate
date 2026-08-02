@@ -48,7 +48,7 @@ dev = [
   "editables>=0.6,<0.7",
   "hatchling>=1.27,<2",
   "httpx>=0.28.1,<0.29",
-  "hypothesis>=6.135,<7",
+  "hypothesis>=6.164.0,<7",
   "mypy>=1.17,<2",
   "openai-harmony==0.0.8",
   "pip-audit>=2.9,<3",
