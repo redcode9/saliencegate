@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.27,<2"]
+requires = ["hatchling>=1.32.0,<2"]
 build-backend = "hatchling.build"
 
 [project]
@@ -46,9 +46,9 @@ saliencegate-review = "saliencegate.benchmarks.state_decay_v2.review_cli:entrypo
 dev = [
   "coverage[toml]>=7.10.6,<8",
   "editables>=0.6,<0.7",
-  "hatchling>=1.27,<2",
+  "hatchling>=1.32.0,<2",
   "httpx>=0.28.1,<0.29",
-  "hypothesis>=6.135,<7",
+  "hypothesis>=6.165.5,<7",
   "mypy>=1.17,<2",
   "openai-harmony==0.0.8",
   "pip-audit>=2.9,<3",
